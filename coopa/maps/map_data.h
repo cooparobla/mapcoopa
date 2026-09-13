@@ -1,0 +1,576 @@
+/**
+ * @file map_data.h
+ * @brief The dual Delaunay/Voronoi graph a generated map is made of: cells,
+ *        corners, edges, settlements, and the container that owns them.
+ */
+
+#ifndef COOPA_MAPS_MAP_DATA_H
+#define COOPA_MAPS_MAP_DATA_H
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdint>
+#include <string>
+#include <vector>
+
+#include <glm/glm.hpp>
+
+#include <coopa/maps/biome.h>
+#include <coopa/maps/landmark.h>
+#include <coopa/maps/map_config.h>
+
+namespace coopa {
+namespace maps {
+
+/** @brief Index of a `MapCenter` within `MapGraph::centers`. */
+using CenterId = std::int32_t;
+/** @brief Index of a `MapCorner` within `MapGraph::corners`. */
+using CornerId = std::int32_t;
+/** @brief Index of a `MapEdge` within `MapGraph::edges`. */
+using EdgeId = std::int32_t;
+/** @brief Index of a `MapRegion` within `MapGraph::regions`. */
+using RegionId = std::int32_t;
+/** @brief Index of a `MapCountry` within `MapGraph::countries`. */
+using CountryId = std::int32_t;
+
+/** @brief The value an unset `CenterId`, `CornerId` or `EdgeId` holds. */
+inline constexpr std::int32_t k_invalid_id = -1;
+
+/**
+ * @struct MapPoint
+ * @brief A position in grid space, where the map spans `[0, grid_size]` on both axes.
+ */
+struct MapPoint {
+    double x = 0.0; /**< @brief Horizontal position in grid units. */
+    double y = 0.0; /**< @brief Vertical position in grid units. */
+
+    /**
+     * @brief Euclidean distance to another point.
+     * @param other The point to measure to.
+     * @return The distance in grid units.
+     */
+    double distance_to(const MapPoint& other) const {
+        return std::sqrt((x - other.x) * (x - other.x) + (y - other.y) * (y - other.y));
+    }
+};
+
+/**
+ * @brief Sorts points counter-clockwise about their centroid, in place.
+ *
+ * Recovers a winding order from an unordered vertex set. Correct only for a
+ * convex polygon -- a subdivided cell boundary is not one, which is why
+ * `MapGraph::cell_outline()` builds its result in order and falls back to this
+ * only when a cell's edges do not form a closed ring.
+ *
+ * @param points The points to order.
+ */
+inline void sort_points_radially(std::vector<MapPoint>& points) {
+    if (points.size() < 3) {
+        return;
+    }
+    double sum_x = 0.0;
+    double sum_y = 0.0;
+    for (const MapPoint& point : points) {
+        sum_x += point.x;
+        sum_y += point.y;
+    }
+    const double count = static_cast<double>(points.size());
+    const MapPoint centroid{sum_x / count, sum_y / count};
+
+    std::sort(points.begin(), points.end(), [centroid](const MapPoint& a, const MapPoint& b) {
+        return std::atan2(a.y - centroid.y, a.x - centroid.x)
+             < std::atan2(b.y - centroid.y, b.x - centroid.x);
+    });
+}
+
+/**
+ * @brief Ray-casting point-in-polygon test; an odd crossing count means inside.
+ *
+ * Works for any simple polygon, convex or not, which matters because a cell
+ * outline is convex only before its edges are subdivided.
+ *
+ * @param polygon The polygon's vertices, in winding order.
+ * @param point The point to test.
+ * @return True if the point lies inside the polygon.
+ */
+inline bool point_in_polygon(const std::vector<MapPoint>& polygon, const MapPoint& point) {
+    bool inside = false;
+    const std::size_t count = polygon.size();
+    if (count < 3) {
+        return false;
+    }
+    for (std::size_t i = 0, j = count - 1; i < count; j = i++) {
+        const MapPoint& a = polygon[i];
+        const MapPoint& b = polygon[j];
+        if ((a.y > point.y) != (b.y > point.y)) {
+            const double denominator = b.y - a.y;
+            if (denominator == 0.0) {
+                continue;
+            }
+            const double x_at_y = (b.x - a.x) * (point.y - a.y) / denominator + a.x;
+            if (point.x < x_at_y) {
+                inside = !inside;
+            }
+        }
+    }
+    return inside;
+}
+
+/**
+ * @struct MapCenter
+ * @brief One Voronoi cell -- a polygon of terrain, and a vertex of the Delaunay triangulation.
+ *
+ * This is the unit gameplay cares about: it carries the biome, the elevation
+ * and the moisture. Its three adjacency lists hold indices into `MapGraph`
+ * rather than pointers; the original stored `shared_ptr`s in both directions,
+ * so `center -> corners -> touches -> center` formed a reference cycle and the
+ * entire graph leaked on every generation.
+ */
+struct MapCenter {
+    CenterId index = k_invalid_id; /**< @brief This cell's own index; equals its slot in `MapGraph::centers`. */
+    MapPoint point;                /**< @brief The generating site, at the polygon's approximate centre. */
+
+    bool water = false;  /**< @brief Lake or ocean. */
+    bool ocean = false;  /**< @brief Water connected to the map border; false for an inland lake. */
+    bool coast = false;  /**< @brief Land bordering at least one ocean cell. */
+    bool border = false; /**< @brief Lies in the forced-water band at the edge of the map. */
+
+    Biome biome = Biome::Ocean; /**< @brief Terrain classification, assigned by the biome pass. */
+    double elevation = 0.0;     /**< @brief Mean of the cell's corner elevations, in `[0, 1]`. */
+    double moisture = 0.0;      /**< @brief Mean of the cell's corner moistures, in `[0, 1]`. */
+    /** @brief Mean of the cell's corner temperatures, in `[0, 1]`; 0 polar, 1 equatorial. */
+    double temperature = 0.0;
+
+    /** @brief The region this cell belongs to, or `k_invalid_id` for water and unclaimed land. */
+    RegionId region = k_invalid_id;
+    /** @brief The country this cell belongs to, or `k_invalid_id`. */
+    CountryId country = k_invalid_id;
+
+    std::vector<CenterId> neighbors; /**< @brief Cells sharing an edge with this one. */
+    std::vector<EdgeId> borders;     /**< @brief Edges bounding this cell. */
+    std::vector<CornerId> corners;   /**< @brief Polygon vertices, sorted counter-clockwise. */
+};
+
+/**
+ * @struct MapCorner
+ * @brief One Voronoi vertex -- the circumcentre of a Delaunay triangle.
+ *
+ * Elevation, moisture and rivers are all computed here first and averaged down
+ * to cells afterwards, because water flows between corners, not between cells.
+ */
+struct MapCorner {
+    CornerId index = k_invalid_id; /**< @brief This corner's own index; equals its slot in `MapGraph::corners`. */
+    MapPoint point;                /**< @brief The circumcentre position. */
+
+    bool ocean = false;  /**< @brief Every cell touching this corner is ocean. */
+    bool water = false;  /**< @brief Lake or ocean. */
+    bool coast = false;  /**< @brief Touches both land and ocean cells. */
+    bool border = false; /**< @brief Lies at or beyond the map edge. */
+
+    double elevation = 0.0;    /**< @brief Height in `[0, 1]`, zero at the coast. */
+    double moisture = 0.0;     /**< @brief Wetness in `[0, 1]`. */
+    double temperature = 0.0;  /**< @brief Warmth in `[0, 1]`; 0 polar, 1 equatorial. */
+    int river = 0;             /**< @brief Volume of river water passing through, or 0 for none. */
+
+    std::vector<CenterId> touches;  /**< @brief Cells this corner is a vertex of. */
+    std::vector<EdgeId> protrudes;  /**< @brief Edges meeting at this corner. */
+    std::vector<CornerId> adjacent; /**< @brief Corners one edge away. */
+
+    /** @brief The adjacent corner water flows to; self when this is a local minimum. */
+    CornerId downslope = k_invalid_id;
+};
+
+/**
+ * @struct MapEdge
+ * @brief A Delaunay edge and its dual Voronoi edge, stored as one object.
+ *
+ * `d0`/`d1` are the two cells the edge separates; `v0`/`v1` are the two corners
+ * it runs between. Rivers follow the Voronoi edge, roads follow the Delaunay
+ * edge, which is why both live here.
+ */
+struct MapEdge {
+    EdgeId index = k_invalid_id; /**< @brief This edge's own index; equals its slot in `MapGraph::edges`. */
+
+    CenterId d0 = k_invalid_id; /**< @brief Cell on one side. */
+    CenterId d1 = k_invalid_id; /**< @brief Cell on the other side. */
+    CornerId v0 = k_invalid_id; /**< @brief Corner at one end. */
+    CornerId v1 = k_invalid_id; /**< @brief Corner at the other end. */
+
+    MapPoint midpoint; /**< @brief Halfway between `v0` and `v1`. */
+    int river = 0;     /**< @brief Volume of water flowing along this edge, or 0. */
+    bool noisy = false;/**< @brief The noisy-edge pass has already processed this edge. */
+    bool road = false; /**< @brief A road runs along this edge. */
+
+    /** @brief The wobbled path from `v0` to `midpoint`; exactly two points when not subdivided. */
+    std::vector<MapPoint> noisy_points0;
+    /** @brief The wobbled path from `v1` to `midpoint`; exactly two points when not subdivided. */
+    std::vector<MapPoint> noisy_points1;
+};
+
+/**
+ * @struct MapBuilding
+ * @brief One axis-aligned building footprint packed inside a settlement's cell.
+ */
+struct MapBuilding {
+    MapPoint point;        /**< @brief Footprint centre, in grid units. */
+    double width = 0.0;    /**< @brief Footprint width, in grid units. */
+    double height = 0.0;   /**< @brief Footprint height, in grid units. */
+    double rotation = 0.0; /**< @brief Yaw in radians, for a consumer that renders oriented meshes. */
+};
+
+/**
+ * @struct MapTown
+ * @brief A settlement occupying one cell, with the buildings packed into it.
+ */
+struct MapTown {
+    CenterId center = k_invalid_id;  /**< @brief The cell this settlement occupies. */
+    MapPoint point;                  /**< @brief Settlement centre, in grid units. */
+    TownTier tier = TownTier::Village; /**< @brief Size class, by site quality rank. */
+    double score = 0.0;              /**< @brief Habitability score the site was chosen on. */
+    std::string name;                /**< @brief Generated in the dialect of its region. */
+    RegionId region = k_invalid_id;  /**< @brief The region this settlement belongs to. */
+
+    /** @brief Number of occupied dwellings; equals `buildings.size()`. */
+    int households = 0;
+    /**
+     * @brief Souls living here.
+     *
+     * Derived from the building count rather than invented: each dwelling holds
+     * a drawn number of occupants, scaled by tier density and by how well the
+     * land feeds them. A settlement's population and its footprint therefore
+     * cannot disagree.
+     */
+    int population = 0;
+    /** @brief Relative wealth in `[0, 1]`, from site quality and access to trade. */
+    double prosperity = 0.0;
+
+    std::vector<MapBuilding> buildings; /**< @brief Footprints that fit inside the cell polygon. */
+};
+
+/**
+ * @brief The four corners of a building's footprint, with its yaw applied.
+ *
+ * Returned counter-clockwise from the footprint's local bottom-left. This is
+ * the authoritative shape of a building: `MapBuilding::point` is only its
+ * centre, and the generator guarantees containment and non-overlap against
+ * *these* corners, not against an axis-aligned box.
+ *
+ * @param building The building to expand.
+ * @return Its four corners in world grid units.
+ */
+inline std::array<MapPoint, 4> building_corners(const MapBuilding& building) {
+    const double half_w = building.width * 0.5;
+    const double half_h = building.height * 0.5;
+    const double c = std::cos(building.rotation);
+    const double s = std::sin(building.rotation);
+
+    const double local[4][2] = {{-half_w, -half_h}, {half_w, -half_h},
+                                {half_w, half_h},   {-half_w, half_h}};
+    std::array<MapPoint, 4> corners{};
+    for (std::size_t i = 0; i < 4; ++i) {
+        corners[i] = {building.point.x + local[i][0] * c - local[i][1] * s,
+                      building.point.y + local[i][0] * s + local[i][1] * c};
+    }
+    return corners;
+}
+
+/**
+ * @brief Separating-axis test for two oriented footprints.
+ *
+ * Two convex shapes miss each other exactly when some axis separates their
+ * projections, and for rectangles only the four edge normals can be that axis.
+ * A bounding-circle test would be cheaper but rejects far more than it needs
+ * to, which would stop buildings from lining a street closely enough to read
+ * as one.
+ *
+ * @param a First footprint.
+ * @param b Second footprint.
+ * @return True if the two footprints intersect.
+ */
+inline bool buildings_overlap(const MapBuilding& a, const MapBuilding& b) {
+    const std::array<MapPoint, 4> box_a = building_corners(a);
+    const std::array<MapPoint, 4> box_b = building_corners(b);
+
+    for (int shape = 0; shape < 2; ++shape) {
+        const std::array<MapPoint, 4>& source = shape == 0 ? box_a : box_b;
+        for (std::size_t i = 0; i < 2; ++i) {
+            // Edge normal; only two per rectangle are distinct.
+            const double axis_x = -(source[i + 1].y - source[i].y);
+            const double axis_y = source[i + 1].x - source[i].x;
+            const double length = std::hypot(axis_x, axis_y);
+            if (length == 0.0) {
+                continue;
+            }
+            const double nx = axis_x / length;
+            const double ny = axis_y / length;
+
+            double min_a = 0.0, max_a = 0.0, min_b = 0.0, max_b = 0.0;
+            for (std::size_t k = 0; k < 4; ++k) {
+                const double pa = box_a[k].x * nx + box_a[k].y * ny;
+                const double pb = box_b[k].x * nx + box_b[k].y * ny;
+                if (k == 0) {
+                    min_a = max_a = pa;
+                    min_b = max_b = pb;
+                } else {
+                    min_a = std::min(min_a, pa); max_a = std::max(max_a, pa);
+                    min_b = std::min(min_b, pb); max_b = std::max(max_b, pb);
+                }
+            }
+            if (max_a <= min_b || max_b <= min_a) {
+                return false; // This axis separates them.
+            }
+        }
+    }
+    return true;
+}
+
+/**
+ * @struct MapLandmark
+ * @brief A notable place worth putting on a map and worth travelling to.
+ */
+struct MapLandmark {
+    CenterId center = k_invalid_id;  /**< @brief The cell it stands on. */
+    MapPoint point;                  /**< @brief Its position, in grid units. */
+    LandmarkKind kind = LandmarkKind::Ruins; /**< @brief What sort of place it is. */
+    std::string name;                /**< @brief Named in the dialect of its region. */
+    RegionId region = k_invalid_id;  /**< @brief The region it lies in, or invalid. */
+};
+
+/**
+ * @brief The language seed for a country, from the map seed and its id.
+ *
+ * Shared so the region pass and the town pass derive the same language without
+ * passing one between them.
+ *
+ * @param map_seed `MapConfig::seed`.
+ * @param country The country's id.
+ * @return A stable seed for `language_for()`.
+ */
+inline std::uint32_t country_language_seed(int map_seed, CountryId country) {
+    return static_cast<std::uint32_t>(map_seed) * 2654435761u
+         + static_cast<std::uint32_t>(country + 1) * 40503u;
+}
+
+/**
+ * @brief The dialect seed for a region, from the map seed and its id.
+ * @param map_seed `MapConfig::seed`.
+ * @param region The region's id.
+ * @return A stable seed for `dialect_for()`.
+ */
+inline std::uint32_t region_dialect_seed(int map_seed, RegionId region) {
+    return static_cast<std::uint32_t>(map_seed) * 2246822519u
+         + static_cast<std::uint32_t>(region + 1) * 3266489917u;
+}
+
+/**
+ * @struct MapRegion
+ * @brief A province: a contiguous block of cells inside one country.
+ *
+ * Regions are the unit a settlement belongs to and takes its name from. Each
+ * carries a dialect of its country's language, so its towns sound related to
+ * their neighbours without being identical.
+ */
+struct MapRegion {
+    RegionId index = k_invalid_id;   /**< @brief This region's own index in `MapGraph::regions`. */
+    CountryId country = k_invalid_id;/**< @brief The country this region belongs to. */
+    std::string name;                /**< @brief Generated in the region's own dialect. */
+
+    CenterId seed = k_invalid_id;    /**< @brief The cell the region grew outward from. */
+    CenterId capital = k_invalid_id; /**< @brief Its foremost settlement's cell, or invalid. */
+    std::vector<CenterId> cells;     /**< @brief Every cell claimed by this region. */
+
+    Biome dominant_biome = Biome::Grassland; /**< @brief The biome covering the most of it. */
+    int population = 0;              /**< @brief Sum of its settlements' populations. */
+    double area = 0.0;               /**< @brief Total cell area, in square grid units. */
+    glm::vec3 color = glm::vec3(255.0f); /**< @brief Tint used when regions are drawn. */
+};
+
+/**
+ * @struct MapCountry
+ * @brief A nation: one or more regions under a single language.
+ */
+struct MapCountry {
+    CountryId index = k_invalid_id;  /**< @brief This country's own index in `MapGraph::countries`. */
+    std::string name;                /**< @brief Generated in the country's language. */
+
+    std::vector<RegionId> regions;   /**< @brief The regions it is divided into. */
+    CenterId capital = k_invalid_id; /**< @brief Its largest settlement's cell, or invalid. */
+    int population = 0;              /**< @brief Sum of its regions' populations. */
+    double area = 0.0;               /**< @brief Total claimed area, in square grid units. */
+    glm::vec3 color = glm::vec3(255.0f); /**< @brief Tint used when countries are drawn. */
+};
+
+/**
+ * @class MapGraph
+ * @brief Owns every cell, corner, edge and settlement of one generated map.
+ *
+ * The three arrays are index-addressed and self-consistent: `centers[i].index
+ * == i` holds for all three after generation, and every id stored in an
+ * adjacency list is a valid slot in the corresponding array. Passes that
+ * reorder anything must sort an index array instead of the storage itself.
+ */
+class MapGraph {
+public:
+    std::vector<MapCenter> centers; /**< @brief Voronoi cells, one per generating site. */
+    std::vector<MapCorner> corners; /**< @brief Voronoi vertices, one per Delaunay triangle. */
+    std::vector<MapEdge> edges;     /**< @brief Shared Delaunay/Voronoi edges. */
+    std::vector<MapTown> towns;     /**< @brief Settlements placed by the town pass. */
+    std::vector<MapRegion> regions; /**< @brief Provinces carved by the region pass. */
+    std::vector<MapCountry> countries; /**< @brief Nations carved by the region pass. */
+    std::vector<MapLandmark> landmarks; /**< @brief Notable places found by the landmark pass. */
+
+    /** @brief Drops every array, returning the graph to its freshly constructed state. */
+    void clear() {
+        centers.clear();
+        corners.clear();
+        edges.clear();
+        towns.clear();
+        regions.clear();
+        countries.clear();
+        landmarks.clear();
+    }
+
+    /**
+     * @brief Interpolates elevation inside a cell from its corner heights.
+     *
+     * Inverse-distance weighted across the cell's corners, which gives a smooth
+     * surface that agrees with the neighbouring cell along their shared edge.
+     *
+     * @param center The cell to sample within.
+     * @param x Horizontal grid position.
+     * @param y Vertical grid position.
+     * @return The interpolated height, or 0 if the cell has no corners.
+     */
+    double elevation_at(const MapCenter& center, double x, double y) const {
+        const MapPoint query{x, y};
+        double total_weight = 0.0;
+        double weighted_elevation = 0.0;
+
+        for (const CornerId corner_id : center.corners) {
+            const MapCorner& corner = corners[static_cast<std::size_t>(corner_id)];
+            const double distance = query.distance_to(corner.point);
+            if (distance == 0.0) {
+                return corner.elevation;
+            }
+            const double weight = 1.0 / distance;
+            weighted_elevation += weight * corner.elevation;
+            total_weight += weight;
+        }
+
+        if (total_weight == 0.0) {
+            return 0.0;
+        }
+        return weighted_elevation / total_weight;
+    }
+
+    /**
+     * @brief Interpolates elevation along an edge from its two endpoint heights.
+     * @param edge The edge to sample along.
+     * @param x Horizontal grid position.
+     * @param y Vertical grid position.
+     * @return The interpolated height, or 0 if either endpoint is unset.
+     */
+    double elevation_at(const MapEdge& edge, double x, double y) const {
+        if (edge.v0 == k_invalid_id || edge.v1 == k_invalid_id) {
+            return 0.0;
+        }
+        const MapCorner& c0 = corners[static_cast<std::size_t>(edge.v0)];
+        const MapCorner& c1 = corners[static_cast<std::size_t>(edge.v1)];
+
+        const MapPoint query{x, y};
+        const double distance_to_v0 = query.distance_to(c0.point);
+        const double distance_to_v1 = query.distance_to(c1.point);
+        const double total_distance = distance_to_v0 + distance_to_v1;
+
+        if (total_distance == 0.0) {
+            return c0.elevation;
+        }
+        return (distance_to_v1 / total_distance) * c0.elevation
+             + (distance_to_v0 / total_distance) * c1.elevation;
+    }
+
+    /**
+     * @brief Collects a cell's polygon outline in grid space, in winding order.
+     *
+     * Walks the cell's corners -- which the generator has already sorted
+     * counter-clockwise -- and, for each consecutive pair, appends the whole
+     * path of the edge joining them. Each edge stores its path as two halves
+     * meeting at the midpoint, so one half is reversed to run the right way
+     * round.
+     *
+     * Building the outline in order matters once edges are subdivided: a
+     * wobbled path is not in convex position, so re-deriving the winding by
+     * sorting the points about their centroid puts near-collinear points in the
+     * wrong order and the fill tears. Cells whose edges do not form a closed
+     * ring -- only possible at the outer hull -- fall back to the unordered
+     * point set, which the caller sorts.
+     *
+     * @param center The cell to outline.
+     * @return The polygon's vertices, in grid units and winding order.
+     */
+    std::vector<MapPoint> cell_outline(const MapCenter& center) const {
+        std::vector<MapPoint> outline;
+        const std::size_t corner_count = center.corners.size();
+
+        if (corner_count >= 3) {
+            bool complete = true;
+            for (std::size_t i = 0; i < corner_count && complete; ++i) {
+                const CornerId from = center.corners[i];
+                const CornerId to = center.corners[(i + 1) % corner_count];
+
+                const EdgeId edge_id = edge_between(center, from, to);
+                if (edge_id == k_invalid_id) {
+                    complete = false;
+                    break;
+                }
+
+                const MapEdge& edge = edges[static_cast<std::size_t>(edge_id)];
+                const bool forward = (edge.v0 == from);
+                const std::vector<MapPoint>& first = forward ? edge.noisy_points0 : edge.noisy_points1;
+                const std::vector<MapPoint>& second = forward ? edge.noisy_points1 : edge.noisy_points0;
+
+                outline.insert(outline.end(), first.begin(), first.end());
+                outline.insert(outline.end(), second.rbegin(), second.rend());
+            }
+            if (complete) {
+                return outline;
+            }
+            outline.clear();
+        }
+
+        for (const EdgeId edge_id : center.borders) {
+            const MapEdge& edge = edges[static_cast<std::size_t>(edge_id)];
+            outline.insert(outline.end(), edge.noisy_points0.begin(), edge.noisy_points0.end());
+            outline.insert(outline.end(), edge.noisy_points1.begin(), edge.noisy_points1.end());
+        }
+        sort_points_radially(outline);
+        return outline;
+    }
+
+    /**
+     * @brief Finds the edge of a cell joining two of its corners.
+     *
+     * Scans only the cell's own bounding edges, of which there are as many as
+     * it has corners.
+     *
+     * @param center The cell whose boundary to search.
+     * @param a One corner.
+     * @param b The other corner.
+     * @return The joining edge, or `k_invalid_id` if the corners are not adjacent.
+     */
+    EdgeId edge_between(const MapCenter& center, CornerId a, CornerId b) const {
+        for (const EdgeId edge_id : center.borders) {
+            const MapEdge& edge = edges[static_cast<std::size_t>(edge_id)];
+            if ((edge.v0 == a && edge.v1 == b) || (edge.v0 == b && edge.v1 == a)) {
+                return edge_id;
+            }
+        }
+        return k_invalid_id;
+    }
+};
+
+} // namespace maps
+} // namespace coopa
+
+#endif // COOPA_MAPS_MAP_DATA_H
