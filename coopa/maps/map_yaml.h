@@ -8,6 +8,7 @@
 
 #include <cstddef>
 #include <exception>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -121,6 +122,56 @@ inline T read_or(const fkyaml::node& node, const char* key, T fallback) {
     }
 }
 
+/**
+ * @brief Encodes a `NoiseConfig` as a mapping node.
+ *
+ * Factored out because `MapConfig` carries two noise fields -- the island field
+ * and the temperature variation field -- and eight keys written twice by hand is
+ * eight chances for the second copy to fall behind the first.
+ *
+ * @param noise The field parameters to encode.
+ * @return A mapping node holding all eight parameters.
+ */
+inline fkyaml::node noise_to_node(const NoiseConfig& noise) {
+    fkyaml::node node = fkyaml::node::mapping();
+    node["seed"] = noise.seed;
+    node["frequency"] = noise.frequency;
+    node["type"] = static_cast<int>(noise.type);
+    node["fractal_type"] = static_cast<int>(noise.fractal_type);
+    node["octaves"] = noise.octaves;
+    node["lacunarity"] = noise.lacunarity;
+    node["gain"] = noise.gain;
+    node["weighted_strength"] = noise.weighted_strength;
+    return node;
+}
+
+/**
+ * @brief Reads a `NoiseConfig` back from a parent mapping, if the key is present.
+ *
+ * The two enum-typed fields go through `int`: they are FastNoiseLite's own enums
+ * and the document stores the underlying value, not a name.
+ *
+ * @param parent The mapping that may contain the block.
+ * @param key The block's key, e.g. `"noise_island"`.
+ * @param noise Updated in place; any absent key keeps its current value.
+ */
+inline void noise_from_node(const fkyaml::node& parent, const char* key, NoiseConfig& noise) {
+    if (!parent.is_mapping() || !parent.contains(key)) {
+        return;
+    }
+    const fkyaml::node& node = parent.at(key);
+    noise.seed = read_or(node, "seed", noise.seed);
+    noise.frequency = read_or(node, "frequency", noise.frequency);
+    noise.type = static_cast<FastNoiseLite::NoiseType>(
+        read_or(node, "type", static_cast<int>(noise.type)));
+    noise.fractal_type = static_cast<FastNoiseLite::FractalType>(
+        read_or(node, "fractal_type", static_cast<int>(noise.fractal_type)));
+    noise.octaves = read_or(node, "octaves", noise.octaves);
+    noise.lacunarity = read_or(node, "lacunarity", noise.lacunarity);
+    noise.gain = read_or(node, "gain", noise.gain);
+    noise.weighted_strength = read_or(node, "weighted_strength", noise.weighted_strength);
+}
+
 } // namespace detail
 
 /**
@@ -129,40 +180,70 @@ inline T read_or(const fkyaml::node& node, const char* key, T fallback) {
  * @return A mapping node holding every generation parameter.
  */
 inline fkyaml::node config_to_node(const MapConfig& config) {
-    fkyaml::node noise = fkyaml::node::mapping();
-    noise["seed"] = config.noise_island.seed;
-    noise["frequency"] = config.noise_island.frequency;
-    noise["type"] = static_cast<int>(config.noise_island.type);
-    noise["fractal_type"] = static_cast<int>(config.noise_island.fractal_type);
-    noise["octaves"] = config.noise_island.octaves;
-    noise["lacunarity"] = config.noise_island.lacunarity;
-    noise["gain"] = config.noise_island.gain;
-    noise["weighted_strength"] = config.noise_island.weighted_strength;
-
     fkyaml::node towns = fkyaml::node::mapping();
     towns["town_count"] = config.towns.town_count;
-    towns["min_spacing"] = config.towns.min_spacing;
+    towns["min_spacing_m"] = config.towns.min_spacing_m;
     towns["capital_count"] = config.towns.capital_count;
     towns["town_tier_count"] = config.towns.town_tier_count;
+    towns["capital_cells"] = config.towns.capital_cells;
+    towns["town_cells"] = config.towns.town_cells;
+    towns["village_cells"] = config.towns.village_cells;
     towns["buildings_per_town"] = config.towns.buildings_per_town;
-    towns["building_size_min"] = config.towns.building_size_min;
-    towns["building_size_max"] = config.towns.building_size_max;
+    towns["building_size_min_m"] = config.towns.building_size_min_m;
+    towns["building_size_max_m"] = config.towns.building_size_max_m;
     towns["town_building_scale"] = config.towns.town_building_scale;
     towns["village_building_scale"] = config.towns.village_building_scale;
-    towns["water_clearance"] = config.towns.water_clearance;
+    towns["water_clearance_m"] = config.towns.water_clearance_m;
     towns["household_size_min"] = config.towns.household_size_min;
     towns["household_size_max"] = config.towns.household_size_max;
     towns["capital_density"] = config.towns.capital_density;
     towns["town_density"] = config.towns.town_density;
-    towns["street_offset"] = config.towns.street_offset;
-    towns["street_spacing"] = config.towns.street_spacing;
-    towns["position_jitter"] = config.towns.position_jitter;
+    towns["street_offset_m"] = config.towns.street_offset_m;
+    towns["street_spacing_m"] = config.towns.street_spacing_m;
+    towns["position_jitter_m"] = config.towns.position_jitter_m;
     towns["rotation_jitter"] = config.towns.rotation_jitter;
     towns["infill_attempts"] = config.towns.infill_attempts;
 
+    fkyaml::node regions = fkyaml::node::mapping();
+    regions["country_count"] = config.regions.country_count;
+    regions["regions_per_country"] = config.regions.regions_per_country;
+    regions["min_country_spacing"] = config.regions.min_country_spacing;
+    regions["elevation_cost"] = config.regions.elevation_cost;
+    regions["water_crossing_cost"] = config.regions.water_crossing_cost;
+
+    fkyaml::node landmarks = fkyaml::node::mapping();
+    landmarks["max_natural"] = config.landmarks.max_natural;
+    landmarks["max_abandoned"] = config.landmarks.max_abandoned;
+    landmarks["peak_elevation"] = config.landmarks.peak_elevation;
+    landmarks["waterfall_drop"] = config.landmarks.waterfall_drop;
+    landmarks["canyon_elevation"] = config.landmarks.canyon_elevation;
+    landmarks["great_lake_cells"] = static_cast<int>(config.landmarks.great_lake_cells);
+    landmarks["town_clearance"] = config.landmarks.town_clearance;
+    landmarks["kind_share_numerator"] = config.landmarks.kind_share_numerator;
+    landmarks["kind_share_denominator"] = config.landmarks.kind_share_denominator;
+    landmarks["cape_ocean_ratio_numerator"] = config.landmarks.cape_ocean_ratio_numerator;
+    landmarks["cape_ocean_ratio_denominator"] = config.landmarks.cape_ocean_ratio_denominator;
+
+    // The pass toggles live under one key rather than loose at the root: there are
+    // twelve of them, they are the coarsest thing in the file, and grouping them
+    // is what lets a reader see the pipeline at a glance.
+    fkyaml::node passes = fkyaml::node::mapping();
+    passes["enable_water"] = config.enable_water;
+    passes["enable_coast"] = config.enable_coast;
+    passes["enable_elevation"] = config.enable_elevation;
+    passes["enable_temperature"] = config.enable_temperature;
+    passes["enable_rivers"] = config.enable_rivers;
+    passes["enable_moisture"] = config.enable_moisture;
+    passes["enable_biomes"] = config.enable_biomes;
+    passes["enable_roads"] = config.enable_roads;
+    passes["enable_regions"] = config.enable_regions;
+    passes["enable_towns"] = config.enable_towns;
+    passes["enable_landmarks"] = config.enable_landmarks;
+    passes["enable_noisy_edges"] = config.enable_noisy_edges;
+
     fkyaml::node roads = fkyaml::node::mapping();
     roads["hub_count"] = config.roads.hub_count;
-    roads["hub_min_spacing"] = config.roads.hub_min_spacing;
+    roads["hub_min_spacing_m"] = config.roads.hub_min_spacing_m;
     roads["slope_cost"] = config.roads.slope_cost;
     roads["elevation_cost"] = config.roads.elevation_cost;
     roads["rough_ground_cost"] = config.roads.rough_ground_cost;
@@ -179,56 +260,85 @@ inline fkyaml::node config_to_node(const MapConfig& config) {
     node["seed"] = config.seed;
     node["grid_size"] = config.grid_size;
     node["jitter"] = config.jitter;
+    node["meters_per_grid_unit"] = config.meters_per_grid_unit;
+    node["meters_per_pixel"] = config.meters_per_pixel;
+    node["composite_shading"] = std::string(composite_shading_name(config.composite_shading));
     node["image_size"] = config.image_size;
+    node["png_compression_level"] = config.png_compression_level;
     node["border_length"] = config.border_length;
     node["threshold_water"] = config.threshold_water;
     node["threshold_water_count"] = config.threshold_water_count;
     node["river_count"] = config.river_count;
-    node["river_width_base"] = config.river_width_base;
-    node["river_width_per_volume"] = config.river_width_per_volume;
-    node["trail_width"] = config.trail_width;
-    node["road_width"] = config.road_width;
-    node["highway_width"] = config.highway_width;
+    node["river_min_length"] = config.river_min_length;
+    node["river_source_min_elevation"] = config.river_source_min_elevation;
+    node["river_source_max_elevation"] = config.river_source_max_elevation;
+    node["river_smoothing_iterations"] = config.river_smoothing_iterations;
+    node["river_width_base_m"] = config.river_width_base_m;
+    node["river_width_per_volume_m"] = config.river_width_per_volume_m;
+    node["trail_width_m"] = config.trail_width_m;
+    node["road_width_m"] = config.road_width_m;
+    node["highway_width_m"] = config.highway_width_m;
     node["temperature_lapse_rate"] = config.temperature_lapse_rate;
     node["temperature_falloff"] = config.temperature_falloff;
     node["elevation_smoothing_iterations"] = config.elevation_smoothing_iterations;
     node["elevation_smoothing_strength"] = config.elevation_smoothing_strength;
     node["subdivide_noisy_edges"] = config.subdivide_noisy_edges;
-    node["noise_island"] = std::move(noise);
+    node["show_regions"] = config.show_regions;
+    node["region_tint"] = config.region_tint;
+    node["noise_island"] = detail::noise_to_node(config.noise_island);
+    node["noise_temperature"] = detail::noise_to_node(config.noise_temperature);
     node["towns"] = std::move(towns);
     node["roads"] = std::move(roads);
+    node["regions"] = std::move(regions);
+    node["landmarks"] = std::move(landmarks);
+    node["passes"] = std::move(passes);
     return node;
 }
 
 /**
- * @brief Reads a `MapConfig` back from a YAML mapping node.
+ * @brief Applies a YAML mapping node on top of an existing `MapConfig`.
  *
- * Every key is optional and falls back to the in-struct default, so a map
+ * Every key is optional; one that is absent leaves the corresponding field
+ * exactly as it was. That is what makes a configuration file *override* a
+ * caller's defaults rather than replace them wholesale, and it is also why a map
  * saved before a parameter existed still loads.
  *
- * @param node The mapping node to decode.
- * @return The decoded configuration.
+ * @param node The mapping node to decode; a non-mapping node applies nothing.
+ * @param config Updated in place.
  */
-inline MapConfig config_from_node(const fkyaml::node& node) {
-    MapConfig config;
+inline void apply_config_node(const fkyaml::node& node, MapConfig& config) {
     if (!node.is_mapping()) {
-        return config;
+        return;
     }
 
     config.seed = detail::read_or(node, "seed", config.seed);
     config.grid_size = detail::read_or(node, "grid_size", config.grid_size);
     config.jitter = detail::read_or(node, "jitter", config.jitter);
+    config.meters_per_grid_unit =
+        detail::read_or(node, "meters_per_grid_unit", config.meters_per_grid_unit);
+    config.meters_per_pixel = detail::read_or(node, "meters_per_pixel", config.meters_per_pixel);
+    config.composite_shading = composite_shading_from_name(detail::read_or(
+        node, "composite_shading", std::string(composite_shading_name(config.composite_shading))));
     config.image_size = detail::read_or(node, "image_size", config.image_size);
+    config.png_compression_level =
+        detail::read_or(node, "png_compression_level", config.png_compression_level);
     config.border_length = detail::read_or(node, "border_length", config.border_length);
     config.threshold_water = detail::read_or(node, "threshold_water", config.threshold_water);
     config.threshold_water_count = detail::read_or(node, "threshold_water_count", config.threshold_water_count);
     config.river_count = detail::read_or(node, "river_count", config.river_count);
-    config.river_width_base = detail::read_or(node, "river_width_base", config.river_width_base);
-    config.river_width_per_volume =
-        detail::read_or(node, "river_width_per_volume", config.river_width_per_volume);
-    config.trail_width = detail::read_or(node, "trail_width", config.trail_width);
-    config.road_width = detail::read_or(node, "road_width", config.road_width);
-    config.highway_width = detail::read_or(node, "highway_width", config.highway_width);
+    config.river_min_length = detail::read_or(node, "river_min_length", config.river_min_length);
+    config.river_source_min_elevation =
+        detail::read_or(node, "river_source_min_elevation", config.river_source_min_elevation);
+    config.river_source_max_elevation =
+        detail::read_or(node, "river_source_max_elevation", config.river_source_max_elevation);
+    config.river_smoothing_iterations =
+        detail::read_or(node, "river_smoothing_iterations", config.river_smoothing_iterations);
+    config.river_width_base_m = detail::read_or(node, "river_width_base_m", config.river_width_base_m);
+    config.river_width_per_volume_m =
+        detail::read_or(node, "river_width_per_volume_m", config.river_width_per_volume_m);
+    config.trail_width_m = detail::read_or(node, "trail_width_m", config.trail_width_m);
+    config.road_width_m = detail::read_or(node, "road_width_m", config.road_width_m);
+    config.highway_width_m = detail::read_or(node, "highway_width_m", config.highway_width_m);
     config.temperature_lapse_rate =
         detail::read_or(node, "temperature_lapse_rate", config.temperature_lapse_rate);
     config.temperature_falloff =
@@ -238,40 +348,101 @@ inline MapConfig config_from_node(const fkyaml::node& node) {
     config.elevation_smoothing_strength =
         detail::read_or(node, "elevation_smoothing_strength", config.elevation_smoothing_strength);
 
+    // Legacy: widths were grid-unit fractions before they were metres. Scale them
+    // by the world scale rather than ignoring them, so a map saved in between the
+    // two conventions still draws its rivers and roads at the size it meant.
+    const auto grid_key_as_meters = [&node, &config](const char* metre_key, const char* grid_key,
+                                                     double& target) {
+        if (!node.contains(metre_key) && node.contains(grid_key)) {
+            target = detail::read_or(node, grid_key, 0.0) * config.meters_per_grid_unit;
+        }
+    };
+    grid_key_as_meters("river_width_base_m", "river_width_base", config.river_width_base_m);
+    grid_key_as_meters("river_width_per_volume_m", "river_width_per_volume",
+                       config.river_width_per_volume_m);
+    grid_key_as_meters("trail_width_m", "trail_width", config.trail_width_m);
+    grid_key_as_meters("road_width_m", "road_width", config.road_width_m);
+    grid_key_as_meters("highway_width_m", "highway_width", config.highway_width_m);
+
     // Legacy: widths used to be pixel counts at a nominal 1024 render of a
     // 40-unit grid. Convert rather than ignore, so a map saved before widths
     // became physical still draws its rivers and roads at the intended size.
-    if (!node.contains("river_width_base") && node.contains("river_factor")) {
+    if (!node.contains("river_width_base_m") && node.contains("river_factor")) {
         const double pixels = static_cast<double>(detail::read_or(node, "river_factor", 1));
-        config.river_width_base = (pixels * 2.0) / k_legacy_pixels_per_grid_unit;
-        config.river_width_per_volume = 2.0 / k_legacy_pixels_per_grid_unit;
+        config.river_width_base_m = (pixels * 2.0) / k_legacy_pixels_per_grid_unit;
+        config.river_width_per_volume_m = 2.0 / k_legacy_pixels_per_grid_unit;
     }
-    if (!node.contains("road_width") && node.contains("road_size")) {
+    if (!node.contains("road_width_m") && node.contains("road_size")) {
         const double pixels = static_cast<double>(detail::read_or(node, "road_size", 1));
-        config.road_width = (pixels * 2.0) / k_legacy_pixels_per_grid_unit;
+        config.road_width_m = (pixels * 2.0) / k_legacy_pixels_per_grid_unit;
     }
     config.subdivide_noisy_edges = detail::read_or(node, "subdivide_noisy_edges", config.subdivide_noisy_edges);
 
-    if (node.contains("noise_island")) {
-        const fkyaml::node& noise = node.at("noise_island");
-        config.noise_island.seed = detail::read_or(noise, "seed", config.noise_island.seed);
-        config.noise_island.frequency = detail::read_or(noise, "frequency", config.noise_island.frequency);
-        config.noise_island.type = static_cast<FastNoiseLite::NoiseType>(
-            detail::read_or(noise, "type", static_cast<int>(config.noise_island.type)));
-        config.noise_island.fractal_type = static_cast<FastNoiseLite::FractalType>(
-            detail::read_or(noise, "fractal_type", static_cast<int>(config.noise_island.fractal_type)));
-        config.noise_island.octaves = detail::read_or(noise, "octaves", config.noise_island.octaves);
-        config.noise_island.lacunarity = detail::read_or(noise, "lacunarity", config.noise_island.lacunarity);
-        config.noise_island.gain = detail::read_or(noise, "gain", config.noise_island.gain);
-        config.noise_island.weighted_strength =
-            detail::read_or(noise, "weighted_strength", config.noise_island.weighted_strength);
+    config.show_regions = detail::read_or(node, "show_regions", config.show_regions);
+    config.region_tint = detail::read_or(node, "region_tint", config.region_tint);
+
+    detail::noise_from_node(node, "noise_island", config.noise_island);
+    detail::noise_from_node(node, "noise_temperature", config.noise_temperature);
+
+    if (node.contains("regions")) {
+        const fkyaml::node& regions = node.at("regions");
+        RegionConfig& target = config.regions;
+        target.country_count = detail::read_or(regions, "country_count", target.country_count);
+        target.regions_per_country =
+            detail::read_or(regions, "regions_per_country", target.regions_per_country);
+        target.min_country_spacing =
+            detail::read_or(regions, "min_country_spacing", target.min_country_spacing);
+        target.elevation_cost = detail::read_or(regions, "elevation_cost", target.elevation_cost);
+        target.water_crossing_cost =
+            detail::read_or(regions, "water_crossing_cost", target.water_crossing_cost);
+    }
+
+    if (node.contains("landmarks")) {
+        const fkyaml::node& landmarks = node.at("landmarks");
+        LandmarkConfig& target = config.landmarks;
+        target.max_natural = detail::read_or(landmarks, "max_natural", target.max_natural);
+        target.max_abandoned = detail::read_or(landmarks, "max_abandoned", target.max_abandoned);
+        target.peak_elevation = detail::read_or(landmarks, "peak_elevation", target.peak_elevation);
+        target.waterfall_drop = detail::read_or(landmarks, "waterfall_drop", target.waterfall_drop);
+        target.canyon_elevation =
+            detail::read_or(landmarks, "canyon_elevation", target.canyon_elevation);
+        target.great_lake_cells = static_cast<std::size_t>(detail::read_or(
+            landmarks, "great_lake_cells", static_cast<int>(target.great_lake_cells)));
+        target.town_clearance = detail::read_or(landmarks, "town_clearance", target.town_clearance);
+        target.kind_share_numerator =
+            detail::read_or(landmarks, "kind_share_numerator", target.kind_share_numerator);
+        target.kind_share_denominator =
+            detail::read_or(landmarks, "kind_share_denominator", target.kind_share_denominator);
+        target.cape_ocean_ratio_numerator = detail::read_or(
+            landmarks, "cape_ocean_ratio_numerator", target.cape_ocean_ratio_numerator);
+        target.cape_ocean_ratio_denominator = detail::read_or(
+            landmarks, "cape_ocean_ratio_denominator", target.cape_ocean_ratio_denominator);
+    }
+
+    if (node.contains("passes")) {
+        const fkyaml::node& passes = node.at("passes");
+        config.enable_water = detail::read_or(passes, "enable_water", config.enable_water);
+        config.enable_coast = detail::read_or(passes, "enable_coast", config.enable_coast);
+        config.enable_elevation = detail::read_or(passes, "enable_elevation", config.enable_elevation);
+        config.enable_temperature =
+            detail::read_or(passes, "enable_temperature", config.enable_temperature);
+        config.enable_rivers = detail::read_or(passes, "enable_rivers", config.enable_rivers);
+        config.enable_moisture = detail::read_or(passes, "enable_moisture", config.enable_moisture);
+        config.enable_biomes = detail::read_or(passes, "enable_biomes", config.enable_biomes);
+        config.enable_roads = detail::read_or(passes, "enable_roads", config.enable_roads);
+        config.enable_regions = detail::read_or(passes, "enable_regions", config.enable_regions);
+        config.enable_towns = detail::read_or(passes, "enable_towns", config.enable_towns);
+        config.enable_landmarks =
+            detail::read_or(passes, "enable_landmarks", config.enable_landmarks);
+        config.enable_noisy_edges =
+            detail::read_or(passes, "enable_noisy_edges", config.enable_noisy_edges);
     }
 
     if (node.contains("roads")) {
         const fkyaml::node& roads = node.at("roads");
         RoadConfig& target = config.roads;
         target.hub_count = detail::read_or(roads, "hub_count", target.hub_count);
-        target.hub_min_spacing = detail::read_or(roads, "hub_min_spacing", target.hub_min_spacing);
+        target.hub_min_spacing_m = detail::read_or(roads, "hub_min_spacing_m", target.hub_min_spacing_m);
         target.slope_cost = detail::read_or(roads, "slope_cost", target.slope_cost);
         target.elevation_cost = detail::read_or(roads, "elevation_cost", target.elevation_cost);
         target.rough_ground_cost =
@@ -294,27 +465,30 @@ inline MapConfig config_from_node(const fkyaml::node& node) {
     if (node.contains("towns")) {
         const fkyaml::node& towns = node.at("towns");
         config.towns.town_count = detail::read_or(towns, "town_count", config.towns.town_count);
-        config.towns.min_spacing = detail::read_or(towns, "min_spacing", config.towns.min_spacing);
+        config.towns.min_spacing_m = detail::read_or(towns, "min_spacing_m", config.towns.min_spacing_m);
         config.towns.capital_count = detail::read_or(towns, "capital_count", config.towns.capital_count);
         config.towns.town_tier_count = detail::read_or(towns, "town_tier_count", config.towns.town_tier_count);
+        config.towns.capital_cells = detail::read_or(towns, "capital_cells", config.towns.capital_cells);
+        config.towns.town_cells = detail::read_or(towns, "town_cells", config.towns.town_cells);
+        config.towns.village_cells = detail::read_or(towns, "village_cells", config.towns.village_cells);
         config.towns.buildings_per_town = detail::read_or(towns, "buildings_per_town", config.towns.buildings_per_town);
-        config.towns.building_size_min =
-            detail::read_or(towns, "building_size_min", config.towns.building_size_min);
-        config.towns.building_size_max =
-            detail::read_or(towns, "building_size_max", config.towns.building_size_max);
+        config.towns.building_size_min_m =
+            detail::read_or(towns, "building_size_min_m", config.towns.building_size_min_m);
+        config.towns.building_size_max_m =
+            detail::read_or(towns, "building_size_max_m", config.towns.building_size_max_m);
         // Legacy: one fixed size became a range. Collapse the range onto it so an
         // older map's buildings keep exactly the footprint they were saved with.
-        if (!towns.contains("building_size_min") && towns.contains("building_size")) {
-            const double fixed = detail::read_or(towns, "building_size", config.towns.building_size_min);
-            config.towns.building_size_min = fixed;
-            config.towns.building_size_max = fixed;
+        if (!towns.contains("building_size_min_m") && towns.contains("building_size")) {
+            const double fixed = detail::read_or(towns, "building_size", config.towns.building_size_min_m);
+            config.towns.building_size_min_m = fixed;
+            config.towns.building_size_max_m = fixed;
         }
         config.towns.town_building_scale =
             detail::read_or(towns, "town_building_scale", config.towns.town_building_scale);
         config.towns.village_building_scale =
             detail::read_or(towns, "village_building_scale", config.towns.village_building_scale);
-        config.towns.water_clearance =
-            detail::read_or(towns, "water_clearance", config.towns.water_clearance);
+        config.towns.water_clearance_m =
+            detail::read_or(towns, "water_clearance_m", config.towns.water_clearance_m);
         config.towns.household_size_min =
             detail::read_or(towns, "household_size_min", config.towns.household_size_min);
         config.towns.household_size_max =
@@ -323,20 +497,119 @@ inline MapConfig config_from_node(const fkyaml::node& node) {
             detail::read_or(towns, "capital_density", config.towns.capital_density);
         config.towns.town_density =
             detail::read_or(towns, "town_density", config.towns.town_density);
-        config.towns.street_offset = detail::read_or(towns, "street_offset", config.towns.street_offset);
-        config.towns.street_spacing = detail::read_or(towns, "street_spacing", config.towns.street_spacing);
-        config.towns.position_jitter = detail::read_or(towns, "position_jitter", config.towns.position_jitter);
+        config.towns.street_offset_m = detail::read_or(towns, "street_offset_m", config.towns.street_offset_m);
+        config.towns.street_spacing_m = detail::read_or(towns, "street_spacing_m", config.towns.street_spacing_m);
+        config.towns.position_jitter_m = detail::read_or(towns, "position_jitter_m", config.towns.position_jitter_m);
         config.towns.rotation_jitter = detail::read_or(towns, "rotation_jitter", config.towns.rotation_jitter);
         config.towns.infill_attempts = detail::read_or(towns, "infill_attempts", config.towns.infill_attempts);
     }
+}
 
+/**
+ * @brief Reads a `MapConfig` back from a YAML mapping node.
+ *
+ * Every key is optional and falls back to the in-struct default, so a map saved
+ * before a parameter existed still loads.
+ *
+ * @param node The mapping node to decode.
+ * @return The decoded configuration.
+ */
+inline MapConfig config_from_node(const fkyaml::node& node) {
+    MapConfig config;
+    apply_config_node(node, config);
     return config;
+}
+
+/**
+ * @enum ConfigLoad
+ * @brief How reading a configuration file turned out.
+ */
+enum class ConfigLoad {
+    Ok,        /**< @brief The file parsed and was applied. */
+    NotFound,  /**< @brief No file at that path; nothing was applied. */
+    Malformed  /**< @brief The file exists but is not valid YAML; nothing was applied. */
+};
+
+/**
+ * @struct ConfigLoadResult
+ * @brief What `load_config()` managed to do, and what a caller should say about it.
+ */
+struct ConfigLoadResult {
+    /** @brief The outcome. */
+    ConfigLoad status = ConfigLoad::NotFound;
+    /**
+     * @brief The document set `seed:` explicitly, rather than inheriting a default.
+     *
+     * The decoded struct cannot answer this on its own: `MapConfig::seed` has an
+     * in-struct default, so a configuration that named that exact value is
+     * indistinguishable from one that said nothing. A generator that draws a
+     * random seed when none was given needs the difference.
+     */
+    bool has_seed = false;
+    /** @brief Why it failed, ready to print; empty when `status` is `Ok`. */
+    std::string message;
+};
+
+/**
+ * @brief Applies a configuration file on top of an existing `MapConfig`.
+ *
+ * Keys absent from the document keep whatever `out_config` already held, which is
+ * what lets a caller establish its own defaults first and let the file override
+ * only what it mentions. On `NotFound` or `Malformed` nothing is applied at all,
+ * so a caller's defaults survive a missing or broken file intact.
+ *
+ * Reports the outcome rather than printing it. `load_map()` goes through
+ * `coopa::collections::YAMLMap::load()`, which writes its own line to `std::cerr`
+ * and rethrows on a parse error -- so it can neither tell a missing file from a
+ * broken one nor keep quiet. A header-only library has no business owning the
+ * program's stderr or deciding whether a bad config is fatal; that belongs to
+ * whatever is running it.
+ *
+ * Unknown keys are ignored, so an older binary still reads a newer file.
+ *
+ * @param path Path to the configuration file, e.g. `assets/config.yaml`.
+ * @param out_config Updated in place by whatever the document specifies.
+ * @return The outcome, whether a seed was named, and a message on failure.
+ */
+inline ConfigLoadResult load_config(const std::string& path, MapConfig& out_config) {
+    ConfigLoadResult result;
+
+    std::ifstream file(path);
+    if (!file) {
+        result.status = ConfigLoad::NotFound;
+        result.message = "no configuration file at '" + path + "'";
+        return result;
+    }
+
+    fkyaml::node root;
+    try {
+        root = fkyaml::node::deserialize(file);
+    } catch (const std::exception& error) {
+        result.status = ConfigLoad::Malformed;
+        result.message = "could not parse '" + path + "': " + error.what();
+        return result;
+    }
+
+    if (!root.is_mapping()) {
+        // An empty file parses as null rather than as an empty mapping. Treated as
+        // malformed and not as "no keys set": a caller asked for this file, and
+        // silently generating from defaults would hide the mistake.
+        result.status = ConfigLoad::Malformed;
+        result.message = "'" + path + "' is not a YAML mapping";
+        return result;
+    }
+
+    result.has_seed = root.contains("seed");
+    apply_config_node(root, out_config);
+    result.status = ConfigLoad::Ok;
+    return result;
 }
 
 /**
  * @brief Serialises a map and the configuration that produced it to a YAML document.
  *
- * The whole graph goes in -- cells, corners, edges, road runs and settlements, with every
+ * The whole graph goes in -- cells, corners, edges, road runs, watercourses and
+ * settlements, with every
  * adjacency list -- so the document is a save of generator state rather than a
  * derived export, and `map_from_node()` reconstructs it exactly.
  *
@@ -447,6 +720,16 @@ inline fkyaml::node map_to_node(const MapGraph& graph, const MapConfig& config) 
         roads.push_back(std::move(node));
     }
 
+    std::vector<fkyaml::node> rivers;
+    rivers.reserve(graph.rivers.size());
+    for (const MapRiver& river : graph.rivers) {
+        fkyaml::node node = fkyaml::node::mapping();
+        node["volume"] = river.volume;
+        node["corners"] = detail::id_sequence(river.corners);
+        node["points"] = detail::point_sequence(river.points);
+        rivers.push_back(std::move(node));
+    }
+
     std::vector<fkyaml::node> towns;
     towns.reserve(graph.towns.size());
     for (const MapTown& town : graph.towns) {
@@ -464,6 +747,7 @@ inline fkyaml::node map_to_node(const MapGraph& graph, const MapConfig& config) 
 
         fkyaml::node node = fkyaml::node::mapping();
         node["center"] = static_cast<int>(town.center);
+        node["cells"] = detail::id_sequence(town.cells);
         node["x"] = town.point.x;
         node["y"] = town.point.y;
         node["tier"] = std::string(town_tier_name(town.tier));
@@ -536,6 +820,7 @@ inline fkyaml::node map_to_node(const MapGraph& graph, const MapConfig& config) 
     root["corners"] = fkyaml::node::sequence(std::move(corners));
     root["edges"] = fkyaml::node::sequence(std::move(edges));
     root["roads"] = fkyaml::node::sequence(std::move(roads));
+    root["rivers"] = fkyaml::node::sequence(std::move(rivers));
     root["towns"] = fkyaml::node::sequence(std::move(towns));
     root["regions"] = fkyaml::node::sequence(std::move(regions));
     root["countries"] = fkyaml::node::sequence(std::move(countries));
@@ -647,9 +932,20 @@ inline bool map_from_node(const fkyaml::node& root, MapGraph& out_graph, MapConf
         }
     }
 
+    if (root.contains("rivers") && root.at("rivers").is_sequence()) {
+        for (const fkyaml::node& node : root.at("rivers")) {
+            MapRiver river;
+            river.volume = detail::read_or(node, "volume", 0);
+            river.corners = detail::read_id_sequence<CornerId>(node, "corners");
+            river.points = detail::read_point_sequence(node, "points");
+            out_graph.rivers.push_back(std::move(river));
+        }
+    }
+
     if (root.contains("towns") && root.at("towns").is_sequence()) {
         for (const fkyaml::node& node : root.at("towns")) {
             MapTown town;
+            town.cells = detail::read_id_sequence<CenterId>(node, "cells");
             town.center = static_cast<CenterId>(
                 detail::read_or(node, "center", static_cast<int>(k_invalid_id)));
             town.point = {detail::read_or(node, "x", 0.0), detail::read_or(node, "y", 0.0)};

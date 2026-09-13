@@ -15,7 +15,12 @@
 #include <unordered_map>
 #include <vector>
 
+#include <atomic>
+#include <memory>
+
 #include <delaunator/delaunator.hpp>
+
+#include <coopa/job/engine.h>
 
 #include <coopa/debug/logger.h>
 #include <coopa/maps/map_config.h>
@@ -31,6 +36,7 @@
 #include <coopa/maps/passes/pass_regions.h>
 #include <coopa/maps/passes/pass_roads.h>
 #include <coopa/maps/passes/pass_towns.h>
+#include <coopa/maps/map_task.h>
 #include <coopa/maps/passes/pass_water.h>
 
 namespace coopa {
@@ -62,20 +68,58 @@ public:
      * @brief Generates the map, discarding any previous result.
      * @throws std::runtime_error If the point set is degenerate and cannot be triangulated.
      */
-    void generate() {
-        logger_.info("map generation: start (seed " + std::to_string(config_.seed)
-                     + ", grid " + std::to_string(config_.grid_size) + ")");
+    void generate() { generate_(nullptr, nullptr); }
 
-        graph_.clear();
-        generate_points_();
-        triangulate_points_();
-        sort_cell_corners_();
-        border_check_();
-        execute_passes_();
+    /**
+     * @brief Sets the engine asynchronous generation runs on; null runs inline.
+     *
+     * Nothing inside generation is itself threaded, and deliberately so: a
+     * default map takes about 135 ms to generate against some 11 s to export, so
+     * there is nothing here worth the determinism risk. What the engine buys is
+     * getting those 135 ms *off the calling thread*, which is what a frame loop
+     * cares about.
+     *
+     * @param engine Not owned; the house pattern is an injected, nullable engine.
+     */
+    void set_job_engine(coopa::job::JobEngine* engine) { engine_ = engine; }
 
-        logger_.info("map generation: done (" + std::to_string(graph_.centers.size())
-                     + " cells, " + std::to_string(graph_.corners.size())
-                     + " corners, " + std::to_string(graph_.edges.size()) + " edges)");
+    /**
+     * @brief Starts generation and returns immediately.
+     *
+     * The generator itself must outlive the returned task -- the job writes into
+     * `graph_`. `MapTask`'s destructor cancels and waits, so declaring the task
+     * after the generator and letting both fall out of scope together is correct
+     * by construction.
+     *
+     * Cancellation is checked between passes. Threading a token into each pass
+     * would mean changing the single fixed `execute()` signature every pass
+     * shares -- the contract `passes/README.md` documents -- to shave at most one
+     * pass off the latency, and the longest pass is roughly 50 ms.
+     *
+     * A cancelled generation leaves `graph()` holding a partly annotated map:
+     * every array is intact and internally consistent, but the passes that had
+     * not run yet have not written their fields. Treat it as unusable and
+     * regenerate.
+     *
+     * @return A task to poll, measure and cancel.
+     */
+    MapTask generate_async() {
+        auto state = std::make_shared<MapTaskState>();
+        state->total.store(k_generation_steps);
+
+        if (engine_ == nullptr) {
+            generate_(state, nullptr);
+            return MapTask(state);
+        }
+
+        const coopa::job::JobHandle handle = engine_->create_handle();
+        engine_->submit(
+            [this, state](const coopa::job::JobContext& ctx) {
+                generate_(state, &ctx);
+                state->finish();
+            },
+            k_map_job_type, handle);
+        return MapTask(engine_, handle, state);
     }
 
     /** @brief The generated map. Empty until `generate()` has been called. */
@@ -92,6 +136,8 @@ private:
     coopa::debug::Logger& logger_;    /**< @brief Progress sink. */
     MapGraph graph_;                  /**< @brief The graph under construction. */
     std::vector<MapPoint> points_;    /**< @brief Generating sites, one per cell. */
+    /** @brief Engine `generate_async()` runs on, or null to run inline. Not owned. */
+    coopa::job::JobEngine* engine_ = nullptr;
 
     /** @brief How far outside the grid the boundary ring of points is placed. */
     static constexpr double k_boundary_margin = 1.0;
@@ -292,19 +338,95 @@ private:
     }
 
     /** @brief Runs every enabled pass, in dependency order. */
-    void execute_passes_() {
-        if (config_.enable_water)        PassWater{}.execute(graph_, config_, logger_);
-        if (config_.enable_coast)        PassCoast{}.execute(graph_, config_, logger_);
-        if (config_.enable_elevation)    PassElevation{}.execute(graph_, config_, logger_);
-        if (config_.enable_temperature)  PassTemperature{}.execute(graph_, config_, logger_);
-        if (config_.enable_rivers)       PassRivers{}.execute(graph_, config_, logger_);
-        if (config_.enable_moisture)     PassMoisture{}.execute(graph_, config_, logger_);
-        if (config_.enable_biomes)       PassBiomes{}.execute(graph_, config_, logger_);
-        if (config_.enable_roads)        PassRoads{}.execute(graph_, config_, logger_);
-        if (config_.enable_regions)      PassRegions{}.execute(graph_, config_, logger_);
-        if (config_.enable_towns)        PassTowns{}.execute(graph_, config_, logger_);
-        if (config_.enable_landmarks)    PassLandmarks{}.execute(graph_, config_, logger_);
-        if (config_.enable_noisy_edges)  PassNoisyEdges{}.execute(graph_, config_, logger_);
+    /**
+     * @brief The one generation implementation, reached synchronously or on a job.
+     *
+     * `generate()` and `generate_async()` differ only in what they pass here, so
+     * the two cannot drift apart -- the same reasoning behind
+     * `AnimationSystem`'s shared serial/parallel body.
+     *
+     * @param state Optional progress counter, stepped once per stage.
+     * @param ctx Optional job context, polled for cancellation between passes.
+     */
+    void generate_(const std::shared_ptr<MapTaskState>& state,
+                   const coopa::job::JobContext* ctx) {
+        logger_.info("map generation: start (seed " + std::to_string(config_.seed)
+                     + ", grid " + std::to_string(config_.grid_size) + ")");
+
+        graph_.clear();
+        generate_points_();
+        triangulate_points_();
+        sort_cell_corners_();
+        border_check_();
+        if (state) {
+            state->step();   // The geometry build is one stage of the thirteen.
+        }
+        if (!execute_passes_(state, ctx)) {
+            logger_.info("map generation: cancelled");
+            return;
+        }
+
+        logger_.info("map generation: done (" + std::to_string(graph_.centers.size())
+                     + " cells, " + std::to_string(graph_.corners.size())
+                     + " corners, " + std::to_string(graph_.edges.size()) + " edges)");
+    }
+
+    /** @brief Steps `generate_()` reports: the geometry build plus the twelve passes. */
+    static constexpr int k_generation_steps = 13;
+
+    /**
+     * @brief Runs one pass, counting it and checking for cancellation first.
+     *
+     * A disabled pass still counts as a step, so progress tracks how far through
+     * the pipeline the run is rather than how much work it happened to need --
+     * which is what a loading bar wants.
+     *
+     * @tparam Pass The pass type to run.
+     * @param enabled Its `MapConfig::enable_*` toggle.
+     * @param state Optional progress counter.
+     * @param ctx Optional job context, polled for cancellation.
+     * @return False if the run has been cancelled and should stop.
+     */
+    template <typename Pass>
+    bool stage_(bool enabled, const std::shared_ptr<MapTaskState>& state,
+                const coopa::job::JobContext* ctx) {
+        if (ctx != nullptr && ctx->is_cancelled()) {
+            return false;
+        }
+        if (enabled) {
+            Pass{}.execute(graph_, config_, logger_);
+        }
+        if (state) {
+            state->step();
+        }
+        return true;
+    }
+
+    /**
+     * @brief Runs every pass in order, stopping early if cancelled.
+     *
+     * The order is a dependency chain, not a preference -- moisture needs rivers,
+     * biomes need moisture, towns need regions. Chained with `&&` so that a
+     * cancellation short-circuits the rest without an early-return ladder.
+     *
+     * @param state Optional progress counter.
+     * @param ctx Optional job context, polled for cancellation between passes.
+     * @return False if the run was abandoned partway.
+     */
+    bool execute_passes_(const std::shared_ptr<MapTaskState>& state = nullptr,
+                         const coopa::job::JobContext* ctx = nullptr) {
+        return stage_<PassWater>(config_.enable_water, state, ctx)
+            && stage_<PassCoast>(config_.enable_coast, state, ctx)
+            && stage_<PassElevation>(config_.enable_elevation, state, ctx)
+            && stage_<PassTemperature>(config_.enable_temperature, state, ctx)
+            && stage_<PassRivers>(config_.enable_rivers, state, ctx)
+            && stage_<PassMoisture>(config_.enable_moisture, state, ctx)
+            && stage_<PassBiomes>(config_.enable_biomes, state, ctx)
+            && stage_<PassRoads>(config_.enable_roads, state, ctx)
+            && stage_<PassRegions>(config_.enable_regions, state, ctx)
+            && stage_<PassTowns>(config_.enable_towns, state, ctx)
+            && stage_<PassLandmarks>(config_.enable_landmarks, state, ctx)
+            && stage_<PassNoisyEdges>(config_.enable_noisy_edges, state, ctx);
     }
 
     /**

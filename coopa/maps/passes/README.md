@@ -15,7 +15,15 @@ settled. Turning a pass off leaves the fields it would have written at their def
 rather than reordering anything.
 
 The graph's geometry is built before any pass runs and none of them change it; a pass only
-annotates cells, corners and edges. Every pass that draws randomness seeds a generator from
+annotates cells, corners and edges.
+
+That single fixed signature is also why `generate_async()` checks for cancellation
+*between* passes rather than inside one: threading a token through twelve `execute()`
+methods would change the contract every pass is written to, to shave at most one pass off
+the latency — and the longest pass is roughly 50 ms. Nothing in here runs in parallel
+either. Generation is about 140 ms against some 10 s of export, so there is nothing to win,
+and the road pass could not be parallelised regardless: each route is deliberately routed
+over ground the earlier ones already claimed. Every pass that draws randomness seeds a generator from
 `MapConfig::seed`, offset per pass so two passes never share a stream.
 
 ---
@@ -28,7 +36,7 @@ annotates cells, corners and edges. Every pass that draws randomness seeds a gen
 | 2 | [`pass_coast.h`](./pass_coast.h) | `coast`; refines corner `ocean`/`water` | pass 1 |
 | 3 | [`pass_elevation.h`](./pass_elevation.h) | `elevation`, `downslope` | pass 2 |
 | 4 | [`pass_temperature.h`](./pass_temperature.h) | `temperature` | pass 3 |
-| 5 | [`pass_rivers.h`](./pass_rivers.h) | `river` on corners and edges | pass 3 |
+| 5 | [`pass_rivers.h`](./pass_rivers.h) | `river` on corners and edges; `MapGraph::rivers` | pass 3 |
 | 6 | [`pass_moisture.h`](./pass_moisture.h) | `moisture` | pass 5 |
 | 7 | [`pass_biomes.h`](./pass_biomes.h) | `MapCenter::biome` | passes 3, 4 and 6 |
 | 8 | [`pass_roads.h`](./pass_roads.h) | `MapEdge::road`, `road_class`, `traffic`, `bridge`; `MapGraph::roads` | passes 3, 5 and 7 |
@@ -65,9 +73,23 @@ and puts deserts at the pole. Latitude runs along **y**, so a map reads as a nor
 slice of a globe.
 
 ### 5. Rivers ([`pass_rivers.h`](./pass_rivers.h))
-Sample sources uniformly, reject any outside a middling elevation band, and walk
+Sample sources uniformly, reject any outside the source elevation band, and walk
 `downslope` to the coast. The attempt count is bounded: the original retried by
 decrementing its loop counter, which hangs outright on a map with no qualifying land.
+
+The walk gathers the corner chain *before* raising any volume, and only commits a
+watercourse at least `river_min_length` corners long. Raising volumes as it walked — which
+is what this did — makes a short river impossible to reject, because by the time you can
+measure it you have already carved it. Most land is near a coast, so without the rejection
+the map fills with two-cell trickles. The source floor was raised from 0.3 to 0.45 for the
+same reason: below that a "source" can appear on the plain it was meant to run down to.
+
+Each kept watercourse is then traced into a `MapRiver` — the corner chain, and a copy of it
+corner-cut by `chaikin_smooth()` ([`../map_data.h`](../map_data.h), shared with the road
+pass). Drawn straight between Voronoi corners a river is visibly angular at every corner,
+which is the one shape moving water never has; corner-cutting rounds the joints without
+straightening the course, because it never moves a point more than a quarter of a segment.
+The meander is the downslope chain itself and survives intact.
 
 ### 6. Moisture ([`pass_moisture.h`](./pass_moisture.h))
 Lakes and rivers seed the field; the ocean deliberately does not, so a desert can sit
@@ -137,6 +159,16 @@ access to sea, river or road;
 accept the best greedily subject to a minimum separation so settlements spread across a
 continent rather than clustering on one river mouth; then rank them into capitals, towns
 and villages.
+
+A settlement is **not one cell**. At 60 m to the grid unit a cell is about 3,600 m², which
+holds roughly ten 10 m buildings at a believable density — so a capital confined to its own
+cell is a hamlet and the three tiers stop being distinguishable. Each settlement claims
+cells breadth-first over `MapCenter::neighbors`, taking dry habitable land no other
+settlement holds: seven for a capital, three for a town, one for a village. Breadth-first
+and not a radius, so the claimed patch is contiguous and a coastal town grows along its
+shore instead of reaching across the water. The packer then runs per claimed cell, carrying
+the growing building list forward so `buildings_overlap()` still rejects a footprint that
+would cross a boundary into ground already built on.
 
 Each accepted cell is then laid out. The roads and rivers bordering it become *streets*
 running from the cell's site out to those edges — a road is drawn along the Delaunay edge,

@@ -118,6 +118,40 @@ inline bool point_in_polygon(const std::vector<MapPoint>& polygon, const MapPoin
 }
 
 /**
+ * @brief Chaikin corner-cutting, with the two endpoints pinned.
+ *
+ * Each interior segment is replaced by its quarter and three-quarter points,
+ * which rounds every corner without the curve drifting off the points it was
+ * derived from. The ends are kept exactly where they are so a smoothed path
+ * still meets the junction, the settlement or the coastline it was traced to --
+ * a road that stops a quarter of a cell short of its own junction is worse than
+ * one drawn straight.
+ *
+ * Shared by the road and river passes. Both trace a chain of graph positions and
+ * both need the joints rounded off without the course being straightened: the
+ * meander of a river and the switchback of a mountain road are the *data*, and
+ * corner-cutting preserves them precisely because it never moves a point far.
+ *
+ * @param points The path to smooth, in place.
+ * @param iterations Passes to apply; zero or fewer leaves the path alone.
+ */
+inline void chaikin_smooth(std::vector<MapPoint>& points, int iterations) {
+    for (int pass = 0; pass < iterations && points.size() > 2; ++pass) {
+        std::vector<MapPoint> cut;
+        cut.reserve(points.size() * 2);
+        cut.push_back(points.front());
+        for (std::size_t i = 0; i + 1 < points.size(); ++i) {
+            const MapPoint& a = points[i];
+            const MapPoint& b = points[i + 1];
+            cut.push_back({a.x * 0.75 + b.x * 0.25, a.y * 0.75 + b.y * 0.25});
+            cut.push_back({a.x * 0.25 + b.x * 0.75, a.y * 0.25 + b.y * 0.75});
+        }
+        cut.push_back(points.back());
+        points = std::move(cut);
+    }
+}
+
+/**
  * @struct MapCenter
  * @brief One Voronoi cell -- a polygon of terrain, and a vertex of the Delaunay triangulation.
  *
@@ -256,6 +290,24 @@ struct MapRoad {
 };
 
 /**
+ * @struct MapRiver
+ * @brief One watercourse, as a smoothed centreline in grid units.
+ *
+ * The counterpart of `MapRoad`: the per-corner and per-edge `river` volumes say
+ * *where* the water is, this says what the channel looks like. Drawn straight
+ * between Voronoi corners a river is visibly angular at every corner, which is
+ * the one shape moving water never has.
+ *
+ * Ordered source to mouth, so `volume` -- which is the volume where it ends --
+ * is also the largest the channel ever gets.
+ */
+struct MapRiver {
+    std::vector<MapPoint> points;  /**< @brief The smoothed centreline, in grid units, source first. */
+    std::vector<CornerId> corners; /**< @brief The corners it runs through, in order. */
+    int volume = 0;                /**< @brief Volume at the mouth; the channel widens toward it. */
+};
+
+/**
  * @struct MapBuilding
  * @brief One axis-aligned building footprint packed inside a settlement's cell.
  */
@@ -271,7 +323,21 @@ struct MapBuilding {
  * @brief A settlement occupying one cell, with the buildings packed into it.
  */
 struct MapTown {
-    CenterId center = k_invalid_id;  /**< @brief The cell this settlement occupies. */
+    /**
+     * @brief The cell the settlement grew from; the first entry of `cells`.
+     *
+     * Still the settlement's identity -- its position, its region and its
+     * spacing against other settlements are all measured from here.
+     */
+    CenterId center = k_invalid_id;
+    /**
+     * @brief Every cell this settlement covers, the primary one first.
+     *
+     * A settlement larger than a hamlet does not fit in one Voronoi cell, so a
+     * capital claims its neighbours and builds across all of them. Disjoint
+     * between settlements: a cell belongs to at most one.
+     */
+    std::vector<CenterId> cells;
     MapPoint point;                  /**< @brief Settlement centre, in grid units. */
     TownTier tier = TownTier::Village; /**< @brief Size class, by site quality rank. */
     double score = 0.0;              /**< @brief Habitability score the site was chosen on. */
@@ -463,6 +529,7 @@ public:
     std::vector<MapCorner> corners; /**< @brief Voronoi vertices, one per Delaunay triangle. */
     std::vector<MapEdge> edges;     /**< @brief Shared Delaunay/Voronoi edges. */
     std::vector<MapRoad> roads;     /**< @brief Road runs traced by the road pass. */
+    std::vector<MapRiver> rivers;   /**< @brief Watercourses traced by the river pass. */
     std::vector<MapTown> towns;     /**< @brief Settlements placed by the town pass. */
     std::vector<MapRegion> regions; /**< @brief Provinces carved by the region pass. */
     std::vector<MapCountry> countries; /**< @brief Nations carved by the region pass. */
@@ -474,6 +541,7 @@ public:
         corners.clear();
         edges.clear();
         roads.clear();
+        rivers.clear();
         towns.clear();
         regions.clear();
         countries.clear();

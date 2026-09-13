@@ -3,6 +3,22 @@ cmake_policy(VERSION 3.20)
 
 project(mapcoopa)
 
+# --- Default the build type, for a standalone build only. ---
+# Left unset, CMake passes no optimisation flags at all and GCC/Clang default to
+# -O0. That is not a small difference here: a default map takes 40.9 s at -O0 and
+# 9.5 s at -O3, because this is a software rasteriser and a deflate encoder
+# pushing 23 megapixels seven times over. Every binary this project produced
+# before this line was unoptimised.
+#
+# Guarded on being the top-level project so a consumer that pulls mapcoopa in via
+# add_subdirectory() keeps its own build type -- overriding a parent project's
+# choice of flags is not ours to make. A developer wanting a debugger can still
+# pass -DCMAKE_BUILD_TYPE=Debug or RelWithDebInfo explicitly.
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR AND NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+    message(STATUS "mapcoopa: CMAKE_BUILD_TYPE was unset, defaulting to Release")
+endif()
+
 # Set C++ standard
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

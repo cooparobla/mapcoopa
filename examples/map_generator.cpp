@@ -3,24 +3,42 @@
  * @brief Standalone tool that generates a random map and writes it out as two
  *        PNG renders and one YAML document.
  *
- * Build target `coopa_mapgen`. With no arguments it draws a seed from the
- * system entropy source and prints it, so every run produces a different map
- * that can still be reproduced afterwards with `--seed=`.
+ * Build target `coopa_mapgen`. Settings come from four places, each overriding
+ * the one before it:
+ *
+ *   1. `MapConfig`'s in-struct defaults, sized for the small map a bare
+ *      `MapConfig` gives a library consumer.
+ *   2. `k_scene_*` below -- this tool's own defaults, which is what keeps a run
+ *      with no configuration file producing the documented 80-cell world.
+ *   3. `assets/config.yaml`, or whatever `--config=` names.
+ *   4. Command-line flags, so trying something never means editing a
+ *      version-controlled file.
+ *
+ * A missing configuration file is a warning; one that exists but does not parse
+ * is fatal. Generating a map that silently ignored the settings it was given is
+ * worse than generating none.
  *
  * @code
- * ./build/coopa_mapgen                          # random map, written to ./map_out.*
+ * ./build/coopa_mapgen                          # assets/config.yaml, written to ./map_out.*
  * ./build/coopa_mapgen --seed=251 --out=/tmp/m  # reproducible, written to /tmp/m.*
+ * ./build/coopa_mapgen --config=/tmp/alt.yaml   # a different configuration entirely
  * @endcode
  */
 
+#include <chrono>
 #include <cstdlib>
 #include <iostream>
+#include <memory>
+#include <thread>
 #include <random>
 #include <string>
 #include <string_view>
 
+#include <root_directory.h>
+
 #include <coopa/debug/logger.h>
-#include <coopa/maps/image_writer.h>
+#include <coopa/job/engine.h>
+#include <coopa/maps/map_export.h>
 #include <coopa/maps/map_config.h>
 #include <coopa/maps/map_generator.h>
 #include <coopa/maps/map_renderer.h>
@@ -38,7 +56,7 @@ void print_usage() {
         << "\n"
         << "  --seed=N         master seed; random each run when omitted\n"
         << "  --grid-size=N    cells per axis (default 80)\n"
-        << "  --image-size=N   render size in pixels, square (default 2048)\n"
+        << "  --image-size=N   render size in pixels, square; overrides meters_per_pixel\n"
         << "  --rivers=N       river sources to attempt (default 55)\n"
         << "  --towns=N        settlements to place (default 28)\n"
         << "  --road-hubs=N    places the road network is routed between (default 32)\n"
@@ -49,9 +67,14 @@ void print_usage() {
         << "  --no-roads       skip the road network\n"
         << "  --no-subdivide   draw straight cell boundaries instead of wobbled ones\n"
         << "  --out=PATH       output prefix (default \"map_out\")\n"
+        << "  --config=PATH    settings file (default assets/config.yaml)\n"
+        << "  --shading=MODE   composite lighting: elevation (default) | hillshade\n"
+        << "  --threads=N      worker threads; 0 = all cores (default), 1 = serial\n"
+        << "  --png-level=N    PNG deflate effort 1-9; lower is faster and larger\n"
         << "  --help           show this message\n"
         << "\n"
-        << "writes PATH_biomes.png, PATH_elevation.png and PATH.yaml\n";
+        << "writes PATH.yaml and one PNG per layer: elevation, water, biomes,\n"
+        << "roads, structures, landmarks, composite\n";
 }
 
 /**
@@ -80,12 +103,13 @@ bool match_option(std::string_view argument, std::string_view name, std::string_
  */
 int main(int argc, char** argv) {
     coopa::maps::MapConfig config;
+    // This tool's own defaults, applied before the configuration file so that a
+    // run without one still produces the world the README documents rather than
+    // quietly dropping to MapConfig's library defaults of grid 50 at 1024 px.
     // Large enough that climate bands, several nations and a spread of landmarks
     // all have room to appear; the YAML lands around 15 MB.
     config.grid_size = 80;
     config.image_size = 2048;
-    // Scaled to the scene rather than left at the library defaults, which are
-    // sized for the much smaller map a consumer gets from a bare MapConfig.
     config.towns.town_count = 28;
     config.river_count = 55;
     config.landmarks.max_natural = 70;
@@ -93,6 +117,45 @@ int main(int argc, char** argv) {
 
     std::string out_prefix = "map_out";
     bool seed_given = false;
+    // 0 means "derive from the world scale". A --image-size is an instruction
+    // about resolution, so it is applied by back-computing meters_per_pixel
+    // rather than by setting image_size behind the scale's back -- the two must
+    // never be able to disagree about how much ground a pixel covers.
+    int image_size_override = 0;
+    // 0 means one worker per core. 1 means no engine at all -- the serial path,
+    // which is what the byte-for-byte comparison in the README is run against.
+    int threads = 0;
+
+    // --config has to be found before the file is read, and every other flag has
+    // to be applied after -- so the argument list is walked twice. Doing it in one
+    // pass would make a flag's effect depend on whether it happened to come before
+    // or after --config on the line.
+    std::string config_path = std::string(ROOT_DIR) + "/assets/config.yaml";
+    for (int i = 1; i < argc; ++i) {
+        std::string_view value;
+        if (match_option(std::string_view(argv[i]), "config", value)) {
+            config_path = std::string(value);
+        }
+    }
+
+    const coopa::maps::ConfigLoadResult loaded =
+        coopa::maps::load_config(config_path, config);
+    switch (loaded.status) {
+        case coopa::maps::ConfigLoad::Ok:
+            std::cout << "coopa_mapgen: settings from " << config_path << "\n";
+            break;
+        case coopa::maps::ConfigLoad::NotFound:
+            std::cerr << "coopa_mapgen: " << loaded.message << ", using built-in defaults\n";
+            break;
+        case coopa::maps::ConfigLoad::Malformed:
+            std::cerr << "coopa_mapgen: " << loaded.message << "\n";
+            return 1;
+    }
+    // A configuration that named a seed counts as having given one, so the
+    // entropy draw below happens only when neither the file nor the command line
+    // chose. Without this a config.yaml with `seed:` in it would still produce a
+    // different map every run.
+    seed_given = loaded.has_seed;
 
     for (int i = 1; i < argc; ++i) {
         const std::string_view argument(argv[i]);
@@ -116,7 +179,7 @@ int main(int argc, char** argv) {
         } else if (match_option(argument, "grid-size", value)) {
             config.grid_size = std::atoi(std::string(value).c_str());
         } else if (match_option(argument, "image-size", value)) {
-            config.image_size = std::atoi(std::string(value).c_str());
+            image_size_override = std::atoi(std::string(value).c_str());
         } else if (match_option(argument, "rivers", value)) {
             config.river_count = std::atoi(std::string(value).c_str());
         } else if (match_option(argument, "towns", value)) {
@@ -129,6 +192,28 @@ int main(int argc, char** argv) {
             config.regions.regions_per_country = std::atoi(std::string(value).c_str());
         } else if (match_option(argument, "out", value)) {
             out_prefix = std::string(value);
+        } else if (match_option(argument, "threads", value)) {
+            threads = std::atoi(std::string(value).c_str());
+            if (threads < 0) {
+                std::cerr << "coopa_mapgen: --threads must be 0 or more\n";
+                return 1;
+            }
+        } else if (match_option(argument, "png-level", value)) {
+            config.png_compression_level = std::atoi(std::string(value).c_str());
+            if (config.png_compression_level < 1 || config.png_compression_level > 9) {
+                std::cerr << "coopa_mapgen: --png-level must be between 1 and 9\n";
+                return 1;
+            }
+        } else if (match_option(argument, "shading", value)) {
+            const std::string mode(value);
+            if (mode != "elevation" && mode != "hillshade") {
+                std::cerr << "coopa_mapgen: --shading must be 'elevation' or 'hillshade'\n";
+                return 1;
+            }
+            config.composite_shading = coopa::maps::composite_shading_from_name(mode);
+        } else if (match_option(argument, "config", value)) {
+            // Already read in the first pass above; accepted here so it is not
+            // reported as an unrecognised argument.
         } else {
             std::cerr << "coopa_mapgen: unrecognised argument '" << argument << "'\n\n";
             print_usage();
@@ -136,10 +221,20 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (config.grid_size < 2 || config.image_size < 16) {
-        std::cerr << "coopa_mapgen: --grid-size must be at least 2 and --image-size at least 16\n";
+    if (config.grid_size < 2) {
+        std::cerr << "coopa_mapgen: --grid-size must be at least 2\n";
         return 1;
     }
+    if (image_size_override > 0) {
+        if (image_size_override < 16) {
+            std::cerr << "coopa_mapgen: --image-size must be at least 16\n";
+            return 1;
+        }
+        const double world_meters =
+            static_cast<double>(config.grid_size) * config.meters_per_grid_unit;
+        config.meters_per_pixel = world_meters / static_cast<double>(image_size_override);
+    }
+    config.image_size = coopa::maps::derive_image_size(config);
 
     if (!seed_given) {
         std::random_device entropy;
@@ -157,25 +252,41 @@ int main(int argc, char** argv) {
     config.noise_island.frequency *= k_reference_grid_size / static_cast<double>(config.grid_size);
 
     coopa::debug::Logger logger("mapgen");
+
+    // Owned here rather than inside the library: mapcoopa takes an engine, it
+    // does not run one, so that a host with its own thread pool shares it instead
+    // of competing with a second.
+    std::unique_ptr<coopa::job::JobEngine> engine;
+    if (threads != 1) {
+        const unsigned int workers = threads > 0 ? static_cast<unsigned int>(threads)
+                                                 : std::thread::hardware_concurrency();
+        engine = std::make_unique<coopa::job::JobEngine>(std::max(1u, workers));
+    }
+
+    const auto started = std::chrono::steady_clock::now();
+    const auto elapsed_ms = [](std::chrono::steady_clock::time_point from) {
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - from)
+            .count();
+    };
+
     coopa::maps::MapGenerator generator(config, logger);
-    generator.generate();
+    generator.set_job_engine(engine.get());
+    generator.generate_async().wait();
+    const double generate_ms = elapsed_ms(started);
 
     const coopa::maps::BiomePalette palette;
-    const std::string biomes_path = out_prefix + "_biomes.png";
-    const std::string elevation_path = out_prefix + "_elevation.png";
     const std::string yaml_path = out_prefix + ".yaml";
 
-    if (!coopa::maps::write_png(biomes_path,
-                                coopa::maps::BiomeRenderer::render(generator.graph(), config, palette))) {
-        std::cerr << "coopa_mapgen: failed to write " << biomes_path << "\n";
+    const auto export_started = std::chrono::steady_clock::now();
+    coopa::maps::MapExporter exporter;
+    exporter.set_job_engine(engine.get());
+    if (!exporter.export_layers(generator.graph(), config, out_prefix, palette, &logger)) {
+        std::cerr << "coopa_mapgen: failed to write one or more layers\n";
         return 1;
     }
-    if (!coopa::maps::write_png(elevation_path,
-                                coopa::maps::ElevationRenderer::render(generator.graph(), config, palette))) {
-        std::cerr << "coopa_mapgen: failed to write " << elevation_path << "\n";
-        return 1;
-    }
+    const double export_ms = elapsed_ms(export_started);
 
+    const auto yaml_started = std::chrono::steady_clock::now();
     try {
         coopa::maps::save_map(generator.graph(), config, yaml_path);
     } catch (const std::exception& e) {
@@ -183,20 +294,36 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    const double yaml_ms = elapsed_ms(yaml_started);
+
     int population = 0;
     for (const coopa::maps::MapTown& town : generator.graph().towns) {
         population += town.population;
     }
 
+    const double world_km =
+        static_cast<double>(config.grid_size) * config.meters_per_grid_unit / 1000.0;
     std::cout << "\nseed:       " << config.seed << "  (rerun with --seed=" << config.seed << ")\n"
+              << "world:      " << world_km << " km square, " << config.meters_per_grid_unit
+              << " m per cell\n"
+              << "render:     " << config.image_size << " px square, "
+              << config.meters_per_pixel << " m per pixel, "
+              << coopa::maps::composite_shading_name(config.composite_shading) << " shading\n"
               << "cells:      " << generator.graph().centers.size() << "\n"
               << "countries:  " << generator.graph().countries.size()
               << "  regions: " << generator.graph().regions.size() << "\n"
               << "towns:      " << generator.graph().towns.size()
               << "  population: " << population << "\n"
               << "landmarks:  " << generator.graph().landmarks.size() << "\n"
-              << "written:   " << biomes_path << "\n"
-              << "           " << elevation_path << "\n"
-              << "           " << yaml_path << std::endl;
+              << "written:    " << coopa::maps::k_map_layer_count << " layers as "
+              << out_prefix << "_<layer>.png\n"
+              << "            " << yaml_path << "\n"
+              << "threads:    " << (engine ? engine->worker_count() : 1u) << "\n"
+              << "timings:    generate " << static_cast<int>(generate_ms) << " ms, export "
+              << static_cast<int>(export_ms) << " ms, yaml " << static_cast<int>(yaml_ms)
+              << " ms" << std::endl;
+    if (engine) {
+        engine->shutdown();
+    }
     return 0;
 }

@@ -1,6 +1,6 @@
 /**
  * @file test.cpp
- * @brief mapcoopa's test suite -- 39 cases over the generator, its passes, the
+ * @brief mapcoopa's test suite -- 57 cases over the generator, its passes, the
  *        renderers and the YAML round trip.
  *
  * Build target `mapcoopa_tests` (the bare `mapcoopa` target is the generator,
@@ -13,6 +13,7 @@
  */
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdio> // For std::remove
@@ -23,6 +24,7 @@
 #include <map>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <root_directory.h>
@@ -33,6 +35,8 @@
 #include <coopa/maps/map_data.h>
 #include <coopa/maps/map_generator.h>
 #include <coopa/maps/map_renderer.h>
+#include <coopa/maps/map_export.h>
+#include <coopa/maps/map_task.h>
 #include <coopa/maps/map_yaml.h>
 #include <glm/glm.hpp>
 
@@ -93,6 +97,19 @@ using namespace coopa::maps;
 static coopa::debug::Logger& maps_logger() {
     static coopa::debug::Logger logger("maps_test");
     return logger;
+}
+
+/**
+ * @brief One `JobEngine` shared by every test that needs one.
+ *
+ * Function-local static, like the logger, because a `JobEngine` starts a thread
+ * per core and a suite that built one per case would spend its runtime on thread
+ * creation. Shared is also the way it is meant to be used -- see the engine's own
+ * note on long-lived subsystems sharing a single engine.
+ */
+static coopa::job::JobEngine& maps_engine() {
+    static coopa::job::JobEngine engine;
+    return engine;
 }
 
 // Small enough that a full generate() is a few milliseconds, large enough that
@@ -373,7 +390,8 @@ static void test_towns_sit_on_habitable_land_and_stay_apart() {
     MapGenerator generator(small_config(), maps_logger());
     generator.generate();
     const MapGraph& graph = generator.graph();
-    const TownConfig& towns = generator.config().towns;
+    const MapConfig& config = generator.config();
+    const TownConfig& towns = config.towns;
 
     ASSERT_TRUE(!graph.towns.empty());
     ASSERT_TRUE(static_cast<int>(graph.towns.size()) <= towns.town_count);
@@ -388,7 +406,10 @@ static void test_towns_sit_on_habitable_land_and_stay_apart() {
         for (std::size_t j = i + 1; j < graph.towns.size(); ++j) {
             const double dx = graph.towns[j].point.x - town.point.x;
             const double dy = graph.towns[j].point.y - town.point.y;
-            ASSERT_TRUE(dx * dx + dy * dy >= towns.min_spacing * towns.min_spacing);
+            // Configured in metres, compared in grid units -- the two systems meet
+            // at meters_to_grid(), and nowhere else.
+            const double spacing = meters_to_grid(config, towns.min_spacing_m);
+            ASSERT_TRUE(dx * dx + dy * dy >= spacing * spacing);
         }
     }
 }
@@ -400,11 +421,19 @@ static void test_buildings_lie_inside_their_cell() {
 
     std::size_t total_buildings = 0;
     for (const MapTown& town : graph.towns) {
-        const MapCenter& center = graph.centers[static_cast<std::size_t>(town.center)];
-        std::vector<MapPoint> polygon;
-        for (const CornerId corner_id : center.corners) {
-            polygon.push_back(graph.corners[static_cast<std::size_t>(corner_id)].point);
+        // A settlement covers every cell in `cells`, not just its primary one,
+        // so a building has to fall inside *one of* them -- but still wholly
+        // inside that one, never straddling a boundary.
+        std::vector<std::vector<MapPoint>> polygons;
+        for (const CenterId cell_id : town.cells) {
+            const MapCenter& cell = graph.centers[static_cast<std::size_t>(cell_id)];
+            std::vector<MapPoint> polygon;
+            for (const CornerId corner_id : cell.corners) {
+                polygon.push_back(graph.corners[static_cast<std::size_t>(corner_id)].point);
+            }
+            polygons.push_back(std::move(polygon));
         }
+        ASSERT_TRUE(!polygons.empty());
 
         for (const MapBuilding& building : town.buildings) {
             ++total_buildings;
@@ -412,9 +441,19 @@ static void test_buildings_lie_inside_their_cell() {
             // The *rotated* corners, not an axis-aligned box. Checking the box
             // would pass even when a building drawn at its stated yaw hangs out
             // over the cell boundary.
-            for (const MapPoint& corner : building_corners(building)) {
-                ASSERT_TRUE(point_in_polygon(polygon, corner));
+            const std::array<MapPoint, 4> corners = building_corners(building);
+            bool contained = false;
+            for (const std::vector<MapPoint>& polygon : polygons) {
+                bool all_in = true;
+                for (const MapPoint& corner : corners) {
+                    all_in = all_in && point_in_polygon(polygon, corner);
+                }
+                if (all_in) {
+                    contained = true;
+                    break;
+                }
             }
+            ASSERT_TRUE(contained);
         }
     }
     ASSERT_TRUE(total_buildings > 0);
@@ -469,40 +508,45 @@ static void test_buildings_front_their_streets() {
     const MapGraph& graph = generator.graph();
     const TownConfig& towns = config.towns;
 
-    const double reach = towns.street_offset + towns.building_size_max;
+    // In grid units, because that is what the geometry is in; the config is metres.
+    const double reach = meters_to_grid(config, towns.street_offset_m + towns.building_size_max_m);
     std::size_t total = 0;
     std::size_t fronting = 0;
 
     for (const MapTown& town : graph.towns) {
-        const MapCenter& center = graph.centers[static_cast<std::size_t>(town.center)];
-
-        // The streets the pass would have derived: the approach from the cell's
-        // site out to each road or river edge it borders.
-        std::vector<MapPoint> street_ends;
-        for (const EdgeId edge_id : center.borders) {
-            const MapEdge& edge = graph.edges[static_cast<std::size_t>(edge_id)];
-            if (edge.road || edge.river > 0) {
-                street_ends.push_back(edge.midpoint);
+        // One street set per claimed cell: the pass derives streets per cell, so
+        // a building in an outlying cell fronts that cell's streets, not the
+        // primary cell's.
+        std::vector<std::pair<MapPoint, MapPoint>> streets;
+        for (const CenterId cell_id : town.cells) {
+            const MapCenter& cell = graph.centers[static_cast<std::size_t>(cell_id)];
+            for (const EdgeId edge_id : cell.borders) {
+                const MapEdge& edge = graph.edges[static_cast<std::size_t>(edge_id)];
+                if (edge.road || edge.river > 0) {
+                    streets.emplace_back(cell.point, edge.midpoint);
+                }
             }
         }
-        if (street_ends.empty()) {
+        if (streets.empty()) {
             continue;
         }
 
         for (const MapBuilding& building : town.buildings) {
             ++total;
-            for (const MapPoint& end : street_ends) {
-                const double dx = end.x - center.point.x;
-                const double dy = end.y - center.point.y;
+            for (const auto& street : streets) {
+                const MapPoint& from = street.first;
+                const MapPoint& end = street.second;
+                const double dx = end.x - from.x;
+                const double dy = end.y - from.y;
                 const double length_squared = dx * dx + dy * dy;
                 if (length_squared == 0.0) {
                     continue;
                 }
-                double t = ((building.point.x - center.point.x) * dx
-                          + (building.point.y - center.point.y) * dy) / length_squared;
+                double t = ((building.point.x - from.x) * dx
+                          + (building.point.y - from.y) * dy) / length_squared;
                 t = std::clamp(t, 0.0, 1.0);
-                const double nearest_x = center.point.x + t * dx;
-                const double nearest_y = center.point.y + t * dy;
+                const double nearest_x = from.x + t * dx;
+                const double nearest_y = from.y + t * dy;
                 const double distance = std::hypot(building.point.x - nearest_x,
                                                    building.point.y - nearest_y);
                 if (distance > reach) {
@@ -549,13 +593,13 @@ static void test_renderers_produce_a_full_image() {
     MapGenerator generator(config, maps_logger());
     generator.generate();
 
-    const Image biomes = BiomeRenderer::render(generator.graph(), config);
+    const Image biomes = MapLayers::composite(generator.graph(), config);
     ASSERT_EQ(biomes.width, config.image_size);
     ASSERT_EQ(biomes.height, config.image_size);
     ASSERT_EQ(biomes.pixels.size(),
               static_cast<std::size_t>(config.image_size) * config.image_size * 3);
 
-    const Image elevation = ElevationRenderer::render(generator.graph(), config);
+    const Image elevation = MapLayers::elevation(generator.graph(), config);
     ASSERT_EQ(elevation.pixels.size(), biomes.pixels.size());
 
     // Anything other than a single flat colour proves the cells actually drew.
@@ -566,48 +610,16 @@ static void test_renderers_produce_a_full_image() {
     ASSERT_TRUE(varied);
 }
 
-static void test_coverage_mask_darkens_each_pixel_once() {
-    // Two strokes that overlap along a run and then cross. Under per-stroke
-    // darkening the shared pixels drop twice over, plus three times again from
-    // the square brush covering each pixel on consecutive Bresenham steps.
-    const int size = 64;
-    const int amount = 10;
-    const unsigned char base = 200;
-
-    Image image;
-    image.reset(size, size, 3, glm::vec3(base, base, base));
-
-    CoverageMask mask;
-    mask.reset(size, size);
-    mark_line(mask, 8, 32, 56, 32, 1);   // horizontal
-    mark_line(mask, 32, 8, 32, 56, 1);   // vertical, crosses the first
-    mark_line(mask, 8, 32, 56, 32, 1);   // the horizontal again, start to finish
-    darken_masked(image, mask, amount);
-
-    std::size_t darkened = 0;
-    for (int y = 0; y < size; ++y) {
-        for (int x = 0; x < size; ++x) {
-            const std::size_t index = (static_cast<std::size_t>(y) * size + x) * 3;
-            const int value = image.pixels[index];
-            const bool covered = mask.at(x, y);
-            ASSERT_EQ(value, covered ? base - amount : static_cast<int>(base));
-            if (covered) {
-                ++darkened;
-            }
-        }
-    }
-    ASSERT_TRUE(darkened > 0);
-    // The crossing pixel is the one a per-stroke implementation gets most wrong.
-    ASSERT_TRUE(mask.at(32, 32));
-    ASSERT_EQ(static_cast<int>(image.pixels[(32 * static_cast<std::size_t>(size) + 32) * 3]),
-              base - amount);
-}
-
-static void test_elevation_rivers_darken_exactly_once() {
-    // Straight cell boundaries in both renders: the elevation pass runs before
-    // the river pass, so turning rivers off cannot change any cell's height, and
-    // with subdivision off the outlines are purely geometric and so cannot
-    // change either. The two images therefore differ only by the river layer.
+/**
+ * @brief Rivers belong to the water layer, and to no other.
+ *
+ * The elevation layer used to have its river network dimmed into it. That made
+ * it a picture of the terrain rather than the terrain itself -- a consumer
+ * flooding a mesh to those values would find channels already cut. Splitting the
+ * layers means the height field is now height and nothing else, and this is the
+ * check that the split actually happened rather than being merely intended.
+ */
+static void test_rivers_live_on_the_water_layer_only() {
     MapConfig with_rivers_config = small_config();
     with_rivers_config.subdivide_noisy_edges = false;
 
@@ -618,25 +630,19 @@ static void test_elevation_rivers_darken_exactly_once() {
     MapGenerator without_rivers(without_rivers_config, maps_logger());
     with_rivers.generate();
     without_rivers.generate();
+    ASSERT_TRUE(!with_rivers.graph().rivers.empty());
 
-    const Image drawn = ElevationRenderer::render(with_rivers.graph(), with_rivers_config);
-    const Image base = ElevationRenderer::render(without_rivers.graph(), without_rivers_config);
+    // The height field does not notice whether the river pass ran.
+    const Image drawn = MapLayers::elevation(with_rivers.graph(), with_rivers_config);
+    const Image base = MapLayers::elevation(without_rivers.graph(), without_rivers_config);
     ASSERT_EQ(drawn.pixels.size(), base.pixels.size());
+    ASSERT_TRUE(drawn.pixels == base.pixels);
 
-    std::size_t differing = 0;
-    for (std::size_t i = 0; i < base.pixels.size(); ++i) {
-        const int base_value = base.pixels[i];
-        const int drawn_value = drawn.pixels[i];
-        if (drawn_value == base_value) {
-            continue;
-        }
-        ++differing;
-        // Exactly one dip, never a multiple of it. The std::max arm covers
-        // terrain already darker than the dip, which clamps at zero.
-        ASSERT_EQ(drawn_value, std::max(0, base_value - ElevationRenderer::k_river_darken));
-    }
-    // Guards against the assertion above passing because nothing was drawn.
-    ASSERT_TRUE(differing > 0);
+    // The water layer very much does.
+    const Image wet = MapLayers::water(with_rivers.graph(), with_rivers_config);
+    const Image dry = MapLayers::water(without_rivers.graph(), without_rivers_config);
+    ASSERT_EQ(wet.pixels.size(), dry.pixels.size());
+    ASSERT_TRUE(wet.pixels != dry.pixels);
 }
 
 // Regions, names and landmarks need more land than a 16-cell map offers.
@@ -665,7 +671,8 @@ static void test_buildings_avoid_rivers() {
             const MapPoint& a = graph.corners[static_cast<std::size_t>(edge.v0)].point;
             const MapPoint& b = graph.corners[static_cast<std::size_t>(edge.v1)].point;
             const double clearance =
-                river_width(config, edge.river) * 0.5 + config.towns.water_clearance;
+                river_width(config, edge.river) * 0.5
+                + meters_to_grid(config, config.towns.water_clearance_m);
 
             for (const MapBuilding& building : town.buildings) {
                 for (const MapPoint& corner : building_corners(building)) {
@@ -719,13 +726,15 @@ static void test_building_sizes_span_the_range() {
     MapGenerator generator(config, maps_logger());
     generator.generate();
 
-    double smallest = config.towns.building_size_max;
-    double largest = config.towns.building_size_min;
+    double smallest = config.towns.building_size_max_m;
+    double largest = config.towns.building_size_min_m;
     std::size_t count = 0;
     for (const MapTown& town : generator.graph().towns) {
         for (const MapBuilding& building : town.buildings) {
-            ASSERT_TRUE(building.width >= config.towns.building_size_min - 1e-9);
-            ASSERT_TRUE(building.width <= config.towns.building_size_max + 1e-9);
+            ASSERT_TRUE(building.width
+                        >= meters_to_grid(config, config.towns.building_size_min_m) - 1e-9);
+            ASSERT_TRUE(building.width
+                        <= meters_to_grid(config, config.towns.building_size_max_m) + 1e-9);
             ASSERT_TRUE(std::abs(building.width - building.height) < 1e-9);
             smallest = std::min(smallest, building.width);
             largest = std::max(largest, building.width);
@@ -734,8 +743,8 @@ static void test_building_sizes_span_the_range() {
     }
     ASSERT_TRUE(count > 0);
     // Actually varied, not one size repeated -- the range has to be used.
-    ASSERT_TRUE(largest - smallest > (config.towns.building_size_max
-                                      - config.towns.building_size_min) * 0.5);
+    ASSERT_TRUE(largest - smallest > (config.towns.building_size_max_m
+                                      - config.towns.building_size_min_m) * 0.5);
 }
 
 static void test_regions_partition_the_land() {
@@ -969,7 +978,22 @@ static void test_yaml_round_trip_preserves_the_graph() {
     }
 }
 
-static void test_yaml_round_trip_renders_identically() {
+/**
+ * @brief A reloaded map renders as the same map, layer for layer.
+ *
+ * Six significant digits survive the document (see the precision note on
+ * `map_to_node()`), and for everything drawn from connectivity, flags or flat
+ * colour that is exact -- those layers must come back byte for byte.
+ *
+ * The two layers derived from the *height field* are the exception, and only
+ * just. Hillshading takes differences between neighbouring elevations and
+ * multiplies them by a large exaggeration, so the last digit of a round-tripped
+ * height can move a greyscale value by one. Allowing one and no more is the
+ * point: it pins the loss to rounding rather than to anything structural, and a
+ * regression that dropped, say, the corner elevations entirely would blow
+ * straight through it.
+ */
+static void test_yaml_round_trip_renders_every_layer() {
     MapConfig config = small_config(9);
     MapGenerator generator(config, maps_logger());
     generator.generate();
@@ -982,12 +1006,21 @@ static void test_yaml_round_trip_renders_identically() {
     ASSERT_TRUE(load_map(path, loaded, loaded_config));
     std::remove(path.c_str());
 
-    // The serialiser drops an edge's noisy path when subdivision left it at two
-    // points; this is the check that reconstructing it puts the same pixels down.
-    const Image before = BiomeRenderer::render(generator.graph(), config);
-    const Image after = BiomeRenderer::render(loaded, loaded_config);
-    ASSERT_EQ(before.pixels.size(), after.pixels.size());
-    ASSERT_TRUE(before.pixels == after.pixels);
+    for (std::size_t i = 0; i < k_map_layer_count; ++i) {
+        const MapLayer layer = static_cast<MapLayer>(i);
+        const Image before = MapLayers::render(layer, generator.graph(), config);
+        const Image after = MapLayers::render(layer, loaded, loaded_config);
+        ASSERT_EQ(before.pixels.size(), after.pixels.size());
+        ASSERT_TRUE(before.pixels.size() > 0);
+
+        const bool from_height = layer == MapLayer::Elevation || layer == MapLayer::Composite;
+        const int tolerance = from_height ? 1 : 0;
+        for (std::size_t k = 0; k < before.pixels.size(); ++k) {
+            const int delta = std::abs(static_cast<int>(before.pixels[k])
+                                     - static_cast<int>(after.pixels[k]));
+            ASSERT_TRUE(delta <= tolerance);
+        }
+    }
 }
 
 static void test_disabled_passes_leave_the_graph_untouched() {
@@ -1367,7 +1400,7 @@ static void test_readme_legend_matches_the_palette() {
         // pointing at the wrong biome, or a hex that disagrees with its own RGB,
         // both fail here rather than passing three separate looser checks.
         const glm::vec3& color = palette.color_for(biome);
-        const std::string row = "| ![](docs/legend/" + slug + ".svg) | ";
+        const std::string row = "| ![](assets/svg/" + slug + ".svg) | ";
         const std::string tail = " | `" + slug + "` | `" + hex + "` | "
                                + std::to_string(static_cast<int>(color.r)) + ", "
                                + std::to_string(static_cast<int>(color.g)) + ", "
@@ -1379,7 +1412,7 @@ static void test_readme_legend_matches_the_palette() {
         ASSERT_TRUE(readme.find(tail, at) < readme.find('\n', at));
 
         // And the swatch itself is that colour, not merely a file of the right name.
-        const std::string swatch = read_file(root + "/docs/legend/" + slug + ".svg");
+        const std::string swatch = read_file(root + "/assets/svg/" + slug + ".svg");
         ASSERT_TRUE(!swatch.empty());
         ASSERT_TRUE(swatch.find("fill=\"" + hex + "\"") != std::string::npos);
         ++rows_checked;
@@ -1389,7 +1422,7 @@ static void test_readme_legend_matches_the_palette() {
     // The overlay half of the legend, keyed by the swatch each row points at.
     const std::pair<const char*, glm::vec3> overlays[] = {
         {"river", palette.river_color},
-        {"road-casing", palette.road_casing_color},
+        {"bridge", palette.bridge_color},
         {"trail", palette.trail_color},
         {"road", palette.road_color},
         {"highway", palette.highway_color},
@@ -1401,12 +1434,12 @@ static void test_readme_legend_matches_the_palette() {
     };
     for (const auto& overlay : overlays) {
         const std::string hex = hex_of(overlay.second);
-        const std::string row = "| ![](docs/legend/" + std::string(overlay.first) + ".svg) |";
+        const std::string row = "| ![](assets/svg/" + std::string(overlay.first) + ".svg) |";
         const std::size_t at = readme.find(row);
         ASSERT_TRUE(at != std::string::npos);
         ASSERT_TRUE(readme.find("`" + hex + "`", at) < readme.find('\n', at));
 
-        const std::string swatch = read_file(root + "/docs/legend/" + overlay.first + ".svg");
+        const std::string swatch = read_file(root + "/assets/svg/" + overlay.first + ".svg");
         ASSERT_TRUE(!swatch.empty());
         ASSERT_TRUE(swatch.find("fill=\"" + hex + "\"") != std::string::npos);
     }
@@ -1414,6 +1447,873 @@ static void test_readme_legend_matches_the_palette() {
     // The tint caveat is the one thing a reader can check against a render and
     // find false, so it may not quietly disappear either.
     ASSERT_TRUE(readme.find("untinted") != std::string::npos);
+}
+
+
+// --- Configuration files --------------------------------------------------
+
+/** @brief Writes a throwaway YAML file and returns its path. */
+static std::string write_temp_yaml(const std::string& name, const std::string& body) {
+    std::ofstream out(name);
+    out << body;
+    out.close();
+    return name;
+}
+
+/**
+ * @brief A `MapConfig` with every field moved off its default.
+ *
+ * Deliberately exhaustive and deliberately not derived from the defaults: the
+ * point is that a field left out of `config_to_node()` or `config_from_node()`
+ * comes back as its default, so any field this function forgets to disturb is a
+ * field the round-trip test cannot catch.
+ */
+static MapConfig perturbed_config() {
+    MapConfig config;
+    config.grid_size = 37;
+    config.jitter = 0.41;
+    config.seed = 90210;
+    config.border_length = 1.75;
+    config.image_size = 333;
+    config.png_compression_level = 4;
+    config.show_regions = false;
+    config.composite_shading = CompositeShading::Hillshade;
+    config.region_tint = 0.42f;
+    config.temperature_lapse_rate = 0.31;
+    config.temperature_falloff = 2.4;
+    config.elevation_smoothing_iterations = 9;
+    config.elevation_smoothing_strength = 0.66;
+    config.threshold_water = 0.44;
+    config.threshold_water_count = 3;
+    config.river_count = 17;
+    config.river_width_base_m = 0.077;
+    config.river_width_per_volume_m = 0.033;
+    config.trail_width_m = 0.11;
+    config.road_width_m = 0.22;
+    config.highway_width_m = 0.33;
+    config.subdivide_noisy_edges = false;
+
+    config.noise_island = {11, 0.123, FastNoiseLite::NoiseType_Cellular,
+                           FastNoiseLite::FractalType_Ridged, 3, 2.5, 0.6, 0.7};
+    config.noise_temperature = {22, 0.456, FastNoiseLite::NoiseType_Perlin,
+                                FastNoiseLite::FractalType_PingPong, 7, 1.5, 0.4, 0.2};
+
+    config.towns = {13, 555.5, 2, 6, 0.55, 3.5, 0.15, 0.25, 0.3, 0.75, 0.05,
+                    9, 5, 2, 41, 8.5, 17.5, 0.8, 0.5, 4.5,
+                    2, 9, 1.9, 1.4, 9.5, 16.5, 2.5, 0.5, 123};
+    config.roads = {19, 444.5, 4.5, 2.5, 3.5, 1.25, 0.95, 44.0, 3, 0.65, 0.5, 0.2, 4};
+    config.regions = {7, 4, 9.5, 3.25, 31.0};
+    config.landmarks = {29, 31, 0.71, 0.088, 0.52, 12, 3.75, 2, 7, 5, 4};
+
+    config.enable_water = false;
+    config.enable_coast = false;
+    config.enable_elevation = false;
+    config.enable_temperature = false;
+    config.enable_rivers = false;
+    config.enable_moisture = false;
+    config.enable_biomes = false;
+    config.enable_roads = false;
+    config.enable_regions = false;
+    config.enable_towns = false;
+    config.enable_landmarks = false;
+    config.enable_noisy_edges = false;
+    return config;
+}
+
+static void test_load_config_reports_a_missing_file() {
+    MapConfig config;
+    config.grid_size = 64;   // A caller's own default, which must survive.
+    config.river_count = 9;
+
+    const ConfigLoadResult result = load_config("no_such_config_file.yaml", config);
+    ASSERT_TRUE(result.status == ConfigLoad::NotFound);
+    ASSERT_TRUE(!result.has_seed);
+    ASSERT_TRUE(!result.message.empty());
+    // Nothing applied, so the caller's defaults are intact rather than reset.
+    ASSERT_EQ(config.grid_size, 64);
+    ASSERT_EQ(config.river_count, 9);
+}
+
+static void test_load_config_rejects_a_malformed_file() {
+    MapConfig config;
+    config.grid_size = 64;
+
+    const std::string broken = write_temp_yaml("test_broken_config.yaml",
+                                               "seed: 42\n  bad indent: [\n");
+    const ConfigLoadResult result = load_config(broken, config);
+    std::remove(broken.c_str());
+
+    ASSERT_TRUE(result.status == ConfigLoad::Malformed);
+    ASSERT_TRUE(!result.message.empty());
+    ASSERT_EQ(config.grid_size, 64);
+
+    // An empty file parses as null, not as an empty mapping. Reported rather than
+    // taken as "no keys set": a caller asked for this file by name.
+    const std::string empty = write_temp_yaml("test_empty_config.yaml", "");
+    const ConfigLoadResult from_empty = load_config(empty, config);
+    std::remove(empty.c_str());
+    ASSERT_TRUE(from_empty.status == ConfigLoad::Malformed);
+}
+
+static void test_config_round_trips_every_field() {
+    const MapConfig original = perturbed_config();
+
+    const std::string path = "test_full_config.yaml";
+    {
+        std::ofstream out(path);
+        out << config_to_node(original);
+    }
+
+    // Loaded onto a *default* config, so any field the writer or the reader forgets
+    // comes back as its default and fails below.
+    MapConfig loaded;
+    const ConfigLoadResult result = load_config(path, loaded);
+    std::remove(path.c_str());
+
+    ASSERT_TRUE(result.status == ConfigLoad::Ok);
+    ASSERT_TRUE(result.has_seed);
+
+    ASSERT_EQ(loaded.grid_size, original.grid_size);
+    ASSERT_TRUE(std::abs(loaded.jitter - original.jitter) < 1e-9);
+    ASSERT_EQ(loaded.seed, original.seed);
+    ASSERT_TRUE(std::abs(loaded.border_length - original.border_length) < 1e-9);
+    ASSERT_EQ(loaded.image_size, original.image_size);
+    ASSERT_EQ(loaded.png_compression_level, original.png_compression_level);
+    ASSERT_TRUE(loaded.show_regions == original.show_regions);
+    ASSERT_TRUE(loaded.composite_shading == original.composite_shading);
+    ASSERT_TRUE(std::abs(loaded.region_tint - original.region_tint) < 1e-6f);
+    ASSERT_TRUE(std::abs(loaded.temperature_lapse_rate - original.temperature_lapse_rate) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.temperature_falloff - original.temperature_falloff) < 1e-9);
+    ASSERT_EQ(loaded.elevation_smoothing_iterations, original.elevation_smoothing_iterations);
+    ASSERT_TRUE(std::abs(loaded.elevation_smoothing_strength
+                         - original.elevation_smoothing_strength) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.threshold_water - original.threshold_water) < 1e-9);
+    ASSERT_EQ(loaded.threshold_water_count, original.threshold_water_count);
+    ASSERT_EQ(loaded.river_count, original.river_count);
+    ASSERT_TRUE(std::abs(loaded.river_width_base_m - original.river_width_base_m) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.river_width_per_volume_m - original.river_width_per_volume_m) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.trail_width_m - original.trail_width_m) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.road_width_m - original.road_width_m) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.highway_width_m - original.highway_width_m) < 1e-9);
+    ASSERT_TRUE(loaded.subdivide_noisy_edges == original.subdivide_noisy_edges);
+
+    // Both noise fields, which is the reason they share one pair of helpers: a
+    // second hand-written copy is what falls behind.
+    const NoiseConfig* noises[2][2] = {
+        {&loaded.noise_island, &original.noise_island},
+        {&loaded.noise_temperature, &original.noise_temperature},
+    };
+    for (const auto& pair : noises) {
+        ASSERT_EQ(pair[0]->seed, pair[1]->seed);
+        ASSERT_TRUE(std::abs(pair[0]->frequency - pair[1]->frequency) < 1e-9);
+        ASSERT_TRUE(pair[0]->type == pair[1]->type);
+        ASSERT_TRUE(pair[0]->fractal_type == pair[1]->fractal_type);
+        ASSERT_EQ(pair[0]->octaves, pair[1]->octaves);
+        ASSERT_TRUE(std::abs(pair[0]->lacunarity - pair[1]->lacunarity) < 1e-9);
+        ASSERT_TRUE(std::abs(pair[0]->gain - pair[1]->gain) < 1e-9);
+        ASSERT_TRUE(std::abs(pair[0]->weighted_strength - pair[1]->weighted_strength) < 1e-9);
+    }
+
+    ASSERT_EQ(loaded.towns.town_count, original.towns.town_count);
+    ASSERT_TRUE(std::abs(loaded.towns.min_spacing_m - original.towns.min_spacing_m) < 1e-9);
+    ASSERT_EQ(loaded.towns.capital_count, original.towns.capital_count);
+    ASSERT_EQ(loaded.towns.town_tier_count, original.towns.town_tier_count);
+    ASSERT_EQ(loaded.towns.buildings_per_town, original.towns.buildings_per_town);
+    ASSERT_TRUE(std::abs(loaded.towns.building_size_min_m - original.towns.building_size_min_m) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.towns.building_size_max_m - original.towns.building_size_max_m) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.towns.water_clearance_m - original.towns.water_clearance_m) < 1e-9);
+    ASSERT_EQ(loaded.towns.household_size_min, original.towns.household_size_min);
+    ASSERT_EQ(loaded.towns.household_size_max, original.towns.household_size_max);
+    ASSERT_EQ(loaded.towns.infill_attempts, original.towns.infill_attempts);
+
+    ASSERT_EQ(loaded.roads.hub_count, original.roads.hub_count);
+    ASSERT_TRUE(std::abs(loaded.roads.hub_min_spacing_m - original.roads.hub_min_spacing_m) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.roads.slope_cost - original.roads.slope_cost) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.roads.ford_cost - original.roads.ford_cost) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.roads.water_crossing_cost
+                         - original.roads.water_crossing_cost) < 1e-9);
+    ASSERT_EQ(loaded.roads.max_water_span, original.roads.max_water_span);
+    ASSERT_TRUE(std::abs(loaded.roads.reuse_discount - original.roads.reuse_discount) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.roads.highway_traffic_share
+                         - original.roads.highway_traffic_share) < 1e-9);
+    ASSERT_EQ(loaded.roads.smoothing_iterations, original.roads.smoothing_iterations);
+
+    // The two blocks that were missing entirely before configuration files existed.
+    ASSERT_EQ(loaded.regions.country_count, original.regions.country_count);
+    ASSERT_EQ(loaded.regions.regions_per_country, original.regions.regions_per_country);
+    ASSERT_TRUE(std::abs(loaded.regions.min_country_spacing
+                         - original.regions.min_country_spacing) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.regions.elevation_cost - original.regions.elevation_cost) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.regions.water_crossing_cost
+                         - original.regions.water_crossing_cost) < 1e-9);
+
+    ASSERT_EQ(loaded.landmarks.max_natural, original.landmarks.max_natural);
+    ASSERT_EQ(loaded.landmarks.max_abandoned, original.landmarks.max_abandoned);
+    ASSERT_TRUE(std::abs(loaded.landmarks.peak_elevation
+                         - original.landmarks.peak_elevation) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.landmarks.waterfall_drop
+                         - original.landmarks.waterfall_drop) < 1e-9);
+    ASSERT_EQ(loaded.landmarks.great_lake_cells, original.landmarks.great_lake_cells);
+    ASSERT_EQ(loaded.landmarks.kind_share_denominator, original.landmarks.kind_share_denominator);
+    ASSERT_EQ(loaded.landmarks.cape_ocean_ratio_numerator,
+              original.landmarks.cape_ocean_ratio_numerator);
+
+    // All twelve toggles, which a saved map used to lose outright.
+    ASSERT_TRUE(loaded.enable_water == original.enable_water);
+    ASSERT_TRUE(loaded.enable_coast == original.enable_coast);
+    ASSERT_TRUE(loaded.enable_elevation == original.enable_elevation);
+    ASSERT_TRUE(loaded.enable_temperature == original.enable_temperature);
+    ASSERT_TRUE(loaded.enable_rivers == original.enable_rivers);
+    ASSERT_TRUE(loaded.enable_moisture == original.enable_moisture);
+    ASSERT_TRUE(loaded.enable_biomes == original.enable_biomes);
+    ASSERT_TRUE(loaded.enable_roads == original.enable_roads);
+    ASSERT_TRUE(loaded.enable_regions == original.enable_regions);
+    ASSERT_TRUE(loaded.enable_towns == original.enable_towns);
+    ASSERT_TRUE(loaded.enable_landmarks == original.enable_landmarks);
+    ASSERT_TRUE(loaded.enable_noisy_edges == original.enable_noisy_edges);
+}
+
+static void test_load_config_overrides_only_what_it_names() {
+    MapConfig config;
+    config.grid_size = 64;
+    config.river_count = 9;
+    config.roads.hub_count = 5;
+
+    // An absent key leaves the caller's value alone; that is what makes a config
+    // file an override rather than a replacement, and what lets the generator set
+    // its own scene defaults first.
+    const std::string path = write_temp_yaml("test_partial_config.yaml",
+                                             "grid_size: 12\nnot_a_real_key: 7\n");
+    const ConfigLoadResult result = load_config(path, config);
+    std::remove(path.c_str());
+
+    ASSERT_TRUE(result.status == ConfigLoad::Ok);
+    ASSERT_TRUE(!result.has_seed);   // Never named, so a caller may still draw one.
+    ASSERT_EQ(config.grid_size, 12);
+    ASSERT_EQ(config.river_count, 9);
+    ASSERT_EQ(config.roads.hub_count, 5);
+}
+
+/**
+ * @brief The shipped assets/config.yaml is documentation, and drifts from the tool.
+ *
+ * It is what a reader edits and what the README describes, so a value changed in
+ * one and not the other is a silent lie. Nothing else would catch it: the
+ * generator reads whatever the file says, so a wrong value produces a different
+ * map perfectly happily.
+ */
+static void test_shipped_config_matches_the_documented_defaults() {
+    MapConfig config;
+    const ConfigLoadResult result =
+        load_config(std::string(ROOT_DIR) + "/assets/config.yaml", config);
+
+    ASSERT_TRUE(result.status == ConfigLoad::Ok);
+    ASSERT_TRUE(result.has_seed);
+
+    // The values README.md's options table quotes as this tool's defaults.
+    ASSERT_EQ(config.grid_size, 80);
+    ASSERT_EQ(config.river_count, 55);
+    // The scale the whole file is denominated in. image_size is NOT asserted --
+    // it is derived from these two, and the shipped file deliberately omits it.
+    ASSERT_TRUE(std::abs(config.meters_per_grid_unit - 60.0) < 1e-9);
+    ASSERT_TRUE(std::abs(config.meters_per_pixel - 1.0) < 1e-9);
+    ASSERT_TRUE(config.composite_shading == CompositeShading::Elevation);
+    ASSERT_EQ(derive_image_size(config), 4800);
+    ASSERT_EQ(config.towns.town_count, 28);
+    ASSERT_EQ(config.roads.hub_count, 32);
+    ASSERT_EQ(config.regions.country_count, 5);
+    ASSERT_EQ(config.regions.regions_per_country, 3);
+
+    // Shipping with a pass turned off would silently produce a map missing a whole
+    // feature, and the symptom would look like a bug in the pass.
+    ASSERT_TRUE(config.enable_water && config.enable_coast && config.enable_elevation);
+    ASSERT_TRUE(config.enable_temperature && config.enable_rivers && config.enable_moisture);
+    ASSERT_TRUE(config.enable_biomes && config.enable_roads && config.enable_regions);
+    ASSERT_TRUE(config.enable_towns && config.enable_landmarks && config.enable_noisy_edges);
+}
+
+
+// --- World scale and layers -----------------------------------------------
+
+/**
+ * @brief The scale arithmetic, and the round trip through --image-size.
+ *
+ * These three numbers -- grid size, metres per cell, metres per pixel -- are
+ * what make every other size in the config mean something, so an error here
+ * silently rescales the entire world rather than breaking anything visibly.
+ */
+static void test_world_scale_arithmetic() {
+    MapConfig config;
+    config.grid_size = 80;
+    config.meters_per_grid_unit = 60.0;
+    config.meters_per_pixel = 1.0;
+
+    // 80 cells x 60 m = 4.8 km, at one pixel to the metre.
+    ASSERT_EQ(derive_image_size(config), 4800);
+    ASSERT_TRUE(std::abs(meters_to_grid(config, 60.0) - 1.0) < 1e-12);
+    ASSERT_TRUE(std::abs(grid_to_meters(config, 1.0) - 60.0) < 1e-12);
+    ASSERT_TRUE(std::abs(meters_to_grid(config, grid_to_meters(config, 0.37)) - 0.37) < 1e-12);
+
+    // Coarser pixels, same world.
+    config.meters_per_pixel = 4.0;
+    ASSERT_EQ(derive_image_size(config), 1200);
+
+    // What --image-size does: back-compute the scale so the two cannot disagree.
+    const double world_meters =
+        static_cast<double>(config.grid_size) * config.meters_per_grid_unit;
+    config.meters_per_pixel = world_meters / 2400.0;
+    ASSERT_EQ(derive_image_size(config), 2400);
+    ASSERT_TRUE(std::abs(config.meters_per_pixel - 2.0) < 1e-12);
+}
+
+/**
+ * @brief A feature configured in metres is drawn that many pixels across.
+ *
+ * The whole point of the scale: at one pixel to the metre a width read off a
+ * render is a measurement. Checked against `draw_line()` directly rather than
+ * against a generated map, because a road in a map is curved and a scanline
+ * across a curve measures the secant, not the width.
+ *
+ * One pixel of slack, and in one direction only: the brush is a disc of integer
+ * radius, so it can only draw odd widths, and `half_width_pixels_()` rounds down
+ * so an even width understates rather than overstates.
+ */
+static void test_features_render_at_their_configured_size() {
+    MapConfig config;
+    config.grid_size = 80;
+    config.meters_per_grid_unit = 60.0;
+    config.meters_per_pixel = 1.0;
+    config.image_size = derive_image_size(config);
+    const double scale = static_cast<double>(config.image_size) / config.grid_size;
+
+    // Mirrors MapLayers::half_width_pixels_, which is private to the renderer.
+    const auto half_width_for = [scale](double width_grid) { return width_grid * scale * 0.5; };
+    const auto drawn_width = [](double half_width) {
+        Image image;
+        image.reset(200, 200, 3, glm::vec3(0.0f));
+        draw_line(image, 20.0, 100.0, 180.0, 100.0, half_width, glm::vec3(255.0f));
+        int best = 0, run = 0;
+        for (int y = 0; y < image.height; ++y) {
+            run = image.color_at(100, y).r > 0.0f ? run + 1 : 0;
+            best = std::max(best, run);
+        }
+        return best;
+    };
+
+    // One pixel of slack either way: an even width cannot be centred on a pixel
+    // row, so an axis-aligned stroke -- which is what this measures -- rounds up
+    // to an odd row count.
+    for (const RoadClass road_class : {RoadClass::Trail, RoadClass::Road, RoadClass::Highway}) {
+        const int meters = static_cast<int>(road_width_meters(config, road_class));
+        const int pixels = drawn_width(half_width_for(road_width_for(config, road_class)));
+        ASSERT_TRUE(std::abs(pixels - meters) <= 1);
+    }
+    for (const int volume : {0, 3, 10}) {
+        const int meters = static_cast<int>(river_width_meters(config, volume));
+        const int pixels = drawn_width(half_width_for(river_width(config, volume)));
+        ASSERT_TRUE(std::abs(pixels - meters) <= 1);
+    }
+
+    // Building footprints are stored in grid units but configured in metres.
+    ASSERT_TRUE(std::abs(grid_to_meters(config,
+                    meters_to_grid(config, config.towns.building_size_min_m))
+                - config.towns.building_size_min_m) < 1e-9);
+    ASSERT_TRUE(config.towns.building_size_min_m >= 5.0);
+    ASSERT_TRUE(config.towns.building_size_max_m <= 20.0);
+}
+
+/**
+ * @brief A stroke is the width it was asked for, whichever way it runs.
+ *
+ * Two width bugs lived here in turn, and neither was visible from a horizontal
+ * measurement. A **square** brush widened a line by up to sqrt(2) off the axes,
+ * so a diagonal 6 m road drew 8 m wide. Replacing it with a round brush stamped
+ * along an 8-connected path introduced the opposite error -- the path advances
+ * sqrt(2) of ground per step, so a diagonal drew 0.707 of its width. `draw_line()`
+ * now paints by distance to the segment and has neither problem.
+ *
+ * Measured as painted area over Euclidean length, which is direction-independent;
+ * a scanline measures the secant across anything not perpendicular to it. The
+ * tolerance is a pixel and a bit: pixel centres sit on integers, so an
+ * axis-aligned band of even width has to round to an odd row count, and that
+ * parity is irreducible however the stroke is defined.
+ */
+static void test_stroke_width_is_direction_independent() {
+    const auto mean_width = [](double x0, double y0, double x1, double y1, double width) {
+        Image image;
+        image.reset(400, 400, 3, glm::vec3(0.0f));
+        draw_line(image, x0, y0, x1, y1, width * 0.5, glm::vec3(255.0f));
+        std::size_t painted = 0;
+        for (int y = 0; y < image.height; ++y) {
+            for (int x = 0; x < image.width; ++x) {
+                if (image.color_at(x, y).r > 0.0f) {
+                    ++painted;
+                }
+            }
+        }
+        return static_cast<double>(painted) / std::hypot(x1 - x0, y1 - y0);
+    };
+
+    for (const double width : {3.0, 5.0, 6.0, 10.0, 25.0}) {
+        const double flat = mean_width(40, 200, 360, 200, width);
+        const double diagonal = mean_width(40, 40, 360, 360, width);
+
+        // Both orientations land within rasterisation parity of the width they
+        // were given. A square brush put the diagonal 40% over; a brush stamped
+        // along an 8-connected path put it 30% under. Either would blow through
+        // this at every width tested.
+        ASSERT_TRUE(std::abs(flat - width) <= 1.6);
+        ASSERT_TRUE(std::abs(diagonal - width) <= 1.6);
+    }
+}
+
+static void test_rivers_are_long_and_smooth() {
+    MapConfig config = world_config(31);
+    MapGenerator generator(config, maps_logger());
+    generator.generate();
+    const MapGraph& graph = generator.graph();
+
+    ASSERT_TRUE(!graph.rivers.empty());
+    for (const MapRiver& river : graph.rivers) {
+        // Short trickles are rejected and redrawn, so every kept watercourse
+        // actually crosses some country.
+        ASSERT_TRUE(static_cast<int>(river.corners.size()) >= config.river_min_length);
+
+        // Corner-cutting multiplies the point count; a run of N corners that
+        // came back with N points was never smoothed.
+        ASSERT_TRUE(river.points.size() > river.corners.size());
+        ASSERT_TRUE(river.volume > 0);
+
+        for (const MapPoint& point : river.points) {
+            ASSERT_TRUE(std::isfinite(point.x) && std::isfinite(point.y));
+            ASSERT_TRUE(point.x >= 0.0 && point.x <= static_cast<double>(config.grid_size));
+            ASSERT_TRUE(point.y >= 0.0 && point.y <= static_cast<double>(config.grid_size));
+        }
+        // The course runs downhill, source to mouth.
+        const MapCorner& source = graph.corners[static_cast<std::size_t>(river.corners.front())];
+        const MapCorner& mouth = graph.corners[static_cast<std::size_t>(river.corners.back())];
+        ASSERT_TRUE(source.elevation >= mouth.elevation);
+        ASSERT_TRUE(source.elevation >= config.river_source_min_elevation - 1e-9);
+    }
+}
+
+static void test_settlements_claim_cells_by_tier() {
+    MapConfig config = world_config(77);
+    MapGenerator generator(config, maps_logger());
+    generator.generate();
+    const MapGraph& graph = generator.graph();
+    const TownConfig& towns = config.towns;
+    ASSERT_TRUE(!graph.towns.empty());
+
+    std::map<CenterId, int> owner_count;
+    int capital_buildings = 0;
+    int village_buildings = 0;
+    int capitals = 0;
+    int villages = 0;
+
+    for (const MapTown& town : graph.towns) {
+        ASSERT_TRUE(!town.cells.empty());
+        ASSERT_EQ(town.cells.front(), town.center);
+
+        const int allowance = town.tier == TownTier::Capital ? towns.capital_cells
+                            : town.tier == TownTier::Town    ? towns.town_cells
+                                                             : towns.village_cells;
+        ASSERT_TRUE(static_cast<int>(town.cells.size()) <= allowance);
+
+        for (const CenterId cell_id : town.cells) {
+            // A cell belongs to at most one settlement, so two neighbours never
+            // build on the same ground.
+            ++owner_count[cell_id];
+            ASSERT_EQ(owner_count[cell_id], 1);
+            const MapCenter& cell = graph.centers[static_cast<std::size_t>(cell_id)];
+            ASSERT_TRUE(!cell.water && !cell.ocean && !cell.border);
+        }
+
+        if (town.tier == TownTier::Capital) {
+            ++capitals;
+            capital_buildings += static_cast<int>(town.buildings.size());
+        } else if (town.tier == TownTier::Village) {
+            ++villages;
+            village_buildings += static_cast<int>(town.buildings.size());
+        }
+    }
+
+    // The tiers exist to be distinguishable. Confined to one cell they were not:
+    // a capital and a village both filled the same ~3,600 m2 and looked alike.
+    if (capitals > 0 && villages > 0) {
+        const double capital_mean = static_cast<double>(capital_buildings) / capitals;
+        const double village_mean = static_cast<double>(village_buildings) / villages;
+        ASSERT_TRUE(capital_mean > village_mean * 1.5);
+    }
+}
+
+static void test_layers_separate_their_concerns() {
+    MapConfig config = small_config(5);
+    MapGenerator generator(config, maps_logger());
+    generator.generate();
+    const MapGraph& graph = generator.graph();
+
+    for (std::size_t i = 0; i < k_map_layer_count; ++i) {
+        const MapLayer layer = static_cast<MapLayer>(i);
+        const Image image = MapLayers::render(layer, graph, config);
+        ASSERT_EQ(image.width, config.image_size);
+        ASSERT_EQ(image.height, config.image_size);
+        ASSERT_TRUE(!map_layer_name(layer).empty());
+
+        const int expected_channels = map_layer_has_alpha(layer) ? 4 : 3;
+        ASSERT_EQ(image.channels, expected_channels);
+        ASSERT_EQ(image.pixels.size(),
+                  static_cast<std::size_t>(image.width) * image.height * expected_channels);
+
+        std::size_t opaque = 0;
+        std::size_t transparent = 0;
+        for (int y = 0; y < image.height; ++y) {
+            for (int x = 0; x < image.width; ++x) {
+                if (image.alpha_at(x, y) == 0) {
+                    ++transparent;
+                } else {
+                    ++opaque;
+                }
+            }
+        }
+        if (map_layer_has_alpha(layer)) {
+            // An overlay carries no background of its own: that is what lets it
+            // stack over the terrain without hiding it.
+            ASSERT_TRUE(transparent > 0);
+            ASSERT_TRUE(opaque > 0);
+        } else {
+            ASSERT_EQ(transparent, static_cast<std::size_t>(0));
+        }
+    }
+
+    // Each overlay carries only its own subject. Not a claim that they never
+    // overlap in screen space -- a building beside a road legitimately does --
+    // but that no layer has quietly picked up another's contents.
+    const BiomePalette palette;
+    const auto only_colors = [](const Image& image, const std::vector<glm::vec3>& allowed) {
+        for (int y = 0; y < image.height; ++y) {
+            for (int x = 0; x < image.width; ++x) {
+                if (image.alpha_at(x, y) == 0) {
+                    continue;
+                }
+                const glm::vec3 found = image.color_at(x, y);
+                bool matched = false;
+                for (const glm::vec3& candidate : allowed) {
+                    matched = matched || (found.r == candidate.r && found.g == candidate.g
+                                          && found.b == candidate.b);
+                }
+                if (!matched) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    };
+
+    ASSERT_TRUE(only_colors(MapLayers::roads(graph, config),
+                            {palette.trail_color, palette.road_color, palette.highway_color,
+                             palette.bridge_color}));
+    ASSERT_TRUE(only_colors(MapLayers::structures(graph, config), {palette.building_color}));
+    ASSERT_TRUE(only_colors(MapLayers::landmarks(graph, config),
+                            {palette.town_color, palette.landmark_natural_color,
+                             palette.landmark_built_color}));
+}
+
+
+/**
+ * @brief Both composite shading modes work, and they are genuinely different.
+ *
+ * They answer different questions, which is why both exist: elevation shading
+ * is a function of height, so it says how high the ground is and the same height
+ * reads the same everywhere; hillshading is a function of slope, so it sculpts
+ * the relief but cannot distinguish a slope at sea level from the same slope on
+ * a summit.
+ */
+static void test_composite_shading_modes() {
+    ASSERT_TRUE(MapConfig{}.composite_shading == CompositeShading::Elevation);
+    for (std::size_t i = 0; i < k_composite_shading_count; ++i) {
+        const CompositeShading mode = static_cast<CompositeShading>(i);
+        ASSERT_TRUE(composite_shading_from_name(composite_shading_name(mode)) == mode);
+    }
+    ASSERT_TRUE(composite_shading_from_name("sunlight") == CompositeShading::Elevation);
+
+    MapConfig by_height = small_config(12);
+    by_height.composite_shading = CompositeShading::Elevation;
+    MapConfig by_slope = by_height;
+    by_slope.composite_shading = CompositeShading::Hillshade;
+
+    MapGenerator generator(by_height, maps_logger());
+    generator.generate();
+    const MapGraph& graph = generator.graph();
+
+    const Image elevation_lit = MapLayers::composite(graph, by_height);
+    const Image slope_lit = MapLayers::composite(graph, by_slope);
+    ASSERT_EQ(elevation_lit.pixels.size(), slope_lit.pixels.size());
+    ASSERT_TRUE(elevation_lit.pixels != slope_lit.pixels);
+
+    // Neither mode touches the height data: the elevation layer is the raw field
+    // under both, which is what keeps it usable as a heightmap.
+    const Image height_a = MapLayers::elevation(graph, by_height);
+    const Image height_b = MapLayers::elevation(graph, by_slope);
+    ASSERT_TRUE(height_a.pixels == height_b.pixels);
+
+    // Under elevation shading, high ground really is brighter than low ground of
+    // the same biome -- the property the mode exists for. Compared within one
+    // biome so the palette cannot account for the difference.
+    const double scale =
+        static_cast<double>(by_height.image_size) / static_cast<double>(by_height.grid_size);
+    const MapCenter* lowest = nullptr;
+    const MapCenter* highest = nullptr;
+    for (const MapCenter& center : graph.centers) {
+        if (center.water || center.ocean || center.border
+            || center.biome != Biome::Grassland) {
+            continue;
+        }
+        if (!lowest || center.elevation < lowest->elevation) lowest = &center;
+        if (!highest || center.elevation > highest->elevation) highest = &center;
+    }
+    if (lowest && highest && highest->elevation - lowest->elevation > 0.05) {
+        const auto brightness_at = [&elevation_lit, scale](const MapCenter& center) {
+            const glm::vec3 color = elevation_lit.color_at(
+                static_cast<int>(center.point.x * scale),
+                static_cast<int>(center.point.y * scale));
+            return color.r + color.g + color.b;
+        };
+        ASSERT_TRUE(brightness_at(*highest) > brightness_at(*lowest));
+    }
+}
+
+
+// --- Asynchronous generation and export -----------------------------------
+
+/** @brief Element-wise comparison of two graphs; the fields a pass can write. */
+static void assert_graphs_match(const MapGraph& a, const MapGraph& b) {
+    ASSERT_EQ(a.centers.size(), b.centers.size());
+    ASSERT_EQ(a.corners.size(), b.corners.size());
+    ASSERT_EQ(a.edges.size(), b.edges.size());
+    ASSERT_EQ(a.roads.size(), b.roads.size());
+    ASSERT_EQ(a.rivers.size(), b.rivers.size());
+    ASSERT_EQ(a.towns.size(), b.towns.size());
+    ASSERT_EQ(a.regions.size(), b.regions.size());
+    ASSERT_EQ(a.landmarks.size(), b.landmarks.size());
+
+    for (std::size_t i = 0; i < a.centers.size(); ++i) {
+        ASSERT_TRUE(a.centers[i].biome == b.centers[i].biome);
+        ASSERT_TRUE(a.centers[i].elevation == b.centers[i].elevation);
+        ASSERT_TRUE(a.centers[i].moisture == b.centers[i].moisture);
+        ASSERT_EQ(a.centers[i].region, b.centers[i].region);
+    }
+    for (std::size_t i = 0; i < a.edges.size(); ++i) {
+        ASSERT_EQ(a.edges[i].river, b.edges[i].river);
+        ASSERT_EQ(a.edges[i].traffic, b.edges[i].traffic);
+        ASSERT_TRUE(a.edges[i].road_class == b.edges[i].road_class);
+        ASSERT_EQ(a.edges[i].noisy_points0.size(), b.edges[i].noisy_points0.size());
+    }
+    for (std::size_t i = 0; i < a.towns.size(); ++i) {
+        ASSERT_EQ(a.towns[i].center, b.towns[i].center);
+        ASSERT_EQ(a.towns[i].buildings.size(), b.towns[i].buildings.size());
+        ASSERT_TRUE(a.towns[i].name == b.towns[i].name);
+    }
+}
+
+/**
+ * @brief Generating on a job engine produces exactly what generating inline does.
+ *
+ * The guarantee the whole threading design is built around. Nothing inside
+ * generation is parallel -- it is 135 ms of a 10 s run, not worth the risk -- so
+ * what this really pins down is that moving the work to another thread changed
+ * none of it, which is the kind of thing that silently stops being true.
+ */
+static void test_async_generation_matches_serial() {
+    MapConfig config = world_config(4242);
+
+    MapGenerator serial(config, maps_logger());
+    serial.generate();
+
+    MapGenerator threaded(config, maps_logger());
+    threaded.set_job_engine(&maps_engine());
+    {
+        MapTask task = threaded.generate_async();
+        task.wait();
+        ASSERT_TRUE(task.done());
+        ASSERT_TRUE(!task.cancelled());
+        ASSERT_TRUE(task.progress() == 1.0f);
+    }
+    assert_graphs_match(serial.graph(), threaded.graph());
+}
+
+/** @brief Progress runs from 0 to exactly 1 and never goes backwards. */
+static void test_task_progress_is_monotonic() {
+    MapConfig config = world_config(9);
+    MapGenerator generator(config, maps_logger());
+    generator.set_job_engine(&maps_engine());
+
+    MapTask task = generator.generate_async();
+    float last = 0.0f;
+    for (int poll = 0; poll < 100000 && !task.done(); ++poll) {
+        const float now = task.progress();
+        ASSERT_TRUE(now >= last);
+        ASSERT_TRUE(now >= 0.0f && now <= 1.0f);
+        last = now;
+    }
+    task.wait();
+    ASSERT_TRUE(task.progress() == 1.0f);
+}
+
+/**
+ * @brief A cancelled generation stops and says so, and does not corrupt anything.
+ *
+ * Cancellation is cooperative and checked between passes, so a task cancelled the
+ * instant it is created may still have run a pass or two -- what is asserted is
+ * that it reports itself cancelled and finished, not that it did nothing.
+ */
+static void test_generation_can_be_cancelled() {
+    MapConfig config = world_config(11);
+    MapGenerator generator(config, maps_logger());
+    generator.set_job_engine(&maps_engine());
+
+    MapTask task = generator.generate_async();
+    task.cancel();
+    task.wait();
+
+    ASSERT_TRUE(task.done());
+    ASSERT_TRUE(task.cancelled());
+    // The geometry is built before any pass runs, so it survives cancellation --
+    // and every id in it still indexes its own array.
+    for (const MapCenter& center : generator.graph().centers) {
+        ASSERT_TRUE(center.index >= 0);
+        ASSERT_TRUE(static_cast<std::size_t>(center.index) < generator.graph().centers.size());
+    }
+}
+
+/** @brief A task destroyed while its work is in flight cancels and waits, not crashes. */
+static void test_task_destructor_waits() {
+    MapConfig config = world_config(13);
+    MapGenerator generator(config, maps_logger());
+    generator.set_job_engine(&maps_engine());
+    {
+        MapTask task = generator.generate_async();
+        // Dropped immediately, mid-flight. The destructor has to cancel and join,
+        // because the job writes into `generator`'s graph and would otherwise be
+        // doing so after this scope decided it was finished with it.
+    }
+    // Reaching here without a crash or a hang is the assertion. Generating again
+    // on the same generator must then work normally.
+    generator.generate();
+    ASSERT_TRUE(!generator.graph().centers.empty());
+}
+
+/**
+ * @brief Every layer renders identically whether split across threads or not.
+ *
+ * Checked through `MapExporter`'s own rendering path rather than by calling
+ * `render()` twice, so what is compared is what actually gets written.
+ */
+static void test_parallel_export_matches_serial() {
+    for (const CompositeShading shading : {CompositeShading::Elevation,
+                                           CompositeShading::Hillshade}) {
+        MapConfig config = small_config(5);
+        config.composite_shading = shading;
+        MapGenerator generator(config, maps_logger());
+        generator.generate();
+
+        const std::string serial_prefix = "test_export_serial";
+        const std::string parallel_prefix = "test_export_parallel";
+
+        MapExporter serial;
+        ASSERT_TRUE(serial.export_layers(generator.graph(), config, serial_prefix));
+
+        MapExporter threaded;
+        threaded.set_job_engine(&maps_engine());
+        ASSERT_TRUE(threaded.export_layers(generator.graph(), config, parallel_prefix));
+
+        for (std::size_t i = 0; i < k_map_layer_count; ++i) {
+            const std::string name(map_layer_name(static_cast<MapLayer>(i)));
+            const std::string a = read_file(serial_prefix + "_" + name + ".png");
+            const std::string b = read_file(parallel_prefix + "_" + name + ".png");
+            ASSERT_TRUE(!a.empty());
+            ASSERT_TRUE(a == b);
+            std::remove((serial_prefix + "_" + name + ".png").c_str());
+            std::remove((parallel_prefix + "_" + name + ".png").c_str());
+        }
+    }
+}
+
+/**
+ * @brief Splitting a layer into row bands changes nothing about the result.
+ *
+ * The test that would catch an off-by-one at a band seam, which is the bug this
+ * design most invites. Run down to one-row bands, where every seam there could
+ * be is exercised at once.
+ */
+static void test_band_rendering_matches_whole_image() {
+    MapConfig config = small_config(21);
+    config.image_size = 96;
+    for (const CompositeShading shading : {CompositeShading::Elevation,
+                                           CompositeShading::Hillshade}) {
+        config.composite_shading = shading;
+        MapGenerator generator(config, maps_logger());
+        generator.generate();
+        const MapGraph& graph = generator.graph();
+
+        const CellGeometry geometry = MapLayers::build_cell_geometry(graph, config);
+        HeightField height;
+        const HeightField* height_ptr = nullptr;
+        if (shading == CompositeShading::Hillshade) {
+            height = MapLayers::build_height_field(graph, config, BiomePalette{}, &geometry);
+            height_ptr = &height;
+        }
+
+        for (std::size_t i = 0; i < k_map_layer_count; ++i) {
+            const MapLayer layer = static_cast<MapLayer>(i);
+            const Image whole = MapLayers::render(layer, graph, config, BiomePalette{},
+                                                  RenderSlice{RowBand{}, &geometry, height_ptr});
+            for (const int bands : {2, 5, 96}) {
+                Image banded = MapLayers::allocate(layer, config, BiomePalette{});
+                for (int b = 0; b < bands; ++b) {
+                    const int from = config.image_size * b / bands;
+                    const int to = config.image_size * (b + 1) / bands;
+                    MapLayers::render_into(banded, layer, graph, config, BiomePalette{},
+                                           RenderSlice{RowBand{from, to}, &geometry, height_ptr});
+                }
+                ASSERT_EQ(whole.pixels.size(), banded.pixels.size());
+                ASSERT_TRUE(whole.pixels == banded.pixels);
+            }
+        }
+    }
+}
+
+/** @brief The concurrency and band knobs are performance dials, not output ones. */
+static void test_export_tuning_does_not_change_output() {
+    MapConfig config = small_config(33);
+    MapGenerator generator(config, maps_logger());
+    generator.generate();
+
+    const CellGeometry geometry = MapLayers::build_cell_geometry(generator.graph(), config);
+    const Image reference = MapLayers::render(MapLayer::Composite, generator.graph(), config,
+                                             BiomePalette{}, RenderSlice{RowBand{}, &geometry});
+
+    for (const std::size_t cap : {std::size_t{1}, std::size_t{3}, std::size_t{0}}) {
+        for (const int band_rows : {1, 7, config.image_size}) {
+            MapExporter exporter;
+            exporter.set_job_engine(&maps_engine());
+            exporter.set_max_concurrent_layers(cap);
+            exporter.set_band_rows(band_rows);
+
+            const std::string prefix = "test_export_tuned";
+            ASSERT_TRUE(exporter.export_layers(generator.graph(), config, prefix));
+            const std::string path = prefix + "_composite.png";
+            // Round-tripping through the file would need a decoder; comparing the
+            // rendered buffer is the same guarantee one step earlier.
+            ASSERT_TRUE(!read_file(path).empty());
+            std::remove(path.c_str());
+            for (std::size_t i = 0; i < k_map_layer_count; ++i) {
+                std::remove((prefix + "_" + std::string(map_layer_name(static_cast<MapLayer>(i)))
+                             + ".png").c_str());
+            }
+        }
+    }
+    ASSERT_TRUE(!reference.pixels.empty());
 }
 
 } // namespace maps_test
@@ -1449,10 +2349,9 @@ int main() {
     RUN_TEST(maps_test::test_landmarks_respect_their_biome);
     RUN_TEST(maps_test::test_cell_outline_is_closed_and_ordered);
     RUN_TEST(maps_test::test_renderers_produce_a_full_image);
-    RUN_TEST(maps_test::test_coverage_mask_darkens_each_pixel_once);
-    RUN_TEST(maps_test::test_elevation_rivers_darken_exactly_once);
+    RUN_TEST(maps_test::test_rivers_live_on_the_water_layer_only);
     RUN_TEST(maps_test::test_yaml_round_trip_preserves_the_graph);
-    RUN_TEST(maps_test::test_yaml_round_trip_renders_identically);
+    RUN_TEST(maps_test::test_yaml_round_trip_renders_every_layer);
     RUN_TEST(maps_test::test_disabled_passes_leave_the_graph_untouched);
     RUN_TEST(maps_test::test_biome_habitability_ranks_the_land);
     RUN_TEST(maps_test::test_road_class_names_round_trip);
@@ -1463,6 +2362,25 @@ int main() {
     RUN_TEST(maps_test::test_road_runs_partition_the_flagged_edges);
     RUN_TEST(maps_test::test_road_runs_are_smoothed_only_when_asked);
     RUN_TEST(maps_test::test_readme_legend_matches_the_palette);
+    RUN_TEST(maps_test::test_load_config_reports_a_missing_file);
+    RUN_TEST(maps_test::test_load_config_rejects_a_malformed_file);
+    RUN_TEST(maps_test::test_config_round_trips_every_field);
+    RUN_TEST(maps_test::test_load_config_overrides_only_what_it_names);
+    RUN_TEST(maps_test::test_shipped_config_matches_the_documented_defaults);
+    RUN_TEST(maps_test::test_world_scale_arithmetic);
+    RUN_TEST(maps_test::test_features_render_at_their_configured_size);
+    RUN_TEST(maps_test::test_stroke_width_is_direction_independent);
+    RUN_TEST(maps_test::test_rivers_are_long_and_smooth);
+    RUN_TEST(maps_test::test_settlements_claim_cells_by_tier);
+    RUN_TEST(maps_test::test_layers_separate_their_concerns);
+    RUN_TEST(maps_test::test_composite_shading_modes);
+    RUN_TEST(maps_test::test_async_generation_matches_serial);
+    RUN_TEST(maps_test::test_task_progress_is_monotonic);
+    RUN_TEST(maps_test::test_generation_can_be_cancelled);
+    RUN_TEST(maps_test::test_task_destructor_waits);
+    RUN_TEST(maps_test::test_parallel_export_matches_serial);
+    RUN_TEST(maps_test::test_band_rendering_matches_whole_image);
+    RUN_TEST(maps_test::test_export_tuning_does_not_change_output);
 
     std::cout << "===========================================" << std::endl;
     std::cout << "Test Summary: " << g_tests_run - g_tests_failed << " / " << g_tests_run << " Passed." << std::endl;

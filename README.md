@@ -11,6 +11,11 @@ and a name in its region's own invented language; and landmarks read off the ter
 itself. It is a port of Amit Patel's *Polygonal Map Generation*
 ([Red Blob Games](https://www.redblobgames.com/maps/mapgen2/)).
 
+The world has a **scale**: 60 metres to a grid cell, so the default map is 4.8 km square,
+and every physical size — a 6 m road, a 10 m cottage, a 5 m stream — is configured in
+metres. Rendered at the default one pixel per metre, a width measured off a PNG is a
+measurement of the ground.
+
 It produces **data**, not pixels: nothing here touches Vulkan, GLFW or any sibling repo
 other than [`libcoopa`](../libcoopa), which it uses for exactly two headers
 (`coopa/collections/yaml_map.h` and `coopa/debug/logger.h`). The two PNG renderers are a
@@ -37,9 +42,9 @@ cbuild
 cplay --seed=42 --out=world
 ```
 
-That writes `world_biomes.png`, `world_elevation.png` and `world.yaml` into the current
-directory. With no `--seed` the generator draws one from system entropy and prints it, so
-every run differs but stays reproducible afterwards.
+That writes `world.yaml` and seven PNG layers into the current directory. Settings come from [`assets/config.yaml`](./assets/config.yaml); flags override
+it for one run. With no `--seed` on either, the generator draws one from system entropy and
+prints it, so every run differs but stays reproducible afterwards.
 
 `cbuild` wipes `build/` and reconfigures every time. For a fast iteration loop after the
 first build:
@@ -65,66 +70,257 @@ cmake --build build && ./build/mapcoopa --out=world
 | `--no-roads` | — | Skip the road network |
 | `--no-subdivide` | — | Straight cell boundaries instead of wobbled ones |
 | `--out=PATH` | `map_out` | Output prefix |
+| `--config=PATH` | `assets/config.yaml` | Settings file to read before applying flags |
+| `--shading=MODE` | `elevation` | Composite lighting: `elevation` or `hillshade` |
+| `--threads=N` | 0 (all cores) | Worker threads; `1` runs everything serially |
+| `--png-level=N` | 8 | PNG deflate effort, 1–9; lower is faster and larger |
 
-At the default `--grid-size=80` the YAML lands around 15 MB.
+Every default above comes from `assets/config.yaml`, not from the binary — see
+**Configuration**. At the default `--grid-size=80` the YAML lands around 15 MB.
+
+## Configuration
+
+[`assets/config.yaml`](./assets/config.yaml) holds every knob the generator has: the world
+scale, the sampling grid, both noise fields, the terrain and climate curves, rivers, the
+road network, settlements, political geography, landmarks, and the twelve pass toggles.
+
+### Scale
+
+Two numbers give the world its size, and make every other measurement in the file mean
+something:
+
+```
+world extent = grid_size x meters_per_grid_unit = 80 x 60 m = 4.8 km square
+render size  = world extent / meters_per_pixel  = 4800 / 1  = 4800 px square
+```
+
+`meters_per_grid_unit` is how much ground a cell covers — 60 m, about enough to hold the
+ten or so buildings that make a village. `meters_per_pixel` is the render resolution; at
+the default of 1 a PNG is a literal one-pixel-per-metre map. **`image_size` is derived from
+these and is not set in the file**; `--image-size=N` still works and back-computes
+`meters_per_pixel`, so the two can never disagree about how much ground a pixel covers.
+
+Every physical size is therefore in **metres** and carries an `_m` suffix — `road_width_m: 6`,
+`building_size_max_m: 14`, `river_width_base_m: 5`. Counts, costs, scores and ratios are
+dimensionless and have no suffix. Widths were previously fractions of a grid unit, which
+meant nothing on its own: at 60 m to the cell, the old `road_width: 0.20` was a 12-metre
+carriageway and the highway an 18-metre one.
+It is heavily commented — each key carries its units and what it actually does — and it is
+the file to edit rather than a header.
+
+Settings are resolved in four layers, each overriding the one before it:
+
+| | Source | Where |
+|---|---|---|
+| 1 | `MapConfig`'s in-struct defaults | [`coopa/maps/map_config.h`](./coopa/maps/map_config.h) |
+| 2 | the generator's own scene defaults | [`examples/map_generator.cpp`](./examples/map_generator.cpp) |
+| 3 | `assets/config.yaml`, or `--config=PATH` | |
+| 4 | command-line flags | |
+
+Layer 2 exists so that deleting or moving the config file still produces the 80-cell,
+2048-pixel world this README documents instead of silently dropping to the library's much
+smaller defaults. Layer 4 means trying something never requires editing a version-controlled
+file.
+
+Every key is optional and falls back to the layer beneath it, so deleting a line is always
+safe, and unknown keys are ignored — an older binary still reads a newer file.
+
+**A missing config.yaml is a warning; a malformed one is fatal.** No file, and the
+generator says so on stderr and carries on with layer 2. A file that exists but does not
+parse stops the run with the parser's own message and exit code 1 — generating a map that
+quietly ignored the settings it was handed is worse than generating none.
+
+Three keys do not behave like the rest, and the file says so inline:
+
+- **`seed`** — `--seed` wins over it. With neither, a seed is drawn from system entropy
+  and printed.
+- **`noise_island.seed` / `noise_temperature.seed`** — not settable. Both are always
+  derived from the master seed, so one `--seed` reproduces the whole map rather than just
+  the pass ordering. They appear in the file commented out, with that note.
+- **`noise_island.frequency`** — a *reference* value at `grid_size` 40, scaled by
+  `40 / grid_size` at startup so `--grid-size` controls detail rather than the size of the
+  world. Held fixed, a bigger map comes out as an archipelago of the same small islands.
+
+To load the same settings from C++, `coopa::maps::load_config()` in
+[`coopa/maps/map_yaml.h`](./coopa/maps/map_yaml.h) applies a file on top of an existing
+`MapConfig` and reports whether it was found, parsed and whether it named a seed.
+
+## Layers
+
+Each run writes one PNG per layer rather than a single composited image, so a consumer can
+take the height field without the roads drawn over it, or the road network without the
+terrain under it. All seven register pixel for pixel.
+
+| File | Format | Contents |
+|---|---|---|
+| `_elevation.png` | RGB | Terrain height, black at sea level and white at the summit. Height and nothing else — no rivers cut into it. |
+| `_water.png` | RGB | Water-surface height: sea near 0, a lake at the height of its basin, river channels at the height of the ground they cross. Dry land is black, meaning *no water* rather than water at zero. |
+| `_biomes.png` | RGB | Flat terrain colour, no overlays. |
+| `_roads.png` | RGBA | The road network by class, transparent elsewhere. |
+| `_structures.png` | RGBA | Building footprints as rotated quads, transparent elsewhere. |
+| `_landmarks.png` | RGBA | Settlement and landmark markers, transparent elsewhere. |
+| `_composite.png` | RGB | All of it: biome colour lit from the elevation field, then water, roads, buildings and markers. See **Shading** below. |
+
+The three overlay layers carry real transparency, so they stack over the terrain in any
+image editor and reproduce the composite's arrangement.
+
+### Shading
+
+The composite lights its biome colours two ways, chosen by `composite_shading` or
+`--shading=MODE`. Both read the elevation field the map already carries, so neither can
+disagree with the heightmap layer, and **neither touches the height data** — the elevation
+layer is the raw field under either.
+
+| Mode | Brightness follows | Shows |
+|---|---|---|
+| `elevation` *(default)* | **height** — high ground is pale | *Where* the high ground is. A function of altitude alone, so the same height reads the same everywhere on the map. |
+| `hillshade` | **slope**, lit from the north-west | The *shape* of the land — ridgelines, valley walls, which way a face turns. Blind to altitude: a slope at sea level and the same slope on a summit look identical. |
+
+Hillshading costs a second full-resolution pass plus a blur, so the default mode is also
+the faster one — about 43 s for the full set against 51 s.
+
+The blur is not optional in hillshade mode. Elevation inside a cell is interpolated from
+that cell's own corners, so the surface is continuous across a shared edge but its *slope*
+is not — and shading off the raw field draws every cell as its own little dome rather than
+drawing terrain.
+
+At the default 4.8 km world and 1 m/px each layer is 4800 × 4800 — about 23 megapixels, and
+some 90 MB in memory while it is being written. They are rendered and written one at a
+time for that reason; the full set takes under a minute.
+
+## Asynchronous generation
+
+Generation and export both run off the calling thread, on a
+`coopa::job::JobEngine` the caller injects. Nothing is owned: mapcoopa *takes* an
+engine, so a host that already runs a thread pool shares it rather than competing
+with a second one. **With no engine injected everything runs inline** — that is the
+default, and it is what the determinism tests compare against.
+
+```cpp
+generator.set_job_engine(&engine);          // nullptr, the default, is serial
+MapTask task = generator.generate_async();
+
+while (!task.done()) {                      // from the frame loop, never blocking
+    draw_loading_bar(task.progress());      // 0..1
+}
+use(generator.graph());
+```
+
+`MapTask` is move-only and **its destructor cancels and waits**. The work writes
+into storage the caller owns — the generator's graph, the exporter's images — so a
+task outliving what it is filling in would be a use-after-free; blocking in the
+destructor makes that unrepresentable, the same bargain `std::jthread` strikes.
+
+`cancel()` is cooperative. Generation checks between passes; export checks before
+each layer and between row bands. The one thing neither can interrupt is a PNG
+encode already in progress, because stb's deflate is a single opaque call.
+
+Exporting has the same shape:
+
+```cpp
+MapExporter exporter;
+exporter.set_job_engine(&engine);
+MapTask task = exporter.export_layers_async(graph, config, "world");
+```
+
+### What it costs, and what it buys
+
+Measured on 20 cores at the default 4.8 km world, 4800 × 4800, seven layers:
+
+| | generate | export | yaml | total |
+|---|---|---|---|---|
+| Before any of this (`-O0`, serial) | 580 ms | 40.3 s | 1.9 s | **42.8 s** |
+| Optimised build, serial | 137 ms | 9.5 s | 563 ms | **10.2 s** |
+| Optimised build, 20 threads | 140 ms | 1.3 s | 576 ms | **2.0 s** |
+
+Two findings worth recording, because neither was the one expected:
+
+- **`CMAKE_BUILD_TYPE` was unset**, so every binary this project had ever produced
+  was `-O0`. Defaulting it to `Release` for a standalone build is one line and
+  worth **4.3×** — more than all the threading put together.
+- **Generation was never the problem.** It is 140 ms; the export is 98% of the
+  run. Nothing inside generation is parallelised, deliberately: threading 140 ms
+  would buy nothing and cost the byte-for-byte guarantee its simplest proof.
+
+Parallel output is **byte-for-byte identical** to serial output — all seven PNGs
+and the YAML. Work is split only by disjoint output: across layers, and across
+row bands within a layer. Splitting by *cell* would race, because adjacent cells
+deliberately share their boundary pixels. For the same reason the road pass stays
+serial: each route is routed over ground earlier routes already claimed.
+
+To check it yourself:
+
+```bash
+./build/mapcoopa --seed=42 --threads=1 --out=/tmp/serial
+./build/mapcoopa --seed=42 --threads=0 --out=/tmp/parallel
+cmp /tmp/serial.yaml /tmp/parallel.yaml
+for l in elevation water biomes roads structures landmarks composite; do
+    cmp /tmp/serial_$l.png /tmp/parallel_$l.png || echo "DIFFERS: $l"
+done
+```
 
 ## Legend
 
 ### Biomes
 
-The colours `BiomeRenderer` fills a cell with, from `BiomePalette::biome_colors` in
+The colours `MapLayers` fills a cell with, from `BiomePalette::biome_colors` in
 [`coopa/maps/map_config.h`](./coopa/maps/map_config.h). The **name** column is the
 `snake_case` identifier written into the `.yaml` and accepted back by `biome_from_name()`
 — that string is a biome's stable on-disk identity, so it is what to key on rather than
-the enum's position. The swatches are SVGs under [`docs/legend/`](./docs/legend), one per
-palette entry; `test_readme_legend_matches_the_palette` fails the build if any hex here
-drifts from `BiomePalette`.
+the enum's position. The swatches are SVGs under [`assets/svg/`](./assets/svg), one per
+palette entry.
+
+Both tables and every swatch are generated — run
+[`python3 tools/gen_legend_svg.py`](./tools/gen_legend_svg.py) after changing a palette
+colour, and `test_readme_legend_matches_the_palette` fails the build if they ever drift
+from `BiomePalette`.
 
 | Colour | Biome | YAML name | Hex | RGB |
 |---|---|---|---|---|
-| ![](docs/legend/ocean.svg) | Ocean | `ocean` | `#5EB6DF` | 94, 182, 223 |
-| ![](docs/legend/lake.svg) | Lake | `lake` | `#5EB6DF` | 94, 182, 223 |
-| ![](docs/legend/marsh.svg) | Marsh | `marsh` | `#215E21` | 33, 94, 33 |
-| ![](docs/legend/ice.svg) | Ice | `ice` | `#D2FFFC` | 210, 255, 252 |
-| ![](docs/legend/beach.svg) | Beach | `beach` | `#F5DEB3` | 245, 222, 179 |
-| ![](docs/legend/snow.svg) | Snow | `snow` | `#FFFAFA` | 255, 250, 250 |
-| ![](docs/legend/tundra.svg) | Tundra | `tundra` | `#A9A9A9` | 169, 169, 169 |
-| ![](docs/legend/bare.svg) | Bare | `bare` | `#C9B49B` | 201, 180, 155 |
-| ![](docs/legend/scorched.svg) | Scorched | `scorched` | `#99826D` | 153, 130, 109 |
-| ![](docs/legend/taiga.svg) | Taiga | `taiga` | `#336600` | 51, 102, 0 |
-| ![](docs/legend/shrubland.svg) | Shrubland | `shrubland` | `#808000` | 128, 128, 0 |
-| ![](docs/legend/temperate_desert.svg) | Temperate desert | `temperate_desert` | `#EED6AF` | 238, 214, 175 |
-| ![](docs/legend/temperate_rain_forest.svg) | Temperate rain forest | `temperate_rain_forest` | `#556B2F` | 85, 107, 47 |
-| ![](docs/legend/temperate_deciduous_forest.svg) | Temperate deciduous forest | `temperate_deciduous_forest` | `#228B22` | 34, 139, 34 |
-| ![](docs/legend/grassland.svg) | Grassland | `grassland` | `#7CFC00` | 124, 252, 0 |
-| ![](docs/legend/tropical_rain_forest.svg) | Tropical rain forest | `tropical_rain_forest` | `#006400` | 0, 100, 0 |
-| ![](docs/legend/tropical_seasonal_forest.svg) | Tropical seasonal forest | `tropical_seasonal_forest` | `#6B8E23` | 107, 142, 35 |
-| ![](docs/legend/subtropical_desert.svg) | Subtropical desert | `subtropical_desert` | `#FAFAD2` | 250, 250, 210 |
-| ![](docs/legend/alpine_meadow.svg) | Alpine meadow | `alpine_meadow` | `#8EBA7C` | 142, 186, 124 |
-| ![](docs/legend/glacier.svg) | Glacier | `glacier` | `#DEF1F7` | 222, 241, 247 |
-| ![](docs/legend/cold_desert.svg) | Cold desert | `cold_desert` | `#BAB8A0` | 186, 184, 160 |
-| ![](docs/legend/steppe.svg) | Steppe | `steppe` | `#B2B66C` | 178, 182, 108 |
-| ![](docs/legend/savanna.svg) | Savanna | `savanna` | `#C4BE5A` | 196, 190, 90 |
-| ![](docs/legend/chaparral.svg) | Chaparral | `chaparral` | `#96A05C` | 150, 160, 92 |
-| ![](docs/legend/moorland.svg) | Moorland | `moorland` | `#7E7460` | 126, 116, 96 |
-| ![](docs/legend/boreal_wetland.svg) | Boreal wetland | `boreal_wetland` | `#486E60` | 72, 110, 96 |
-| ![](docs/legend/swamp.svg) | Swamp | `swamp` | `#3A5C3E` | 58, 92, 62 |
-| ![](docs/legend/mangrove.svg) | Mangrove | `mangrove` | `#2E785A` | 46, 120, 90 |
-| ![](docs/legend/cloud_forest.svg) | Cloud forest | `cloud_forest` | `#609676` | 96, 150, 118 |
-| ![](docs/legend/badlands.svg) | Badlands | `badlands` | `#B28058` | 178, 128, 88 |
-| ![](docs/legend/salt_flat.svg) | Salt flat | `salt_flat` | `#EEEEE6` | 238, 238, 230 |
-| ![](docs/legend/dunes.svg) | Dunes | `dunes` | `#E8CE94` | 232, 206, 148 |
-| ![](docs/legend/volcanic_field.svg) | Volcanic field | `volcanic_field` | `#5C4A46` | 92, 74, 70 |
+| ![](assets/svg/ocean.svg) | Ocean | `ocean` | `#5EB6DF` | 94, 182, 223 |
+| ![](assets/svg/lake.svg) | Lake | `lake` | `#5EB6DF` | 94, 182, 223 |
+| ![](assets/svg/marsh.svg) | Marsh | `marsh` | `#215E21` | 33, 94, 33 |
+| ![](assets/svg/ice.svg) | Ice | `ice` | `#D2FFFC` | 210, 255, 252 |
+| ![](assets/svg/beach.svg) | Beach | `beach` | `#F5DEB3` | 245, 222, 179 |
+| ![](assets/svg/snow.svg) | Snow | `snow` | `#FFFAFA` | 255, 250, 250 |
+| ![](assets/svg/tundra.svg) | Tundra | `tundra` | `#A9A9A9` | 169, 169, 169 |
+| ![](assets/svg/bare.svg) | Bare | `bare` | `#C9B49B` | 201, 180, 155 |
+| ![](assets/svg/scorched.svg) | Scorched | `scorched` | `#99826D` | 153, 130, 109 |
+| ![](assets/svg/taiga.svg) | Taiga | `taiga` | `#336600` | 51, 102, 0 |
+| ![](assets/svg/shrubland.svg) | Shrubland | `shrubland` | `#808000` | 128, 128, 0 |
+| ![](assets/svg/temperate_desert.svg) | Temperate desert | `temperate_desert` | `#EED6AF` | 238, 214, 175 |
+| ![](assets/svg/temperate_rain_forest.svg) | Temperate rain forest | `temperate_rain_forest` | `#556B2F` | 85, 107, 47 |
+| ![](assets/svg/temperate_deciduous_forest.svg) | Temperate deciduous forest | `temperate_deciduous_forest` | `#228B22` | 34, 139, 34 |
+| ![](assets/svg/grassland.svg) | Grassland | `grassland` | `#7CFC00` | 124, 252, 0 |
+| ![](assets/svg/tropical_rain_forest.svg) | Tropical rain forest | `tropical_rain_forest` | `#006400` | 0, 100, 0 |
+| ![](assets/svg/tropical_seasonal_forest.svg) | Tropical seasonal forest | `tropical_seasonal_forest` | `#6B8E23` | 107, 142, 35 |
+| ![](assets/svg/subtropical_desert.svg) | Subtropical desert | `subtropical_desert` | `#FAFAD2` | 250, 250, 210 |
+| ![](assets/svg/alpine_meadow.svg) | Alpine meadow | `alpine_meadow` | `#8EBA7C` | 142, 186, 124 |
+| ![](assets/svg/glacier.svg) | Glacier | `glacier` | `#DEF1F7` | 222, 241, 247 |
+| ![](assets/svg/cold_desert.svg) | Cold desert | `cold_desert` | `#BAB8A0` | 186, 184, 160 |
+| ![](assets/svg/steppe.svg) | Steppe | `steppe` | `#B2B66C` | 178, 182, 108 |
+| ![](assets/svg/savanna.svg) | Savanna | `savanna` | `#C4BE5A` | 196, 190, 90 |
+| ![](assets/svg/chaparral.svg) | Chaparral | `chaparral` | `#96A05C` | 150, 160, 92 |
+| ![](assets/svg/moorland.svg) | Moorland | `moorland` | `#7E7460` | 126, 116, 96 |
+| ![](assets/svg/boreal_wetland.svg) | Boreal wetland | `boreal_wetland` | `#486E60` | 72, 110, 96 |
+| ![](assets/svg/swamp.svg) | Swamp | `swamp` | `#3A5C3E` | 58, 92, 62 |
+| ![](assets/svg/mangrove.svg) | Mangrove | `mangrove` | `#2E785A` | 46, 120, 90 |
+| ![](assets/svg/cloud_forest.svg) | Cloud forest | `cloud_forest` | `#609676` | 96, 150, 118 |
+| ![](assets/svg/badlands.svg) | Badlands | `badlands` | `#B28058` | 178, 128, 88 |
+| ![](assets/svg/salt_flat.svg) | Salt flat | `salt_flat` | `#EEEEE6` | 238, 238, 230 |
+| ![](assets/svg/dunes.svg) | Dunes | `dunes` | `#E8CE94` | 232, 206, 148 |
+| ![](assets/svg/volcanic_field.svg) | Volcanic field | `volcanic_field` | `#5C4A46` | 92, 74, 70 |
 
 `ocean` and `lake` share a colour deliberately — they are the same water to look at, and
 what separates them is whether the body reaches the edge of the map, which a reader can
 see from the shape rather than the hue.
 
-> **These are the untinted colours.** At the default `show_regions = true` and
-> `region_tint = 0.13`, every claimed land cell is mixed 13% toward its region's colour so
-> that borders are visible, and a pixel sampled from `world_biomes.png` will therefore be
-> *near* the table value rather than equal to it. Generate with `--no-regions`, or set
-> `MapConfig::show_regions = false`, to get exact matches.
+> **These are the untinted, unshaded colours.** Two things move a rendered pixel off the
+> table value. At the default `show_regions = true` and `region_tint = 0.13`, every claimed
+> land cell is mixed 13% toward its region's colour so that borders are visible — generate
+> with `--no-regions`, or set `MapConfig::show_regions = false`, for exact matches. And the
+> **composite** additionally lights every land pixel by its elevation or its slope, so match
+> against `_biomes.png` rather than `_composite.png`.
 
 ### Overlays
 
@@ -132,17 +328,16 @@ Drawn over the filled cells, in this order — each layer covers the one beneath
 
 | Colour | Overlay | Hex | RGB | Shape |
 |---|---|---|---|---|
-| ![](docs/legend/river.svg) | River | `#5EB6DF` | 94, 182, 223 | Line along the Voronoi edge, widening with volume |
-| ![](docs/legend/road-casing.svg) | Road casing | `#2B2118` | 43, 33, 24 | One pixel of outline under every road |
-| ![](docs/legend/trail.svg) | Trail | `#887A64` | 136, 122, 100 | Thinnest stroke; a spur off the network |
-| ![](docs/legend/road.svg) | Road | `#7A6552` | 122, 101, 82 | Middle stroke |
-| ![](docs/legend/highway.svg) | Highway | `#926C3E` | 146, 108, 62 | Widest stroke; the busiest stretches |
-| ![](docs/legend/road-casing.svg) | Bridge | `#2B2118` | 43, 33, 24 | Short parapet drawn square across the road |
-| ![](docs/legend/building.svg) | Building | `#463228` | 70, 50, 40 | Rotated quad, one per dwelling |
-| ![](docs/legend/settlement.svg) | Settlement | `#782828` | 120, 40, 40 | Square marker; 13 px capital, 9 px town, 5 px village |
-| ![](docs/legend/landmark-natural.svg) | Natural landmark | `#283C82` | 40, 60, 130 | Diamond; 11 px for a region's wonder, 7 px otherwise |
-| ![](docs/legend/landmark-built.svg) | Built landmark | `#5A3C82` | 90, 60, 130 | Square, 7 px |
-| ![](docs/legend/background.svg) | Background | `#FFFFFF` | 255, 255, 255 | Whatever no cell covers |
+| ![](assets/svg/river.svg) | River | `#5EB6DF` | 94, 182, 223 | 5 m plus 2 m per unit of volume, along a smoothed centreline |
+| ![](assets/svg/trail.svg) | Trail | `#887A64` | 136, 122, 100 | 3 m wide; a spur off the network |
+| ![](assets/svg/road.svg) | Road | `#7A6552` | 122, 101, 82 | 6 m wide |
+| ![](assets/svg/highway.svg) | Highway | `#926C3E` | 146, 108, 62 | 10 m wide; the busiest stretches |
+| ![](assets/svg/bridge.svg) | Bridge | `#706C66` | 112, 108, 102 | Stone parapet drawn square across the road |
+| ![](assets/svg/building.svg) | Building | `#463228` | 70, 50, 40 | Rotated quad, 7-14 m per side, one per dwelling |
+| ![](assets/svg/settlement.svg) | Settlement | `#782828` | 120, 40, 40 | Square marker; 25 m capital, 17 m town, 11 m village |
+| ![](assets/svg/landmark-natural.svg) | Natural landmark | `#283C82` | 40, 60, 130 | Diamond; 21 m for a region's wonder, 13 m otherwise |
+| ![](assets/svg/landmark-built.svg) | Built landmark | `#5A3C82` | 90, 60, 130 | Square, 13 m |
+| ![](assets/svg/background.svg) | Background | `#FFFFFF` | 255, 255, 255 | Whatever no cell covers |
 
 The three road tiers are told apart by **width** first and colour second, which is how a
 paper map does it. `RoadClass` is not a label anything chooses: it is read off
@@ -162,8 +357,9 @@ cbuild
 ./build/mapcoopa_tests      # or: ctest --test-dir build
 ```
 
-38 cases covering determinism, the graph invariants, every pass, both renderers and the
-YAML round trip.
+57 cases covering determinism, the graph invariants, every pass, both renderers, the
+configuration loader, the world scale, the asynchronous API and the YAML round
+trip — including that every parallel path reproduces its serial one exactly.
 
 ## Consuming it from another repo
 

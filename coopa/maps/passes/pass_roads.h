@@ -286,7 +286,8 @@ private:
             return a < b;
         });
 
-        const double spacing_squared = roads.hub_min_spacing * roads.hub_min_spacing;
+        const double spacing = meters_to_grid(config, roads.hub_min_spacing_m);
+        const double spacing_squared = spacing * spacing;
         std::vector<CenterId> hubs;
         for (const CenterId candidate : candidates) {
             if (static_cast<int>(hubs.size()) >= roads.hub_count) {
@@ -597,40 +598,12 @@ private:
                     crossing = next;
                 }
 
-                smooth_(run.points, config.roads.smoothing_iterations);
+                chaikin_smooth(run.points, config.roads.smoothing_iterations);
                 graph.roads.push_back(std::move(run));
             }
         }
     }
 
-    /**
-     * @brief Chaikin corner-cutting, with the two endpoints pinned.
-     *
-     * Each interior segment is replaced by its quarter and three-quarter points,
-     * which rounds every corner without the curve drifting off the cells the
-     * route was computed through. The ends are kept exactly where they are so a
-     * run still meets the junction, the settlement or the coastline it was
-     * traced to -- a road that stops a quarter of a cell short of its own
-     * junction is worse than one drawn straight.
-     *
-     * @param points The path to smooth, in place.
-     * @param iterations Passes to apply; zero or fewer leaves the path alone.
-     */
-    static void smooth_(std::vector<MapPoint>& points, int iterations) {
-        for (int pass = 0; pass < iterations && points.size() > 2; ++pass) {
-            std::vector<MapPoint> cut;
-            cut.reserve(points.size() * 2);
-            cut.push_back(points.front());
-            for (std::size_t i = 0; i + 1 < points.size(); ++i) {
-                const MapPoint& a = points[i];
-                const MapPoint& b = points[i + 1];
-                cut.push_back({a.x * 0.75 + b.x * 0.25, a.y * 0.75 + b.y * 0.25});
-                cut.push_back({a.x * 0.25 + b.x * 0.75, a.y * 0.25 + b.y * 0.75});
-            }
-            cut.push_back(points.back());
-            points = std::move(cut);
-        }
-    }
 };
 
 } // namespace maps

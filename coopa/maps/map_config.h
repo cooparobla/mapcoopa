@@ -7,6 +7,7 @@
 #ifndef COOPA_MAPS_MAP_CONFIG_H
 #define COOPA_MAPS_MAP_CONFIG_H
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 
@@ -129,6 +130,59 @@ inline RoadClass road_class_from_name(std::string_view name) {
 }
 
 /**
+ * @enum CompositeShading
+ * @brief How the composite layer lights the biome colours.
+ *
+ * Both are *drawing* choices applied to the biome fill; neither touches the
+ * height data, and the elevation layer on disk is unaffected either way.
+ */
+enum class CompositeShading {
+    /**
+     * @brief Brightness follows height: the higher the ground, the paler it is.
+     *
+     * A function of elevation alone, so the same height reads the same
+     * everywhere on the map and a colour can be compared against the legend
+     * plus a known offset. It shows *where the high ground is*.
+     */
+    Elevation,
+    /**
+     * @brief Brightness follows slope, lit from the north-west.
+     *
+     * A function of the height *gradient*, so it shows the shape of the
+     * land -- ridgelines, valley walls, which way a face turns -- but says
+     * nothing about altitude: a slope at sea level and the same slope on a
+     * summit are drawn identically.
+     */
+    Hillshade
+};
+
+/** @brief Number of distinct `CompositeShading` values. */
+inline constexpr std::size_t k_composite_shading_count = 2;
+
+/**
+ * @brief Maps a composite shading mode to its serialisation name.
+ * @param shading The mode to name.
+ * @return A `snake_case` identifier, e.g. `"hillshade"`.
+ */
+inline std::string_view composite_shading_name(CompositeShading shading) {
+    switch (shading) {
+        case CompositeShading::Elevation: return "elevation";
+        case CompositeShading::Hillshade: return "hillshade";
+    }
+    return "elevation";
+}
+
+/**
+ * @brief Resolves a serialisation name back to a shading mode.
+ * @param name A name previously produced by `composite_shading_name()`.
+ * @return The matching mode, or `CompositeShading::Elevation` if the name is unknown.
+ */
+inline CompositeShading composite_shading_from_name(std::string_view name) {
+    if (name == "hillshade") return CompositeShading::Hillshade;
+    return CompositeShading::Elevation;
+}
+
+/**
  * @struct TownConfig
  * @brief Controls settlement placement and the building footprints packed into each one.
  */
@@ -136,7 +190,7 @@ struct TownConfig {
     /** @brief Upper bound on settlements placed; fewer appear if the map lacks room. */
     int town_count = 12;
     /** @brief Minimum distance in grid units between two settlements. */
-    double min_spacing = 4.0;
+    double min_spacing_m = 360.0;
     /** @brief Rank cutoff: the first `capital_count` sites become capitals. */
     int capital_count = 1;
     /** @brief Rank cutoff: the sites after the capitals, up to this many, become towns. */
@@ -161,12 +215,26 @@ struct TownConfig {
     double area_bonus = 0.5;
     /** @brief Magnitude of the seeded random jitter applied to each site score. */
     double score_jitter = 0.15;
-    /** @brief Buildings attempted in a capital; lesser tiers get a fraction of this. */
-    int buildings_per_town = 30;
+    /**
+     * @brief Cells a capital may claim, itself included.
+     *
+     * A settlement is not one Voronoi cell. At 60 m to the grid unit a cell is
+     * about 3,600 m^2, which holds ten buildings of 10 m at a believable
+     * density -- so a capital confined to its own cell is a hamlet, and the
+     * three tiers become indistinguishable. Claiming neighbours is what lets a
+     * capital be a town-sized thing while a village stays a village.
+     */
+    int capital_cells = 7;
+    /** @brief Cells a town may claim, itself included. */
+    int town_cells = 3;
+    /** @brief Cells a village may claim; one, which is what makes it a village. */
+    int village_cells = 1;
+    /** @brief Buildings attempted in a capital across all its cells; lesser tiers get a fraction. */
+    int buildings_per_town = 70;
     /** @brief Smallest side length of a square building footprint, in grid units. */
-    double building_size_min = 0.09;
+    double building_size_min_m = 7.0;
     /** @brief Largest side length of a square building footprint, in grid units. */
-    double building_size_max = 0.16;
+    double building_size_max_m = 14.0;
     /** @brief Fraction of `buildings_per_town` a town-tier settlement receives. */
     double town_building_scale = 0.7;
     /** @brief Fraction of `buildings_per_town` a village receives. */
@@ -178,7 +246,7 @@ struct TownConfig {
      * shared with a lake or the sea. Without it buildings stand in the channel:
      * rivers are used as streets, so the packer marches plots straight at them.
      */
-    double water_clearance = 0.04;
+    double water_clearance_m = 3.0;
     /** @brief Fewest occupants in a household. */
     int household_size_min = 3;
     /** @brief Most occupants in a household. */
@@ -188,11 +256,11 @@ struct TownConfig {
     /** @brief Population density multiplier applied to a town. */
     double town_density = 1.2;
     /** @brief Perpendicular distance from a street's centreline to a plot centre. */
-    double street_offset = 0.10;
+    double street_offset_m = 8.0;
     /** @brief Spacing along a street between successive plots. */
-    double street_spacing = 0.16;
+    double street_spacing_m = 14.0;
     /** @brief Random offset applied to a street-front plot, on both axes. */
-    double position_jitter = 0.02;
+    double position_jitter_m = 1.5;
     /** @brief Radians of yaw wobble about a street's bearing. */
     double rotation_jitter = 0.25;
     /** @brief Rejection draws before interior infill gives up on a cramped cell. */
@@ -241,11 +309,11 @@ struct RoadConfig {
     /**
      * @brief Minimum distance in grid units between two hubs.
      *
-     * Matches `TownConfig::min_spacing` on purpose. Hubs are scored the way
+     * Matches `TownConfig::min_spacing_m` on purpose. Hubs are scored the way
      * settlement sites are, so spacing them the same way is what puts a road
      * through most of the towns the next pass but one goes on to place.
      */
-    double hub_min_spacing = 4.0;
+    double hub_min_spacing_m = 360.0;
     /**
      * @brief Cost per unit of elevation climbed between two cells.
      *
@@ -360,9 +428,62 @@ struct MapConfig {
     /** @brief Width of the band around the map edge whose cells are forced to border. */
     double border_length = 1.0;
 
+    // --- World scale ---
+
+    /**
+     * @brief Side length in metres of one grid unit.
+     *
+     * The number that makes every other size in this struct mean something. A
+     * cell is roughly one grid unit across, so this is also about how big a cell
+     * is on the ground: at 60 m a cell holds a cluster of ten or so buildings,
+     * which is what a village is, and `grid_size = 80` gives a 4.8 km world.
+     *
+     * Before this existed, grid units were abstract and every physical size was
+     * tuned by eye against a fixed render resolution. Roads came out 12 m wide
+     * and nothing in the generator could have said so.
+     */
+    double meters_per_grid_unit = 60.0;
+
     // --- Rendering ---
 
-    /** @brief Side length in pixels of the square PNG renders. */
+    /**
+     * @brief Ground covered by one rendered pixel, in metres.
+     *
+     * At the default of 1.0 a PNG is a literal one-pixel-per-metre map, so a
+     * pixel count read off a render *is* a measurement: a 6 m road is 6 px wide.
+     * Raising it renders the same world smaller and faster.
+     */
+    double meters_per_pixel = 1.0;
+
+    /**
+     * @brief How the composite layer lights the biome colours.
+     *
+     * Elevation by default. Hillshading draws a more sculptural picture, but it
+     * is a function of slope rather than height, so it answers "which way does
+     * this face turn" and not "how high is this" -- and on a map whose point is
+     * the terrain underneath it, the second question is usually the one being
+     * asked.
+     */
+    CompositeShading composite_shading = CompositeShading::Elevation;
+
+    /**
+     * @brief Deflate effort used when encoding a PNG; higher is smaller and slower.
+     *
+     * stb's own default is 8. Encoding is the dominant cost of an export -- more
+     * than half the runtime of a default map -- so this is worth reaching for
+     * when a run is a preview rather than an artefact. It changes file size only;
+     * the pixels are identical at every level.
+     */
+    int png_compression_level = 8;
+
+    /**
+     * @brief Side length in pixels of the square PNG renders.
+     *
+     * Derived, not chosen -- `derive_image_size()` sets it from the world extent
+     * and `meters_per_pixel`, and the generator calls that at startup. Left
+     * writable because every renderer reads it, and because a caller wanting a
+     * particular resolution can set it and back-compute the scale instead.
+     */
     int image_size = 1024;
     /** @brief Tint cells by the region that claims them, so borders are visible. */
     bool show_regions = true;
@@ -409,6 +530,25 @@ struct MapConfig {
     int threshold_water_count = 2;
     /** @brief Number of river sources attempted. */
     int river_count = 25;
+    /**
+     * @brief Corners a watercourse must run through before it counts as a river.
+     *
+     * Most land is close to a coast, so a source drawn uniformly usually sits a
+     * couple of cells from the sea and produces a trickle. Rejecting the short
+     * ones and drawing again is what leaves rivers that actually cross the map.
+     */
+    int river_min_length = 6;
+    /**
+     * @brief Lowest elevation a river may start from.
+     *
+     * The other half of why rivers used to be short: at the old 0.3 a source
+     * could appear on the coastal plain it was meant to run down to.
+     */
+    double river_source_min_elevation = 0.45;
+    /** @brief Highest elevation a river may start from. */
+    double river_source_max_elevation = 0.9;
+    /** @brief Chaikin corner-cutting passes applied to each traced watercourse. */
+    int river_smoothing_iterations = 2;
 
     /**
      * @brief Width of a volume-zero stream, in grid units.
@@ -419,30 +559,24 @@ struct MapConfig {
      * the town packer had no resolution-independent number to keep buildings
      * out of the channel.
      */
-    double river_width_base = 0.05;
+    double river_width_base_m = 5.0;
     /** @brief Additional width per unit of river volume, in grid units. */
-    double river_width_per_volume = 0.02;
+    double river_width_per_volume_m = 2.0;
     /**
-     * @brief Width of a drawn `RoadClass::Trail`, in grid units.
+     * @brief Carriageway width of a `RoadClass::Trail`, in metres.
      *
-     * The three road widths are spaced so that they still land on *different*
-     * pixel widths after `BiomeRenderer` halves them and truncates to whole
-     * pixels. Spacing them evenly in grid units but finely -- the 0.035 / 0.06 /
-     * 0.10 that looks reasonable written down -- collapses all three to a
-     * one-pixel brush at every render size this generator ships with, and the
-     * hierarchy the road pass worked out is invisible.
+     * A cart track. These three are real widths and not render tuning: at the
+     * default `meters_per_pixel` they come out 3, 6 and 10 pixels, because that
+     * is what 3, 6 and 10 metres of ground are. They were previously expressed
+     * in grid units and chosen so the three would land on different *pixel*
+     * widths, which at 60 m to the grid unit meant a 12 m road and an 18 m
+     * highway -- motorway proportions on a medieval map.
      */
-    double trail_width = 0.10;
-    /**
-     * @brief Width of a drawn `RoadClass::Road`, in grid units.
-     *
-     * Wider than the single `road_width` that preceded it, because it is now
-     * the middle of three tiers rather than the only one, and because a road
-     * drawn a single pixel wide at any render size is a hairline, not a road.
-     */
-    double road_width = 0.20;
-    /** @brief Width of a drawn `RoadClass::Highway`, in grid units. */
-    double highway_width = 0.30;
+    double trail_width_m = 3.0;
+    /** @brief Carriageway width of a `RoadClass::Road`, in metres; two carts abreast. */
+    double road_width_m = 6.0;
+    /** @brief Carriageway width of a `RoadClass::Highway`, in metres. */
+    double highway_width_m = 10.0;
     /** @brief Settlement placement parameters. */
     TownConfig towns;
     /** @brief Road network parameters. */
@@ -479,6 +613,60 @@ struct MapConfig {
 };
 
 /**
+ * @brief Converts a length in metres to grid units.
+ *
+ * The bridge between the two systems the generator speaks. Sizes are configured
+ * and reasoned about in metres, because that is what they physically are;
+ * geometry is computed in grid units, because that is the space the Voronoi
+ * graph lives in. Everything crosses here.
+ *
+ * @param config Supplies `meters_per_grid_unit`.
+ * @param meters The length in metres.
+ * @return The same length in grid units.
+ */
+inline double meters_to_grid(const MapConfig& config, double meters) {
+    return meters / config.meters_per_grid_unit;
+}
+
+/**
+ * @brief Converts a length in grid units to metres.
+ * @param config Supplies `meters_per_grid_unit`.
+ * @param grid The length in grid units.
+ * @return The same length in metres.
+ */
+inline double grid_to_meters(const MapConfig& config, double grid) {
+    return grid * config.meters_per_grid_unit;
+}
+
+/**
+ * @brief The render resolution the world extent and `meters_per_pixel` imply.
+ *
+ * `grid_size * meters_per_grid_unit` metres of world, divided by the ground each
+ * pixel covers. A free function rather than a member so the arithmetic has
+ * exactly one home, and so `image_size` cannot drift from the scale that
+ * produced it.
+ *
+ * @param config Supplies the grid size and both scale factors.
+ * @return The side length in pixels, at least 1.
+ */
+inline int derive_image_size(const MapConfig& config) {
+    const double meters = static_cast<double>(config.grid_size) * config.meters_per_grid_unit;
+    const double pixels = meters / (config.meters_per_pixel > 0.0 ? config.meters_per_pixel : 1.0);
+    return std::max(1, static_cast<int>(pixels + 0.5));
+}
+
+/**
+ * @brief The width of a river carrying a given volume, in metres.
+ * @param config Supplies the width parameters.
+ * @param volume The edge's river volume.
+ * @return The river's width in metres.
+ */
+inline double river_width_meters(const MapConfig& config, int volume) {
+    return config.river_width_base_m
+         + config.river_width_per_volume_m * static_cast<double>(volume);
+}
+
+/**
  * @brief The physical width of a river carrying a given volume, in grid units.
  *
  * The one definition of how wide a river is. The renderer scales it to pixels;
@@ -489,28 +677,42 @@ struct MapConfig {
  * @return The river's width in grid units.
  */
 inline double river_width(const MapConfig& config, int volume) {
-    return config.river_width_base + config.river_width_per_volume * static_cast<double>(volume);
+    return meters_to_grid(config, river_width_meters(config, volume));
 }
 
 /**
- * @brief The physical width of a road of a given class, in grid units.
+ * @brief The width of a road of a given class, in metres.
  *
- * The counterpart of `river_width()`, and the one definition of how wide a road
- * is: the renderer scales it to pixels, and a consumer laying geometry along a
- * road reads the same number.
+ * The counterpart of `river_width_meters()`, and the one definition of how wide
+ * a road is: the renderer scales it to pixels, and a consumer laying geometry
+ * along a road reads the same number.
  *
  * @param config Supplies the per-class widths.
+ * @param road_class The class of road.
+ * @return The road's width in metres; 0 for `RoadClass::None`.
+ */
+inline double road_width_meters(const MapConfig& config, RoadClass road_class) {
+    switch (road_class) {
+        case RoadClass::Trail:   return config.trail_width_m;
+        case RoadClass::Road:    return config.road_width_m;
+        case RoadClass::Highway: return config.highway_width_m;
+        case RoadClass::None:    break;
+    }
+    return 0.0;
+}
+
+/**
+ * @brief The width of a road of a given class, in grid units.
+ *
+ * The grid-space counterpart, so a caller working in graph coordinates never has
+ * to remember which system a width was configured in.
+ *
+ * @param config Supplies the per-class widths and the world scale.
  * @param road_class The class of road.
  * @return The road's width in grid units; 0 for `RoadClass::None`.
  */
 inline double road_width_for(const MapConfig& config, RoadClass road_class) {
-    switch (road_class) {
-        case RoadClass::Trail:   return config.trail_width;
-        case RoadClass::Road:    return config.road_width;
-        case RoadClass::Highway: return config.highway_width;
-        case RoadClass::None:    break;
-    }
-    return 0.0;
+    return meters_to_grid(config, road_width_meters(config, road_class));
 }
 
 /**
@@ -574,14 +776,15 @@ struct BiomePalette {
     /** @brief Colour of a `RoadClass::Highway` stroke. */
     glm::vec3 highway_color = glm::vec3(146, 108, 62);
     /**
-     * @brief Colour of the outline drawn under every road stroke.
+     * @brief Colour of a bridge or causeway parapet, drawn square across the road.
      *
-     * A road is stroked twice, this colour one pixel wider underneath. The
-     * casing is what separates a road from the terrain it crosses: without it a
-     * trail over dark forest is invisible and a highway over pale desert is a
-     * smudge.
+     * Stone, not the near-black this used to share with a road casing. The
+     * casing is gone: it was a dark outline under every stroke, added so a road
+     * would not vanish against dark forest, and at 6 m wide over a hillshaded
+     * composite a road no longer needs one. What it did instead was make every
+     * road read as drawn-on ink rather than as ground.
      */
-    glm::vec3 road_casing_color = glm::vec3(43, 33, 24);
+    glm::vec3 bridge_color = glm::vec3(112, 108, 102);
     /** @brief Colour of the settlement marker drawn at a town's centre. */
     glm::vec3 town_color = glm::vec3(120, 40, 40);
     /** @brief Colour of a natural landmark marker. */
@@ -605,7 +808,7 @@ struct BiomePalette {
             case RoadClass::Highway: return highway_color;
             case RoadClass::None:    break;
         }
-        return road_casing_color;
+        return bridge_color;
     }
 
     /**

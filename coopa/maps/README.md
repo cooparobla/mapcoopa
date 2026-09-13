@@ -48,22 +48,23 @@ coastline.
    │  corners[]  Voronoi verts  (rivers, downslope) │        │  2 coast           │
    │  edges[]    Delaunay + Voronoi edge, shared    │        │  3 elevation       │
    │  roads[]    routed runs, graded by traffic     │        │  4 temperature     │
-   │  towns[]    settlements + packed buildings     │        │  5 rivers          │
-   │  regions[]  provinces, countries[] nations     │        │  6 moisture        │
-   │  landmarks[] notable places                    │        │  7 biomes          │
-   │                                                │        │  8 roads           │
-   │  all adjacency by index, never by pointer      │        │  9 regions         │
-   └──────┬───────────────────────────┬────────────┘        │ 10 towns           │
-          │                            │                     │ 11 landmarks       │
-          ▼                            ▼                     │ 12 noisy edges     │
-   ┌─────────────────┐        ┌─────────────────┐           └───────────────────┘
+   │  rivers[]   smoothed watercourses              │        │  5 rivers          │
+   │  towns[]    settlements + packed buildings     │        │  6 moisture        │
+   │  regions[]  provinces, countries[] nations     │        │  7 biomes          │
+   │  landmarks[] notable places                    │        │  8 roads           │
+   │                                                │        │  9 regions         │
+   │  all adjacency by index, never by pointer      │        │ 10 towns           │
+   └──────┬───────────────────────────┬────────────┘        │ 11 landmarks       │
+          │                            │                     │ 12 noisy edges     │
+          ▼                            ▼                     └───────────────────┘
+   ┌─────────────────┐        ┌─────────────────┐
    │  map_renderer.h  │        │   map_yaml.h     │
-   │  BiomeRenderer   │        │  save_map()      │
-   │  ElevationRender │        │  load_map()      │
+   │  MapLayers       │        │  save_map()      │
+   │  7 image layers  │        │  load_map()      │
    └────────┬────────┘        └─────────────────┘
             ▼
    ┌─────────────────┐
-   │ image_writer.h   │  ──►  .png
+   │ image_writer.h   │  ──►  7 .png layers
    └─────────────────┘
 ```
 
@@ -135,21 +136,47 @@ The nine annotation stages, one header each. See [`passes/README.md`](./passes/R
 ### [`image.h`](./image.h) and [`image_writer.h`](./image_writer.h)
 `Image` (an 8-bit interleaved buffer, not a texture — mapcoopa carries no graphics
 dependency) plus half-space triangle fill, convex polygon fan fill and Bresenham strokes.
-Also `CoverageMask`, a one-bit stencil: an overlay whose per-pixel effect is subtraction
-rather than replacement has to be marked first and applied once, or it compounds wherever
-its strokes overlap.
-`image_writer.h` wraps stb_image_write; see its header comment for why the implementation
-is pulled in with `STB_IMAGE_WRITE_STATIC`.
-
 ### [`map_renderer.h`](./map_renderer.h)
-`BiomeRenderer` (coloured terrain tinted by region, then rivers, then the road network —
-every casing first and every fill after, so a junction is not nicked by whichever road was
-drawn later — then bridge parapets, settlements and landmark markers; the colour and hex
-legend is in the [repository README](../../README.md#legend)) and
-`ElevationRenderer` (greyscale heightmap, with rivers dimming the terrain beneath them by
-a fixed amount — stencilled, so a confluence is no darker than the reaches feeding it).
-Both are debugging aids: a consumer wanting a smooth heightfield should sample
+`MapLayers` renders any of seven views of a map — elevation, water surface, biomes, roads,
+structures, landmarks, and a hillshaded composite of all of them. The three overlay layers
+are RGBA on transparency so they stack; the rest are RGB. Every layer is drawn at the same
+scale, so at the default one pixel per metre a width measured off a render is a
+measurement of the ground. See the [repository README](../../README.md#layers) for the file
+list and the colour legend.
+
+The composite lights its biome colours by `MapConfig::composite_shading`. `Elevation`, the
+default, is a function of height read straight from `MapGraph::elevation_at()` — high
+ground pale, and the same height the same brightness anywhere on the map. `Hillshade` is a
+function of *slope* instead: more sculptural, but it cannot tell a slope at sea level from
+the same slope on a summit.
+
+Hillshading needs the *rasterised* elevation layer, blurred by a fraction of a cell first.
+Elevation inside a cell is interpolated from that cell's own corners, so the surface is
+continuous across a shared edge but its slope is not — and shading straight off
+`elevation_at()` draws every cell as its own little dome. Smoothing first leaves the relief
+of the landscape. Elevation shading needs none of that machinery, because the cusps that
+ruin a *gradient* taken from that function are harmless to its *value*.
+
+All of it is a debugging aid: a consumer wanting a smooth heightfield should sample
 `MapGraph::elevation_at()` rather than re-derive it from a lossy 8-bit image.
+
+### [`map_task.h`](./map_task.h)
+`MapTask` — the token an asynchronous generation or export is observed through:
+`done()`, `progress()`, `cancel()`, `wait()`. Move-only, and its destructor cancels and
+waits, because the work writes into storage the caller owns. With no `JobEngine` injected
+the operation has already run inline by the time a task exists, so there is one API and one
+call pattern either way.
+
+### [`map_export.h`](./map_export.h)
+`MapExporter` — renders all seven layers and writes them, in parallel. Its own header rather
+than more of `map_renderer.h` because exporting needs `image_writer.h`, which carries the
+stb *implementation*; a consumer rendering a layer into a texture should not have to link an
+encoder.
+
+Two levels of parallelism, both by disjoint output so the result is bit-identical to a
+serial run: across layers (which is the only way to overlap PNG encodes, stb's deflate
+being one opaque call per image) and across row bands within a layer. Nesting them is safe —
+`JobEngine::wait_for()` has a waiting worker participate rather than idle.
 
 ### [`map_yaml.h`](./map_yaml.h)
 `save_map()` / `load_map()`, and the `map_to_node()` / `map_from_node()` pair beneath
@@ -157,6 +184,15 @@ them. Writes the entire graph — every cell, corner, edge, settlement and adjac
 so the document is a save of generator state rather than a derived export. Built on
 `coopa::collections::YAMLMap`, with the bulk arrays assembled as `fkyaml::node` sequences
 directly. Float fields are lossy to six significant digits; see the header comment.
+
+Also `load_config()`, which reads a standalone settings file such as
+[`assets/config.yaml`](../../assets/config.yaml). It shares `apply_config_node()` with the
+`config:` block embedded in a saved map, so the two can never disagree about what a key
+means. It *applies* onto an existing `MapConfig` rather than returning a fresh one — an
+absent key leaves the caller's value alone, which is what lets a tool set its own defaults
+first and let the file override only what it mentions — and it returns a `ConfigLoadResult`
+rather than printing: the caller decides whether a missing or malformed file is fatal, and
+`has_seed` tells it whether the document named a seed or merely inherited the default.
 
 ---
 
@@ -205,7 +241,7 @@ for (const coopa::maps::MapLandmark& landmark : map.landmarks) {
 // Persist it, and render a preview.
 coopa::maps::save_map(map, config, "world.yaml");
 coopa::maps::write_png("world_biomes.png",
-                       coopa::maps::BiomeRenderer::render(map, config));
+                       coopa::maps::MapLayers::composite(map, config));
 
 // Load it back in a later session.
 coopa::maps::MapGraph loaded;

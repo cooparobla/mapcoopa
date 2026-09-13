@@ -10,6 +10,8 @@
 #include <cstddef>
 #include <random>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include <coopa/debug/logger.h>
 #include <coopa/maps/map_config.h>
@@ -39,6 +41,7 @@ public:
     void execute(MapGraph& graph, const MapConfig& config, coopa::debug::Logger& logger) const {
         logger.info("map pass: rivers");
 
+        graph.rivers.clear();
         if (graph.corners.empty() || config.river_count <= 0) {
             return;
         }
@@ -56,12 +59,13 @@ public:
             const CornerId source = static_cast<CornerId>(pick(rng));
             const MapCorner& candidate = graph.corners[static_cast<std::size_t>(source)];
             if (candidate.ocean
-                || candidate.elevation < k_min_source_elevation
-                || candidate.elevation > k_max_source_elevation) {
+                || candidate.elevation < config.river_source_min_elevation
+                || candidate.elevation > config.river_source_max_elevation) {
                 continue;
             }
-            carve_river_(graph, source);
-            ++placed;
+            if (carve_river_(graph, config, source)) {
+                ++placed;
+            }
         }
 
         if (placed < config.river_count) {
@@ -72,22 +76,37 @@ public:
     }
 
 private:
-    /** @brief Lowest elevation a river may start from. */
-    static constexpr double k_min_source_elevation = 0.3;
-    /** @brief Highest elevation a river may start from. */
-    static constexpr double k_max_source_elevation = 0.9;
     /** @brief Source draws allowed per requested river before the pass gives up. */
     static constexpr int k_attempts_per_river = 16;
 
-    /** @brief Walks one river from `source` down to the coast. */
-    void carve_river_(MapGraph& graph, CornerId source) const {
+    /**
+     * @brief Walks one river from `source` toward the sea, keeping it only if it runs far enough.
+     *
+     * Two steps, and the order is the point. The walk gathers the corner chain
+     * without touching the graph; only a chain of at least
+     * `MapConfig::river_min_length` corners is then committed. Raising volumes as
+     * it walked -- which is what this did before -- makes a short river
+     * impossible to reject, because by the time you can measure it you have
+     * already carved it. Most of the land is near a coast, so without the
+     * rejection the map fills with two-cell trickles.
+     *
+     * @param graph The graph to carve into.
+     * @param config Supplies the minimum length.
+     * @param source The corner to start from.
+     * @return True if the watercourse was long enough to keep.
+     */
+    bool carve_river_(MapGraph& graph, const MapConfig& config, CornerId source) const {
+        std::vector<CornerId> path;
+        std::vector<EdgeId> crossings;
+
         CornerId current = source;
+        path.push_back(current);
         // The walk is strictly downhill and terminates at the coast or at a
         // basin, but guard the step count anyway: a downslope chain is only
         // acyclic because the elevations it was built from are, and a NaN
         // height would make that false.
         for (std::size_t step = 0; step < graph.corners.size(); ++step) {
-            MapCorner& corner = graph.corners[static_cast<std::size_t>(current)];
+            const MapCorner& corner = graph.corners[static_cast<std::size_t>(current)];
             if (corner.coast) {
                 break;
             }
@@ -95,17 +114,42 @@ private:
             if (next == k_invalid_id || next == current) {
                 break; // Basin: nowhere lower to flow.
             }
-
             const EdgeId edge_id = find_edge_(graph, current, next);
             if (edge_id == k_invalid_id) {
                 break;
             }
-
-            graph.edges[static_cast<std::size_t>(edge_id)].river += 1;
-            corner.river += 1;
-            graph.corners[static_cast<std::size_t>(next)].river += 1;
+            crossings.push_back(edge_id);
+            path.push_back(next);
             current = next;
         }
+
+        if (static_cast<int>(path.size()) < config.river_min_length) {
+            return false;
+        }
+
+        for (const EdgeId edge_id : crossings) {
+            graph.edges[static_cast<std::size_t>(edge_id)].river += 1;
+        }
+        // Every corner on the path gains volume, so a confluence -- a corner two
+        // watercourses both run through -- ends up carrying both, which is what
+        // makes the channel widen downstream.
+        for (const CornerId corner_id : path) {
+            graph.corners[static_cast<std::size_t>(corner_id)].river += 1;
+        }
+
+        MapRiver river;
+        river.corners = path;
+        river.points.reserve(path.size());
+        for (const CornerId corner_id : path) {
+            river.points.push_back(graph.corners[static_cast<std::size_t>(corner_id)].point);
+        }
+        river.volume = graph.corners[static_cast<std::size_t>(path.back())].river;
+        // Corner-cutting rounds the joints; it does not straighten the course,
+        // because it never moves a point more than a quarter of a segment. The
+        // meander is the downslope chain itself and survives intact.
+        chaikin_smooth(river.points, config.river_smoothing_iterations);
+        graph.rivers.push_back(std::move(river));
+        return true;
     }
 
     /**

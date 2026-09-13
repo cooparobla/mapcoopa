@@ -11,6 +11,7 @@
 #include <array>
 #include <cstddef>
 #include <numeric>
+#include <queue>
 #include <random>
 #include <string>
 #include <unordered_map>
@@ -86,7 +87,11 @@ public:
             return scores[static_cast<std::size_t>(a)] > scores[static_cast<std::size_t>(b)];
         });
 
-        const double min_spacing_squared = towns.min_spacing * towns.min_spacing;
+        const double min_spacing = meters_to_grid(config, towns.min_spacing_m);
+        const double min_spacing_squared = min_spacing * min_spacing;
+        // A cell belongs to at most one settlement, so two neighbouring towns
+        // cannot both build on the same ground.
+        std::vector<bool> claimed(graph.centers.size(), false);
         for (const CenterId candidate : candidates) {
             if (static_cast<int>(graph.towns.size()) >= towns.town_count) {
                 break;
@@ -102,7 +107,8 @@ public:
             town.region = center.region;
             town.score = scores[static_cast<std::size_t>(candidate)];
             town.tier = tier_for_rank_(static_cast<int>(graph.towns.size()), towns);
-            town.buildings = pack_buildings_(graph, center, config, town.tier, rng);
+            town.cells = claim_cells_(graph, center, towns, town.tier, claimed);
+            town.buildings = pack_settlement_(graph, town, config, rng);
             assign_statistics_(town, center, towns, rng);
             town.name = name_for_(graph, town, rng);
             graph.towns.push_back(std::move(town));
@@ -198,6 +204,102 @@ private:
     }
 
     /**
+     * @brief Claims the cells a settlement of this tier covers, nearest first.
+     *
+     * Breadth-first from the site over `MapCenter::neighbors`, taking dry,
+     * habitable land no other settlement holds. Breadth-first and not a radius,
+     * so a coastal town grows along its shore rather than reaching across the
+     * water, and so the claimed patch is always contiguous.
+     *
+     * A settlement that cannot find its full allowance -- on a headland, or
+     * hemmed in by a neighbour -- simply gets fewer cells and correspondingly
+     * fewer buildings. That is the right answer: the ground really is not there.
+     *
+     * @param graph The map being generated.
+     * @param center The settlement's primary cell.
+     * @param towns Supplies the per-tier cell allowance.
+     * @param tier The settlement's size class.
+     * @param claimed Updated in place; marks every cell this settlement takes.
+     * @return The claimed cells, the primary one first.
+     */
+    static std::vector<CenterId> claim_cells_(const MapGraph& graph, const MapCenter& center,
+                                              const TownConfig& towns, TownTier tier,
+                                              std::vector<bool>& claimed) {
+        const int allowance = cells_for_tier_(tier, towns);
+        std::vector<CenterId> cells;
+        if (allowance <= 0) {
+            return cells;
+        }
+
+        std::queue<CenterId> pending;
+        pending.push(center.index);
+        claimed[static_cast<std::size_t>(center.index)] = true;
+        cells.push_back(center.index);
+
+        while (!pending.empty() && static_cast<int>(cells.size()) < allowance) {
+            const CenterId current = pending.front();
+            pending.pop();
+            for (const CenterId neighbor_id : graph.centers[static_cast<std::size_t>(current)].neighbors) {
+                if (static_cast<int>(cells.size()) >= allowance) {
+                    break;
+                }
+                const std::size_t index = static_cast<std::size_t>(neighbor_id);
+                if (claimed[index]) {
+                    continue;
+                }
+                const MapCenter& neighbor = graph.centers[index];
+                if (neighbor.water || neighbor.ocean || neighbor.border
+                    || biome_habitability(neighbor.biome) <= 0.0) {
+                    continue;
+                }
+                claimed[index] = true;
+                cells.push_back(neighbor_id);
+                pending.push(neighbor_id);
+            }
+        }
+        return cells;
+    }
+
+    /** @brief How many cells a settlement of this tier may claim. */
+    static int cells_for_tier_(TownTier tier, const TownConfig& towns) {
+        switch (tier) {
+            case TownTier::Capital: return towns.capital_cells;
+            case TownTier::Town:    return towns.town_cells;
+            case TownTier::Village: return towns.village_cells;
+        }
+        return towns.village_cells;
+    }
+
+    /**
+     * @brief Packs buildings across every cell a settlement claims.
+     *
+     * The per-cell packer runs once per claimed cell, and the growing building
+     * list is carried from one to the next so `buildings_overlap()` still
+     * rejects a footprint that would cross a cell boundary into one already
+     * built on. Packing each cell independently would let two plots meet exactly
+     * on the shared edge.
+     *
+     * @param graph The map being generated.
+     * @param town The settlement, with its cells already claimed.
+     * @param config Supplies the layout sizes and the budget.
+     * @param rng The pass's seeded generator.
+     * @return Every building placed, across all of the settlement's cells.
+     */
+    std::vector<MapBuilding> pack_settlement_(const MapGraph& graph, const MapTown& town,
+                                              const MapConfig& config, std::mt19937& rng) const {
+        std::vector<MapBuilding> buildings;
+        const int budget = building_budget_(town.tier, config.towns);
+        for (const CenterId cell_id : town.cells) {
+            if (static_cast<int>(buildings.size()) >= budget) {
+                break;
+            }
+            pack_cell_(graph, graph.centers[static_cast<std::size_t>(cell_id)], config, budget,
+                       rng, buildings);
+        }
+        return buildings;
+    }
+
+    /**
      * @struct Street
      * @brief A line a settlement's buildings front onto, in grid units.
      */
@@ -246,7 +348,7 @@ private:
                 // packer aims plots at the channel and every one is rejected,
                 // losing the riverside frontage that made the site desirable.
                 street.clearance = river_width(config, edge.river) * 0.5
-                                 + config.towns.water_clearance;
+                                 + meters_to_grid(config, config.towns.water_clearance_m);
             }
             streets.push_back(street);
         }
@@ -306,13 +408,10 @@ private:
      * @param rng The pass's seeded generator; the sole source of randomness here.
      * @return The placed buildings.
      */
-    std::vector<MapBuilding> pack_buildings_(const MapGraph& graph, const MapCenter& center,
-                                             const MapConfig& config, TownTier tier,
-                                             std::mt19937& rng) const {
-        const TownConfig& towns = config.towns;
-        std::vector<MapBuilding> buildings;
-        if (center.corners.size() < 3 || towns.buildings_per_town <= 0) {
-            return buildings;
+    void pack_cell_(const MapGraph& graph, const MapCenter& center, const MapConfig& config,
+                    int budget, std::mt19937& rng, std::vector<MapBuilding>& buildings) const {
+        if (center.corners.size() < 3 || budget <= 0) {
+            return;
         }
 
         std::vector<MapPoint> polygon;
@@ -322,12 +421,10 @@ private:
         }
 
         const WaterKeepOut keep_out = collect_water_(graph, center, config);
-        const int budget = building_budget_(tier, towns);
-
-        place_street_frontage_(polygon, derive_streets_(graph, center, config), towns, keep_out,
+        const Layout layout = layout_for_(config);
+        place_street_frontage_(polygon, derive_streets_(graph, center, config), layout, keep_out,
                                budget, rng, buildings);
-        place_infill_(polygon, towns, keep_out, budget, rng, buildings);
-        return buildings;
+        place_infill_(polygon, layout, keep_out, budget, rng, buildings);
     }
 
     /**
@@ -532,12 +629,13 @@ private:
 
             double clearance = 0.0;
             if (edge.river > 0) {
-                clearance = river_width(config, edge.river) * 0.5 + config.towns.water_clearance;
+                clearance = river_width(config, edge.river) * 0.5
+                          + meters_to_grid(config, config.towns.water_clearance_m);
             } else {
                 const CenterId other = edge.d0 == center.index ? edge.d1 : edge.d0;
                 if (other != k_invalid_id
                     && graph.centers[static_cast<std::size_t>(other)].water) {
-                    clearance = config.towns.water_clearance;
+                    clearance = meters_to_grid(config, config.towns.water_clearance_m);
                 }
             }
             if (clearance <= 0.0) {
@@ -549,6 +647,42 @@ private:
             keep_out.clearances.push_back(clearance);
         }
         return keep_out;
+    }
+
+    /**
+     * @struct Layout
+     * @brief A settlement's layout sizes, converted from metres into grid units once.
+     *
+     * The packer works in grid space, because that is where the cell polygon it
+     * has to fit inside lives, but every one of these is configured in metres,
+     * because that is what it physically is. Converting once at the top and
+     * passing this down means no line further in has to remember which system
+     * its number is in -- and a field in here is, by construction, grid units.
+     */
+    struct Layout {
+        double building_min = 0.0;   /**< @brief Smallest footprint side. */
+        double building_max = 0.0;   /**< @brief Largest footprint side. */
+        double street_offset = 0.0;  /**< @brief Centreline to plot centre, across the street. */
+        double street_spacing = 0.0; /**< @brief Along the street, between plots. */
+        double position_jitter = 0.0;/**< @brief Random offset applied to a street-front plot. */
+        double water_clearance = 0.0;/**< @brief Clear ground kept between a building and water. */
+        double rotation_jitter = 0.0;/**< @brief Radians of yaw wobble; already unit-free. */
+        int infill_attempts = 0;     /**< @brief Rejection draws before infill gives up. */
+    };
+
+    /** @brief Builds the grid-space `Layout` for a configuration. */
+    static Layout layout_for_(const MapConfig& config) {
+        const TownConfig& towns = config.towns;
+        Layout layout;
+        layout.building_min = meters_to_grid(config, towns.building_size_min_m);
+        layout.building_max = meters_to_grid(config, towns.building_size_max_m);
+        layout.street_offset = meters_to_grid(config, towns.street_offset_m);
+        layout.street_spacing = meters_to_grid(config, towns.street_spacing_m);
+        layout.position_jitter = meters_to_grid(config, towns.position_jitter_m);
+        layout.water_clearance = meters_to_grid(config, towns.water_clearance_m);
+        layout.rotation_jitter = towns.rotation_jitter;
+        layout.infill_attempts = towns.infill_attempts;
+        return layout;
     }
 
     /** @brief How many buildings a settlement of this tier may hold. */
@@ -565,28 +699,29 @@ private:
 
     /** @brief Places plots in pairs flanking each street, walking outward from the site. */
     void place_street_frontage_(const std::vector<MapPoint>& polygon,
-                                const std::vector<Street>& streets, const TownConfig& towns,
+                                const std::vector<Street>& streets, const Layout& layout,
                                 const WaterKeepOut& keep_out, int budget, std::mt19937& rng,
                                 std::vector<MapBuilding>& buildings) const {
-        if (streets.empty() || towns.street_spacing <= 0.0) {
+        if (streets.empty() || layout.street_spacing <= 0.0) {
             return;
         }
 
-        std::uniform_real_distribution<double> offset_jitter(-towns.position_jitter,
-                                                             towns.position_jitter);
-        std::uniform_real_distribution<double> yaw_jitter(-towns.rotation_jitter,
-                                                          towns.rotation_jitter);
-        std::uniform_real_distribution<double> pick_size(towns.building_size_min,
-                                                         towns.building_size_max);
+        std::uniform_real_distribution<double> offset_jitter(-layout.position_jitter,
+                                                             layout.position_jitter);
+        std::uniform_real_distribution<double> yaw_jitter(-layout.rotation_jitter,
+                                                          layout.rotation_jitter);
+        std::uniform_real_distribution<double> pick_size(layout.building_min,
+                                                         layout.building_max);
 
         for (const Street& street : streets) {
             const double along_x = std::cos(street.bearing);
             const double along_y = std::sin(street.bearing);
             const double across_x = -along_y;
             const double across_y = along_x;
-            const double offset = towns.street_offset + street.clearance;
+            const double offset = layout.street_offset + street.clearance;
 
-            for (double t = towns.street_spacing; t < street.length; t += towns.street_spacing) {
+            for (double t = layout.street_spacing; t < street.length;
+                 t += layout.street_spacing) {
                 for (const double side : {-1.0, 1.0}) {
                     if (static_cast<int>(buildings.size()) >= budget) {
                         return;
@@ -611,7 +746,7 @@ private:
     }
 
     /** @brief Spends the remaining budget on jittered rejection sampling inside the cell. */
-    void place_infill_(const std::vector<MapPoint>& polygon, const TownConfig& towns,
+    void place_infill_(const std::vector<MapPoint>& polygon, const Layout& layout,
                        const WaterKeepOut& keep_out, int budget, std::mt19937& rng,
                        std::vector<MapBuilding>& buildings) const {
         if (static_cast<int>(buildings.size()) >= budget) {
@@ -630,12 +765,12 @@ private:
         std::uniform_real_distribution<double> pick_x(min_x, max_x);
         std::uniform_real_distribution<double> pick_y(min_y, max_y);
         std::uniform_real_distribution<double> pick_yaw(0.0, k_two_pi);
-        std::uniform_real_distribution<double> pick_size(towns.building_size_min,
-                                                         towns.building_size_max);
+        std::uniform_real_distribution<double> pick_size(layout.building_min,
+                                                         layout.building_max);
 
         // Bounded: a cell too cramped to hold another building would otherwise
         // sample forever.
-        for (int attempt = 0; attempt < towns.infill_attempts; ++attempt) {
+        for (int attempt = 0; attempt < layout.infill_attempts; ++attempt) {
             if (static_cast<int>(buildings.size()) >= budget) {
                 return;
             }
