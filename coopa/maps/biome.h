@@ -161,6 +161,65 @@ inline Biome biome_from_name(std::string_view name) {
 }
 
 /**
+ * @brief How readily a biome supports settlement and the traffic between
+ *        settlements, from 0 to 1.
+ *
+ * Zero entries are hard exclusions -- nothing is built on open water, ice or
+ * scorched rock. Grassland and deciduous forest score highest, which is what
+ * pushes settlements onto the temperate middle of a continent rather than its
+ * extremes.
+ *
+ * Lives here beside `classify_biome()` for the same reason: it is a pure table
+ * and can be exercised on a list of inputs without building a whole map to
+ * reach it. Both the road pass and the town pass read it, so where people live
+ * and where the roads between them run cannot disagree about which ground is
+ * hospitable.
+ *
+ * @param biome The biome to weigh.
+ * @return Habitability in `[0, 1]`; 0 means nothing is ever built there.
+ */
+inline double biome_habitability(Biome biome) {
+    switch (biome) {
+        case Biome::Grassland:                return 1.00;
+        case Biome::TemperateDeciduousForest: return 0.90;
+        case Biome::Beach:                    return 0.75;
+        case Biome::Shrubland:                return 0.65;
+        case Biome::TemperateRainForest:      return 0.60;
+        case Biome::TropicalSeasonalForest:   return 0.60;
+        case Biome::Marsh:                    return 0.35;
+        case Biome::Taiga:                    return 0.35;
+        case Biome::TropicalRainForest:       return 0.30;
+        case Biome::TemperateDesert:          return 0.25;
+        case Biome::SubtropicalDesert:        return 0.20;
+        case Biome::Tundra:                   return 0.15;
+        case Biome::Bare:                     return 0.05;
+        // Grazing and grain country, second only to the temperate lowlands.
+        case Biome::Savanna:                  return 0.70;
+        case Biome::Steppe:                   return 0.60;
+        case Biome::Chaparral:                return 0.55;
+        case Biome::Moorland:                 return 0.45;
+        case Biome::CloudForest:              return 0.45;
+        case Biome::Mangrove:                 return 0.40;
+        case Biome::Swamp:                    return 0.30;
+        case Biome::AlpineMeadow:             return 0.30;
+        case Biome::BorealWetland:            return 0.25;
+        case Biome::ColdDesert:               return 0.12;
+        case Biome::Badlands:                 return 0.10;
+        case Biome::Dunes:                    return 0.05;
+        case Biome::SaltFlat:                 return 0.03;
+        // Nothing is built on open water, ice, or bare volcanic rock.
+        case Biome::Ocean:
+        case Biome::Lake:
+        case Biome::Ice:
+        case Biome::Snow:
+        case Biome::Glacier:
+        case Biome::VolcanicField:
+        case Biome::Scorched:                 return 0.0;
+    }
+    return 0.0;
+}
+
+/**
  * @brief Classifies a cell from its terrain state and climate.
  *
  * Water state wins over climate: an ocean cell is `Ocean` at any latitude, an

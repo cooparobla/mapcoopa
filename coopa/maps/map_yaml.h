@@ -160,6 +160,21 @@ inline fkyaml::node config_to_node(const MapConfig& config) {
     towns["rotation_jitter"] = config.towns.rotation_jitter;
     towns["infill_attempts"] = config.towns.infill_attempts;
 
+    fkyaml::node roads = fkyaml::node::mapping();
+    roads["hub_count"] = config.roads.hub_count;
+    roads["hub_min_spacing"] = config.roads.hub_min_spacing;
+    roads["slope_cost"] = config.roads.slope_cost;
+    roads["elevation_cost"] = config.roads.elevation_cost;
+    roads["rough_ground_cost"] = config.roads.rough_ground_cost;
+    roads["ford_cost"] = config.roads.ford_cost;
+    roads["bridge_cost_per_volume"] = config.roads.bridge_cost_per_volume;
+    roads["water_crossing_cost"] = config.roads.water_crossing_cost;
+    roads["max_water_span"] = config.roads.max_water_span;
+    roads["reuse_discount"] = config.roads.reuse_discount;
+    roads["highway_traffic_share"] = config.roads.highway_traffic_share;
+    roads["road_traffic_share"] = config.roads.road_traffic_share;
+    roads["smoothing_iterations"] = config.roads.smoothing_iterations;
+
     fkyaml::node node = fkyaml::node::mapping();
     node["seed"] = config.seed;
     node["grid_size"] = config.grid_size;
@@ -171,7 +186,9 @@ inline fkyaml::node config_to_node(const MapConfig& config) {
     node["river_count"] = config.river_count;
     node["river_width_base"] = config.river_width_base;
     node["river_width_per_volume"] = config.river_width_per_volume;
+    node["trail_width"] = config.trail_width;
     node["road_width"] = config.road_width;
+    node["highway_width"] = config.highway_width;
     node["temperature_lapse_rate"] = config.temperature_lapse_rate;
     node["temperature_falloff"] = config.temperature_falloff;
     node["elevation_smoothing_iterations"] = config.elevation_smoothing_iterations;
@@ -179,6 +196,7 @@ inline fkyaml::node config_to_node(const MapConfig& config) {
     node["subdivide_noisy_edges"] = config.subdivide_noisy_edges;
     node["noise_island"] = std::move(noise);
     node["towns"] = std::move(towns);
+    node["roads"] = std::move(roads);
     return node;
 }
 
@@ -208,7 +226,9 @@ inline MapConfig config_from_node(const fkyaml::node& node) {
     config.river_width_base = detail::read_or(node, "river_width_base", config.river_width_base);
     config.river_width_per_volume =
         detail::read_or(node, "river_width_per_volume", config.river_width_per_volume);
+    config.trail_width = detail::read_or(node, "trail_width", config.trail_width);
     config.road_width = detail::read_or(node, "road_width", config.road_width);
+    config.highway_width = detail::read_or(node, "highway_width", config.highway_width);
     config.temperature_lapse_rate =
         detail::read_or(node, "temperature_lapse_rate", config.temperature_lapse_rate);
     config.temperature_falloff =
@@ -245,6 +265,30 @@ inline MapConfig config_from_node(const fkyaml::node& node) {
         config.noise_island.gain = detail::read_or(noise, "gain", config.noise_island.gain);
         config.noise_island.weighted_strength =
             detail::read_or(noise, "weighted_strength", config.noise_island.weighted_strength);
+    }
+
+    if (node.contains("roads")) {
+        const fkyaml::node& roads = node.at("roads");
+        RoadConfig& target = config.roads;
+        target.hub_count = detail::read_or(roads, "hub_count", target.hub_count);
+        target.hub_min_spacing = detail::read_or(roads, "hub_min_spacing", target.hub_min_spacing);
+        target.slope_cost = detail::read_or(roads, "slope_cost", target.slope_cost);
+        target.elevation_cost = detail::read_or(roads, "elevation_cost", target.elevation_cost);
+        target.rough_ground_cost =
+            detail::read_or(roads, "rough_ground_cost", target.rough_ground_cost);
+        target.ford_cost = detail::read_or(roads, "ford_cost", target.ford_cost);
+        target.bridge_cost_per_volume =
+            detail::read_or(roads, "bridge_cost_per_volume", target.bridge_cost_per_volume);
+        target.water_crossing_cost =
+            detail::read_or(roads, "water_crossing_cost", target.water_crossing_cost);
+        target.max_water_span = detail::read_or(roads, "max_water_span", target.max_water_span);
+        target.reuse_discount = detail::read_or(roads, "reuse_discount", target.reuse_discount);
+        target.highway_traffic_share =
+            detail::read_or(roads, "highway_traffic_share", target.highway_traffic_share);
+        target.road_traffic_share =
+            detail::read_or(roads, "road_traffic_share", target.road_traffic_share);
+        target.smoothing_iterations =
+            detail::read_or(roads, "smoothing_iterations", target.smoothing_iterations);
     }
 
     if (node.contains("towns")) {
@@ -292,7 +336,7 @@ inline MapConfig config_from_node(const fkyaml::node& node) {
 /**
  * @brief Serialises a map and the configuration that produced it to a YAML document.
  *
- * The whole graph goes in -- cells, corners, edges and settlements, with every
+ * The whole graph goes in -- cells, corners, edges, road runs and settlements, with every
  * adjacency list -- so the document is a save of generator state rather than a
  * derived export, and `map_from_node()` reconstructs it exactly.
  *
@@ -373,6 +417,16 @@ inline fkyaml::node map_to_node(const MapGraph& graph, const MapConfig& config) 
         node["my"] = edge.midpoint.y;
         node["river"] = edge.river;
         node["road"] = edge.road;
+        // Written only when there is something to say, as with noisy0/noisy1
+        // below: most edges carry no road, and three keys apiece across every
+        // edge of an 80-cell grid is megabytes spent saying "none".
+        if (edge.road_class != RoadClass::None) {
+            node["road_class"] = std::string(road_class_name(edge.road_class));
+            node["traffic"] = edge.traffic;
+        }
+        if (edge.bridge) {
+            node["bridge"] = true;
+        }
         // Only written when subdivision actually produced a path worth keeping:
         // an unsubdivided edge's two points are recoverable from v0, v1 and the
         // midpoint, and writing them would inflate the document for nothing.
@@ -381,6 +435,16 @@ inline fkyaml::node map_to_node(const MapGraph& graph, const MapConfig& config) 
             node["noisy1"] = detail::point_sequence(edge.noisy_points1);
         }
         edges.push_back(std::move(node));
+    }
+
+    std::vector<fkyaml::node> roads;
+    roads.reserve(graph.roads.size());
+    for (const MapRoad& road : graph.roads) {
+        fkyaml::node node = fkyaml::node::mapping();
+        node["class"] = std::string(road_class_name(road.road_class));
+        node["edges"] = detail::id_sequence(road.edges);
+        node["points"] = detail::point_sequence(road.points);
+        roads.push_back(std::move(node));
     }
 
     std::vector<fkyaml::node> towns;
@@ -471,6 +535,7 @@ inline fkyaml::node map_to_node(const MapGraph& graph, const MapConfig& config) 
     root["centers"] = fkyaml::node::sequence(std::move(centers));
     root["corners"] = fkyaml::node::sequence(std::move(corners));
     root["edges"] = fkyaml::node::sequence(std::move(edges));
+    root["roads"] = fkyaml::node::sequence(std::move(roads));
     root["towns"] = fkyaml::node::sequence(std::move(towns));
     root["regions"] = fkyaml::node::sequence(std::move(regions));
     root["countries"] = fkyaml::node::sequence(std::move(countries));
@@ -555,10 +620,30 @@ inline bool map_from_node(const fkyaml::node& root, MapGraph& out_graph, MapConf
             edge.midpoint = {detail::read_or(node, "mx", 0.0), detail::read_or(node, "my", 0.0)};
             edge.river = detail::read_or(node, "river", 0);
             edge.road = detail::read_or(node, "road", false);
+            // A document written before roads had classes says only `road: true`.
+            // Read that as a plain road rather than discarding it: the flag was
+            // written because a road was there. Same courtesy the legacy
+            // `road_size` conversion above extends to widths.
+            edge.road_class = edge.road
+                ? road_class_from_name(detail::read_or(node, "road_class", std::string("road")))
+                : RoadClass::None;
+            edge.traffic = detail::read_or(node, "traffic", 0);
+            edge.bridge = detail::read_or(node, "bridge", false);
             edge.noisy_points0 = detail::read_point_sequence(node, "noisy0");
             edge.noisy_points1 = detail::read_point_sequence(node, "noisy1");
             edge.noisy = !edge.noisy_points0.empty();
             out_graph.edges.push_back(std::move(edge));
+        }
+    }
+
+    if (root.contains("roads") && root.at("roads").is_sequence()) {
+        for (const fkyaml::node& node : root.at("roads")) {
+            MapRoad road;
+            road.road_class =
+                road_class_from_name(detail::read_or(node, "class", std::string("trail")));
+            road.edges = detail::read_id_sequence<EdgeId>(node, "edges");
+            road.points = detail::read_point_sequence(node, "points");
+            out_graph.roads.push_back(std::move(road));
         }
     }
 

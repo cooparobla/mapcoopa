@@ -328,7 +328,7 @@ private:
             for (const CenterId cell : region.cells) {
                 const MapCenter& center = graph.centers[static_cast<std::size_t>(cell)];
                 ++tally[static_cast<std::size_t>(center.biome)];
-                region.area += cell_area_(graph, center);
+                region.area += graph.cell_area(center);
             }
             const auto peak = std::max_element(tally.begin(), tally.end());
             if (peak != tally.end() && *peak > 0) {
@@ -339,21 +339,6 @@ private:
                 graph.countries[static_cast<std::size_t>(region.country)].area += region.area;
             }
         }
-    }
-
-    /** @brief Polygon area of a cell, by the shoelace formula. */
-    static double cell_area_(const MapGraph& graph, const MapCenter& center) {
-        if (center.corners.size() < 3) {
-            return 0.0;
-        }
-        double twice_area = 0.0;
-        const std::size_t count = center.corners.size();
-        for (std::size_t i = 0, j = count - 1; i < count; j = i++) {
-            const MapPoint& a = graph.corners[static_cast<std::size_t>(center.corners[i])].point;
-            const MapPoint& b = graph.corners[static_cast<std::size_t>(center.corners[j])].point;
-            twice_area += (b.x + a.x) * (b.y - a.y);
-        }
-        return std::abs(twice_area) * 0.5;
     }
 
     /**

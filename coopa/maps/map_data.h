@@ -200,12 +200,59 @@ struct MapEdge {
     MapPoint midpoint; /**< @brief Halfway between `v0` and `v1`. */
     int river = 0;     /**< @brief Volume of water flowing along this edge, or 0. */
     bool noisy = false;/**< @brief The noisy-edge pass has already processed this edge. */
-    bool road = false; /**< @brief A road runs along this edge. */
+    /**
+     * @brief A road runs along this edge.
+     *
+     * Kept as a plain predicate beside `road_class` because most consumers only
+     * ask whether one is there -- the town packer turns a road-flagged border
+     * into a street without caring how busy it is. Always equal to
+     * `road_class != RoadClass::None`; the road pass is what keeps them agreeing.
+     */
+    bool road = false;
+    /** @brief Traffic tier of the road here; `None` when no road runs along this edge. */
+    RoadClass road_class = RoadClass::None;
+    /**
+     * @brief Routes the network pass sent along this edge; what `road_class` is derived from.
+     *
+     * Kept rather than discarded after classification so a consumer can re-cut
+     * the tiers at its own thresholds, and so a test can check that a highway
+     * really did earn the title.
+     */
+    int traffic = 0;
+    /**
+     * @brief The road here spans water -- a river, a lake neck or a strait.
+     *
+     * Exactly representable because a road follows the Delaunay edge `d0`-`d1`
+     * and a river the dual Voronoi edge `v0`-`v1`, and those are this same
+     * object: the two cross each other by construction, so a road on a
+     * river-carrying edge crosses that river and nothing else needs deciding.
+     */
+    bool bridge = false;
 
     /** @brief The wobbled path from `v0` to `midpoint`; exactly two points when not subdivided. */
     std::vector<MapPoint> noisy_points0;
     /** @brief The wobbled path from `v1` to `midpoint`; exactly two points when not subdivided. */
     std::vector<MapPoint> noisy_points1;
+};
+
+/**
+ * @struct MapRoad
+ * @brief One continuous run of road, as a smoothed centreline in grid units.
+ *
+ * The per-edge flags say *where* roads are; this says what one *looks like*.
+ * A run is a maximal chain of same-class road edges between two junctions, so a
+ * consumer can follow a highway from end to end -- to drive a caravan along it,
+ * or to stroke it as a single polyline -- without rediscovering the chain from
+ * the edge flags every time.
+ *
+ * `points` is denser than `edges` is long: the chain of cell sites is corner-cut
+ * before it is stored, because a route drawn straight between sites is visibly
+ * faceted at every cell and no road is.
+ */
+struct MapRoad {
+    RoadClass road_class = RoadClass::Trail; /**< @brief The class every edge in this run shares. */
+    std::vector<MapPoint> points; /**< @brief The smoothed centreline, in grid units, in order. */
+    std::vector<EdgeId> edges;    /**< @brief The edges this run covers, in order along it. */
 };
 
 /**
@@ -403,7 +450,7 @@ struct MapCountry {
 
 /**
  * @class MapGraph
- * @brief Owns every cell, corner, edge and settlement of one generated map.
+ * @brief Owns every cell, corner, edge, road run and settlement of one generated map.
  *
  * The three arrays are index-addressed and self-consistent: `centers[i].index
  * == i` holds for all three after generation, and every id stored in an
@@ -415,6 +462,7 @@ public:
     std::vector<MapCenter> centers; /**< @brief Voronoi cells, one per generating site. */
     std::vector<MapCorner> corners; /**< @brief Voronoi vertices, one per Delaunay triangle. */
     std::vector<MapEdge> edges;     /**< @brief Shared Delaunay/Voronoi edges. */
+    std::vector<MapRoad> roads;     /**< @brief Road runs traced by the road pass. */
     std::vector<MapTown> towns;     /**< @brief Settlements placed by the town pass. */
     std::vector<MapRegion> regions; /**< @brief Provinces carved by the region pass. */
     std::vector<MapCountry> countries; /**< @brief Nations carved by the region pass. */
@@ -425,6 +473,7 @@ public:
         centers.clear();
         corners.clear();
         edges.clear();
+        roads.clear();
         towns.clear();
         regions.clear();
         countries.clear();
@@ -546,6 +595,33 @@ public:
         }
         sort_points_radially(outline);
         return outline;
+    }
+
+    /**
+     * @brief Polygon area of a cell, by the shoelace formula.
+     *
+     * Computed from `MapCenter::corners`, which the generator has already sorted
+     * counter-clockwise, so the straight-edged cell is measured -- not the
+     * wobbled one. That is the area a pass actually wants: subdivision moves a
+     * boundary in and out about the same midpoint and leaves the enclosed area
+     * essentially unchanged, and the straight polygon exists before the
+     * noisy-edge pass has run.
+     *
+     * @param center The cell to measure.
+     * @return Its area in square grid units; 0 for a degenerate cell.
+     */
+    double cell_area(const MapCenter& center) const {
+        if (center.corners.size() < 3) {
+            return 0.0;
+        }
+        double twice_area = 0.0;
+        const std::size_t count = center.corners.size();
+        for (std::size_t i = 0, j = count - 1; i < count; j = i++) {
+            const MapPoint& a = corners[static_cast<std::size_t>(center.corners[i])].point;
+            const MapPoint& b = corners[static_cast<std::size_t>(center.corners[j])].point;
+            twice_area += (b.x + a.x) * (b.y - a.y);
+        }
+        return std::abs(twice_area) * 0.5;
     }
 
     /**

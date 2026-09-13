@@ -31,7 +31,7 @@ annotates cells, corners and edges. Every pass that draws randomness seeds a gen
 | 5 | [`pass_rivers.h`](./pass_rivers.h) | `river` on corners and edges | pass 3 |
 | 6 | [`pass_moisture.h`](./pass_moisture.h) | `moisture` | pass 5 |
 | 7 | [`pass_biomes.h`](./pass_biomes.h) | `MapCenter::biome` | passes 3, 4 and 6 |
-| 8 | [`pass_roads.h`](./pass_roads.h) | `MapEdge::road` | pass 3 |
+| 8 | [`pass_roads.h`](./pass_roads.h) | `MapEdge::road`, `road_class`, `traffic`, `bridge`; `MapGraph::roads` | passes 3, 5 and 7 |
 | 9 | [`pass_regions.h`](./pass_regions.h) | `MapGraph::regions`, `countries`; cell `region`/`country` | passes 3 and 7 |
 | 10 | [`pass_towns.h`](./pass_towns.h) | `MapGraph::towns` | passes 7, 8 and 9 |
 | 11 | [`pass_landmarks.h`](./pass_landmarks.h) | `MapGraph::landmarks` | passes 7, 9 and 10 |
@@ -80,9 +80,48 @@ temperature first, then elevation, then moisture — about 33 biomes rather than
 original 18.
 
 ### 8. Roads ([`pass_roads.h`](./pass_roads.h))
-Flood elevation-band contour levels outward from the coast; a road runs along any edge
-whose two corners fall in different bands. Roads therefore trace band boundaries, which is
-why they read as switchbacks climbing a slope.
+Roads are *routed*, not drawn. Every Delaunay edge gets a travel cost from the ground
+either side of it — distance scaled by slope, height and how rough the biome is, plus a
+volume-scaled charge to ford or bridge a river and a high but finite one to step into
+water. Anchors ("hubs") are picked with `biome_habitability()`, and a least-cost path is
+run between **every pair** of them.
+
+Routes are laid one at a time, longest link first, and each sees ground an earlier route
+already built on as `RoadConfig::reuse_discount` times as dear. That one rule is what makes
+this a network rather than a fan of independent optimal paths: a later route bends to join
+an existing road instead of paralleling it a cell away, trunks consolidate, and traffic
+concentrates. An edge's `traffic` is the number of routes that chose it, and `RoadClass`
+is a pair of thresholds on that count taken as a *share of the routes laid* — a dead-end
+spur always carries exactly `hubs - 1` routes, so an absolute cutoff would mean something
+different on every map.
+
+Switchbacks survive from the old implementation, but for a reason rather than by
+construction: `slope_cost` makes climbing straight up dear and traversing a slope cheap, so
+a mountain route crosses the contour at a shallow angle and doubles back. Bridges need no
+geometry — a road follows the Delaunay edge `d0`–`d1` and a river the dual Voronoi edge
+`v0`–`v1`, and those are the same `MapEdge`, so an edge carrying both *is* the crossing.
+Finally each maximal same-class chain is traced into a `MapRoad` and corner-cut with
+Chaikin, ends pinned, because a path drawn straight between cell sites is visibly faceted
+and no road is.
+
+Water is crossable but bounded: a causeway may span up to `max_water_span` consecutive
+water cells, so nearby islands link up while the open ocean stays impassable and a remote
+island keeps its own self-contained network. The search state is therefore
+`(cell, consecutive water crossed)` rather than just the cell — the same lake cell is
+reachable one hop from shore and unreachable three hops out.
+
+**What this replaces.** The pass used to flood four elevation bands outward from the coast
+and flag any edge whose two corners fell in different bands. That traces contour lines, and
+contour lines connect nothing: a road could run half the map without passing a settlement,
+every road was the same width, and `TownConfig::road_bonus` was rewarding proximity to a
+contour rather than to a trade route.
+
+**Why it runs before towns.** Towns want roads to score sites by and good roads want towns
+to connect, which looks circular. It is not: the pass picks its own hubs with the same
+`biome_habitability()` table `PassTowns` ranks sites with, so it depends only on biomes and
+rivers, and the settlements placed two passes later land on the network because both
+passes read the same ground. The pass draws no randomness at all — terrain decides
+everything, so there is no stream to seed.
 
 ### 9. Regions ([`pass_regions.h`](./pass_regions.h))
 Scatter country seeds across the land, then claim territory by multi-source Dijkstra where
@@ -92,7 +131,9 @@ same way, and any land the fill could not reach is adopted by its nearest claima
 cell is left stateless. Countries draw a synthetic language; regions get a dialect of it.
 
 ### 10. Towns ([`pass_towns.h`](./pass_towns.h))
-Score land cells on biome habitability, low ground, and access to sea, river or road;
+Score land cells on biome habitability (`biome_habitability()` in
+[`../biome.h`](../biome.h), the same table the road pass ranks hubs with), low ground, and
+access to sea, river or road;
 accept the best greedily subject to a minimum separation so settlements spread across a
 continent rather than clustering on one river mouth; then rank them into capitals, towns
 and villages.
@@ -108,6 +149,12 @@ A cell with no road or river gets fallback lanes toward its farthest corners.
 Every candidate must have all four of its **rotated** corners inside the cell polygon and
 must clear every building already placed, by separating-axis test. That is what makes
 `MapBuilding::rotation` a pose a consumer can trust.
+
+Names are drawn from the region's dialect and then *claimed*: a name already taken is
+redrawn, up to a bound, after which an ordinal is appended. Two settlements of one region
+draw from the same small phoneme table, so a collision is a matter of how many towns that
+region got — and two places sharing a name silently conflates them for anything keying on
+one.
 
 This pass was a stub in the original — it logged its own name and returned, with a
 commented-out sketch of the packing step referencing types that never existed. The scoring,

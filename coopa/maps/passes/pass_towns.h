@@ -14,6 +14,7 @@
 #include <random>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <coopa/debug/logger.h>
@@ -53,6 +54,8 @@ public:
         logger.info("map pass: towns");
 
         graph.towns.clear();
+        dialects_.clear();
+        taken_names_.clear();
         const TownConfig& towns = config.towns;
         if (towns.town_count <= 0 || graph.centers.empty()) {
             return;
@@ -120,59 +123,10 @@ private:
     /** @brief Added to `MapConfig::seed` so towns and rivers do not share a stream. */
     static constexpr unsigned int k_seed_offset = 7919u;
 
-    /**
-     * @brief How readily each biome supports a settlement, from 0 to 1.
-     *
-     * Indexed by `Biome`. Zero entries are hard exclusions -- nothing is built
-     * on open water, ice or scorched rock. Grassland and deciduous forest score
-     * highest, which is what pushes settlements onto the temperate middle of a
-     * continent rather than its extremes.
-     */
-    static double habitability_(Biome biome) {
-        switch (biome) {
-            case Biome::Grassland:                return 1.00;
-            case Biome::TemperateDeciduousForest: return 0.90;
-            case Biome::Beach:                    return 0.75;
-            case Biome::Shrubland:                return 0.65;
-            case Biome::TemperateRainForest:      return 0.60;
-            case Biome::TropicalSeasonalForest:   return 0.60;
-            case Biome::Marsh:                    return 0.35;
-            case Biome::Taiga:                    return 0.35;
-            case Biome::TropicalRainForest:       return 0.30;
-            case Biome::TemperateDesert:          return 0.25;
-            case Biome::SubtropicalDesert:        return 0.20;
-            case Biome::Tundra:                   return 0.15;
-            case Biome::Bare:                     return 0.05;
-            // Grazing and grain country, second only to the temperate lowlands.
-            case Biome::Savanna:                  return 0.70;
-            case Biome::Steppe:                   return 0.60;
-            case Biome::Chaparral:                return 0.55;
-            case Biome::Moorland:                 return 0.45;
-            case Biome::CloudForest:              return 0.45;
-            case Biome::Mangrove:                 return 0.40;
-            case Biome::Swamp:                    return 0.30;
-            case Biome::AlpineMeadow:             return 0.30;
-            case Biome::BorealWetland:            return 0.25;
-            case Biome::ColdDesert:               return 0.12;
-            case Biome::Badlands:                 return 0.10;
-            case Biome::Dunes:                    return 0.05;
-            case Biome::SaltFlat:                 return 0.03;
-            // Nothing is built on open water, ice, or bare volcanic rock.
-            case Biome::Ocean:
-            case Biome::Lake:
-            case Biome::Ice:
-            case Biome::Snow:
-            case Biome::Glacier:
-            case Biome::VolcanicField:
-            case Biome::Scorched:                 return 0.0;
-        }
-        return 0.0;
-    }
-
     /** @brief Scores one cell on biome, elevation and its access to water and roads. */
     double score_site_(const MapGraph& graph, const MapCenter& center, const TownConfig& towns,
                        double mean_area) const {
-        double score = habitability_(center.biome);
+        double score = biome_habitability(center.biome);
         if (score <= 0.0) {
             return 0.0;
         }
@@ -199,25 +153,10 @@ private:
         // has space for, so ranking sites without regard to area produces
         // capitals smaller than the towns below them.
         if (mean_area > 0.0) {
-            const double relative = std::clamp(cell_area_(graph, center) / mean_area, 0.0, 2.0);
+            const double relative = std::clamp(graph.cell_area(center) / mean_area, 0.0, 2.0);
             score += towns.area_bonus * (relative - 1.0);
         }
         return score;
-    }
-
-    /** @brief Polygon area of a cell, by the shoelace formula. */
-    static double cell_area_(const MapGraph& graph, const MapCenter& center) {
-        if (center.corners.size() < 3) {
-            return 0.0;
-        }
-        double twice_area = 0.0;
-        const std::size_t count = center.corners.size();
-        for (std::size_t i = 0, j = count - 1; i < count; j = i++) {
-            const MapPoint& a = graph.corners[static_cast<std::size_t>(center.corners[i])].point;
-            const MapPoint& b = graph.corners[static_cast<std::size_t>(center.corners[j])].point;
-            twice_area += (b.x + a.x) * (b.y - a.y);
-        }
-        return std::abs(twice_area) * 0.5;
     }
 
     /** @brief Mean cell area across dry land, used to normalise the area bonus. */
@@ -228,7 +167,7 @@ private:
             if (center.water || center.border) {
                 continue;
             }
-            total += cell_area_(graph, center);
+            total += graph.cell_area(center);
             ++count;
         }
         return count == 0 ? 0.0 : total / static_cast<double>(count);
@@ -409,7 +348,7 @@ private:
             || static_cast<std::size_t>(town.region) >= graph.regions.size()) {
             // Land outside any nation still gets a name, just not a local one.
             Language stateless = make_language(rng);
-            return generate_name(stateless, rng);
+            return claim_name_(generate_name(stateless, rng), stateless, rng);
         }
 
         auto found = dialects_.find(town.region);
@@ -420,7 +359,41 @@ private:
                 dialect_for(country_language_seed(seed_, region.country),
                             region_dialect_seed(seed_, region.index))).first;
         }
-        return generate_name(found->second, rng);
+        return claim_name_(generate_name(found->second, rng), found->second, rng);
+    }
+
+    /**
+     * @brief Takes a drawn name if it is free, otherwise redraws until one is.
+     *
+     * Two settlements of one region draw from the same small phoneme table, so a
+     * collision is not rare -- it is a matter of how many towns that region got.
+     * Nothing here used to check, and two places on the same map could share a
+     * name, which is worse than a slightly duller name: a consumer keying on a
+     * place name would silently conflate them.
+     *
+     * The last resort is a numeric suffix rather than another draw, because only
+     * that terminates: a dialect has a finite vocabulary and a region crowded
+     * enough can exhaust it, and a loop that draws until it gets lucky would not
+     * come back.
+     *
+     * @param drawn The first candidate, already generated.
+     * @param dialect The language to redraw from.
+     * @param rng The pass's seeded generator.
+     * @return A name no other settlement on this map holds.
+     */
+    std::string claim_name_(std::string drawn, const Language& dialect, std::mt19937& rng) const {
+        for (int attempt = 0; attempt < k_name_attempts; ++attempt) {
+            if (taken_names_.insert(drawn).second) {
+                return drawn;
+            }
+            drawn = generate_name(dialect, rng);
+        }
+        for (int ordinal = 2;; ++ordinal) {
+            std::string suffixed = drawn + " " + std::to_string(ordinal);
+            if (taken_names_.insert(suffixed).second) {
+                return suffixed;
+            }
+        }
     }
 
     /** @brief Sums settlement populations into their regions and countries. */
@@ -475,8 +448,13 @@ private:
         return 0;
     }
 
+    /** @brief Redraws allowed before a name is disambiguated by ordinal instead. */
+    static constexpr int k_name_attempts = 64;
+
     /** @brief Cached dialect per region, built on first use. */
     mutable std::unordered_map<RegionId, Language> dialects_;
+    /** @brief Every settlement name already handed out, so no two places share one. */
+    mutable std::unordered_set<std::string> taken_names_;
     /** @brief The map seed, so a region's dialect can be rebuilt from its id. */
     mutable int seed_ = 0;
 
@@ -505,7 +483,7 @@ private:
         const double density = tier_density_(town.tier, towns);
         // Fertile ground supports fuller houses; the same hamlet on scorched
         // rock holds fewer people than one on grassland.
-        const double land = 0.7 + 0.3 * habitability_(center.biome);
+        const double land = 0.7 + 0.3 * biome_habitability(center.biome);
 
         std::uniform_int_distribution<int> occupants(towns.household_size_min,
                                                      towns.household_size_max);

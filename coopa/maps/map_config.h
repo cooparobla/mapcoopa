@@ -74,6 +74,61 @@ inline TownTier town_tier_from_name(std::string_view name) {
 }
 
 /**
+ * @enum RoadClass
+ * @brief How much traffic a road carries, and therefore what kind of road it is.
+ *
+ * Assigned from the number of routes the network pass pushed along an edge, not
+ * chosen: a highway is a highway because everything goes that way. Ordered
+ * least to most travelled so a comparison against a tier means what it reads
+ * like, and `None` is first so a default-constructed edge carries no road.
+ */
+enum class RoadClass {
+    None,
+    Trail,
+    Road,
+    Highway
+};
+
+/** @brief Number of distinct `RoadClass` values, `None` included. */
+inline constexpr std::size_t k_road_class_count = 4;
+
+/**
+ * @brief Maps a road class to its serialisation name.
+ *
+ * These `snake_case` names are the stable on-disk identity of a class, exactly
+ * as `biome_name()` is for a biome.
+ *
+ * @param road_class The class to name.
+ * @return A `snake_case` identifier, e.g. `"highway"`.
+ */
+inline std::string_view road_class_name(RoadClass road_class) {
+    switch (road_class) {
+        case RoadClass::None:    return "none";
+        case RoadClass::Trail:   return "trail";
+        case RoadClass::Road:    return "road";
+        case RoadClass::Highway: return "highway";
+    }
+    return "none";
+}
+
+/**
+ * @brief Resolves a serialisation name back to a road class.
+ *
+ * Unknown names become `Trail` rather than `None`: the name was written because
+ * a road was there, and downgrading it to the least travelled class loses less
+ * than erasing it.
+ *
+ * @param name A name previously produced by `road_class_name()`.
+ * @return The matching class, or `RoadClass::Trail` if the name is unknown.
+ */
+inline RoadClass road_class_from_name(std::string_view name) {
+    if (name == "none")    return RoadClass::None;
+    if (name == "road")    return RoadClass::Road;
+    if (name == "highway") return RoadClass::Highway;
+    return RoadClass::Trail;
+}
+
+/**
  * @struct TownConfig
  * @brief Controls settlement placement and the building footprints packed into each one.
  */
@@ -169,6 +224,90 @@ struct RegionConfig {
      * lets a country hold both banks of a strait while still stopping at an ocean.
      */
     double water_crossing_cost = 25.0;
+};
+
+/**
+ * @struct RoadConfig
+ * @brief Controls where roads run, how busy they get, and how they are drawn.
+ *
+ * Every cost here is a multiplier on the distance actually travelled, never a
+ * flat number of hops, so the network does not change character when
+ * `grid_size` does -- the same reasoning that made river widths physical
+ * rather than pixel counts.
+ */
+struct RoadConfig {
+    /** @brief Anchors the network is routed between; clamped to the land available. */
+    int hub_count = 32;
+    /**
+     * @brief Minimum distance in grid units between two hubs.
+     *
+     * Matches `TownConfig::min_spacing` on purpose. Hubs are scored the way
+     * settlement sites are, so spacing them the same way is what puts a road
+     * through most of the towns the next pass but one goes on to place.
+     */
+    double hub_min_spacing = 4.0;
+    /**
+     * @brief Cost per unit of elevation climbed between two cells.
+     *
+     * The reason mountain roads switchback. Climbing straight up is dear and
+     * traversing a slope is not, so a route crosses the contour at a shallow
+     * angle and doubles back -- which is what the old contour-flooding pass
+     * drew directly, now arrived at for a reason rather than by construction.
+     */
+    double slope_cost = 9.0;
+    /** @brief Cost per unit of absolute height; pushes a crossing onto the saddle. */
+    double elevation_cost = 1.5;
+    /** @brief Scales `1 - biome_habitability()` into a penalty for rough ground. */
+    double rough_ground_cost = 2.0;
+    /**
+     * @brief Cost of crossing a volume-zero stream; a ford, not yet a bridge.
+     *
+     * Deliberately small. A headwater stream is a wet crossing and little more,
+     * and pricing it like a bridge sends every route detouring to a river's
+     * source -- which reads as a network that is frightened of water rather
+     * than one that has learned where to cross it.
+     */
+    double ford_cost = 0.6;
+    /** @brief Added to `ford_cost` per unit of river volume, so wide water is dear to span. */
+    double bridge_cost_per_volume = 0.35;
+    /**
+     * @brief Cost of stepping into a lake or ocean cell.
+     *
+     * High but finite, and bounded in extent by `max_water_span`. Infinite
+     * would strand every island with its own closed network; this lets a
+     * causeway hop a narrow strait while leaving the open sea uncrossable --
+     * the same bargain `RegionConfig::water_crossing_cost` already strikes for
+     * a country holding both banks.
+     */
+    double water_crossing_cost = 30.0;
+    /** @brief Consecutive water cells a crossing may span; a longer run is impassable. */
+    int max_water_span = 2;
+    /**
+     * @brief Cost multiplier on an edge some earlier route already runs along.
+     *
+     * The whole reason the network has a shape rather than being a fan of
+     * independent optimal paths. Routes are laid one at a time and each sees the
+     * ground already built on as cheap, so a later route bends to join an
+     * existing road instead of cutting its own parallel line a cell away --
+     * which is how a trunk road forms, and why traffic concentrates enough for
+     * a hierarchy to be worth reading off.
+     */
+    double reuse_discount = 0.40;
+    /**
+     * @brief Share of all routes that must pass along an edge for it to be a highway.
+     *
+     * A share and not a count, because a count cannot mean anything fixed: with
+     * `n` hubs every pair is routed, so a dead-end spur carries exactly `n - 1`
+     * routes and a trunk carries a large fraction of all `n(n-1)/2` of them.
+     * Thresholds in absolute traffic would reclassify the entire map the moment
+     * `hub_count` moved -- at 24 hubs a flat cutoff of 12 made highways of
+     * 308 edges out of 322.
+     */
+    double highway_traffic_share = 0.30;
+    /** @brief Share of all routes that makes an edge a road; below it, a trail. */
+    double road_traffic_share = 0.10;
+    /** @brief Chaikin corner-cutting passes applied to each road run. */
+    int smoothing_iterations = 2;
 };
 
 /**
@@ -283,10 +422,31 @@ struct MapConfig {
     double river_width_base = 0.05;
     /** @brief Additional width per unit of river volume, in grid units. */
     double river_width_per_volume = 0.02;
-    /** @brief Width of a drawn road, in grid units. */
-    double road_width = 0.06;
+    /**
+     * @brief Width of a drawn `RoadClass::Trail`, in grid units.
+     *
+     * The three road widths are spaced so that they still land on *different*
+     * pixel widths after `BiomeRenderer` halves them and truncates to whole
+     * pixels. Spacing them evenly in grid units but finely -- the 0.035 / 0.06 /
+     * 0.10 that looks reasonable written down -- collapses all three to a
+     * one-pixel brush at every render size this generator ships with, and the
+     * hierarchy the road pass worked out is invisible.
+     */
+    double trail_width = 0.10;
+    /**
+     * @brief Width of a drawn `RoadClass::Road`, in grid units.
+     *
+     * Wider than the single `road_width` that preceded it, because it is now
+     * the middle of three tiers rather than the only one, and because a road
+     * drawn a single pixel wide at any render size is a hairline, not a road.
+     */
+    double road_width = 0.20;
+    /** @brief Width of a drawn `RoadClass::Highway`, in grid units. */
+    double highway_width = 0.30;
     /** @brief Settlement placement parameters. */
     TownConfig towns;
+    /** @brief Road network parameters. */
+    RoadConfig roads;
     /** @brief Political geography parameters. */
     RegionConfig regions;
     /** @brief Notable-place parameters. */
@@ -330,6 +490,27 @@ struct MapConfig {
  */
 inline double river_width(const MapConfig& config, int volume) {
     return config.river_width_base + config.river_width_per_volume * static_cast<double>(volume);
+}
+
+/**
+ * @brief The physical width of a road of a given class, in grid units.
+ *
+ * The counterpart of `river_width()`, and the one definition of how wide a road
+ * is: the renderer scales it to pixels, and a consumer laying geometry along a
+ * road reads the same number.
+ *
+ * @param config Supplies the per-class widths.
+ * @param road_class The class of road.
+ * @return The road's width in grid units; 0 for `RoadClass::None`.
+ */
+inline double road_width_for(const MapConfig& config, RoadClass road_class) {
+    switch (road_class) {
+        case RoadClass::Trail:   return config.trail_width;
+        case RoadClass::Road:    return config.road_width;
+        case RoadClass::Highway: return config.highway_width;
+        case RoadClass::None:    break;
+    }
+    return 0.0;
 }
 
 /**
@@ -380,8 +561,27 @@ struct BiomePalette {
 
     /** @brief Colour of river strokes. */
     glm::vec3 river_color = glm::vec3(94, 182, 223);
-    /** @brief Colour of road strokes. */
-    glm::vec3 road_color = glm::vec3(0, 0, 0);
+    /**
+     * @brief Colour of a `RoadClass::Road` stroke.
+     *
+     * Warm earth rather than the flat black this used to be. A pure black line
+     * of even width across a coloured map reads as an administrative border,
+     * not as a road -- which is exactly how the old contour roads read.
+     */
+    glm::vec3 road_color = glm::vec3(122, 101, 82);
+    /** @brief Colour of a `RoadClass::Trail` stroke. */
+    glm::vec3 trail_color = glm::vec3(136, 122, 100);
+    /** @brief Colour of a `RoadClass::Highway` stroke. */
+    glm::vec3 highway_color = glm::vec3(146, 108, 62);
+    /**
+     * @brief Colour of the outline drawn under every road stroke.
+     *
+     * A road is stroked twice, this colour one pixel wider underneath. The
+     * casing is what separates a road from the terrain it crosses: without it a
+     * trail over dark forest is invisible and a highway over pale desert is a
+     * smudge.
+     */
+    glm::vec3 road_casing_color = glm::vec3(43, 33, 24);
     /** @brief Colour of the settlement marker drawn at a town's centre. */
     glm::vec3 town_color = glm::vec3(120, 40, 40);
     /** @brief Colour of a natural landmark marker. */
@@ -392,6 +592,21 @@ struct BiomePalette {
     glm::vec3 building_color = glm::vec3(70, 50, 40);
     /** @brief Colour the canvas is cleared to before any cell is filled. */
     glm::vec3 background_color = glm::vec3(255, 255, 255);
+
+    /**
+     * @brief Looks up the stroke colour for a road class.
+     * @param road_class The class to colour; `None` returns the casing colour.
+     * @return The palette entry, in 0-255 component range.
+     */
+    const glm::vec3& color_for(RoadClass road_class) const {
+        switch (road_class) {
+            case RoadClass::Trail:   return trail_color;
+            case RoadClass::Road:    return road_color;
+            case RoadClass::Highway: return highway_color;
+            case RoadClass::None:    break;
+        }
+        return road_casing_color;
+    }
 
     /**
      * @brief Looks up the colour for a biome.

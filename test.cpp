@@ -1,6 +1,6 @@
 /**
  * @file test.cpp
- * @brief mapcoopa's test suite -- 30 cases over the generator, its passes, the
+ * @brief mapcoopa's test suite -- 39 cases over the generator, its passes, the
  *        renderers and the YAML round trip.
  *
  * Build target `mapcoopa_tests` (the bare `mapcoopa` target is the generator,
@@ -16,10 +16,16 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdio> // For std::remove
+#include <fstream>
+#include <functional>
 #include <iostream>
+#include <limits>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#include <root_directory.h>
 
 #include <coopa/debug/logger.h>
 #include <coopa/maps/biome.h>
@@ -209,6 +215,22 @@ static void test_generate_is_deterministic() {
     for (std::size_t i = 0; i < a.edges.size(); ++i) {
         ASSERT_EQ(a.edges[i].noisy_points0.size(), b.edges[i].noisy_points0.size());
         ASSERT_EQ(a.edges[i].river, b.edges[i].river);
+        ASSERT_EQ(a.edges[i].traffic, b.edges[i].traffic);
+        ASSERT_TRUE(a.edges[i].road_class == b.edges[i].road_class);
+        ASSERT_TRUE(a.edges[i].bridge == b.edges[i].bridge);
+    }
+    // The road pass draws no randomness, so its output is reproducible for a
+    // stronger reason than a shared seed -- but it does sort candidate hubs and
+    // hub pairs, and a tie broken by sort order rather than by id would show
+    // here as a network that differs between two runs of the same config.
+    ASSERT_EQ(a.roads.size(), b.roads.size());
+    for (std::size_t i = 0; i < a.roads.size(); ++i) {
+        ASSERT_TRUE(a.roads[i].road_class == b.roads[i].road_class);
+        ASSERT_EQ(a.roads[i].edges.size(), b.roads[i].edges.size());
+        ASSERT_EQ(a.roads[i].points.size(), b.roads[i].points.size());
+        for (std::size_t j = 0; j < a.roads[i].edges.size(); ++j) {
+            ASSERT_EQ(a.roads[i].edges[j], b.roads[i].edges[j]);
+        }
     }
 }
 
@@ -919,7 +941,25 @@ static void test_yaml_round_trip_preserves_the_graph() {
         ASSERT_EQ(a.v1, b.v1);
         ASSERT_EQ(a.river, b.river);
         ASSERT_TRUE(a.road == b.road);
+        ASSERT_TRUE(a.road_class == b.road_class);
+        ASSERT_EQ(a.traffic, b.traffic);
+        ASSERT_TRUE(a.bridge == b.bridge);
         ASSERT_EQ(a.noisy_points0.size(), b.noisy_points0.size());
+    }
+
+    ASSERT_EQ(original.roads.size(), loaded.roads.size());
+    for (std::size_t i = 0; i < original.roads.size(); ++i) {
+        const MapRoad& a = original.roads[i];
+        const MapRoad& b = loaded.roads[i];
+        ASSERT_TRUE(a.road_class == b.road_class);
+        ASSERT_EQ(a.edges.size(), b.edges.size());
+        ASSERT_EQ(a.points.size(), b.points.size());
+        // Positions survive to six significant digits, which at these grid
+        // coordinates is about 1e-4 -- see the precision note on map_to_node().
+        for (std::size_t j = 0; j < a.points.size(); ++j) {
+            ASSERT_TRUE(std::abs(a.points[j].x - b.points[j].x) < 1e-3);
+            ASSERT_TRUE(std::abs(a.points[j].y - b.points[j].y) < 1e-3);
+        }
     }
 
     for (std::size_t i = 0; i < original.towns.size(); ++i) {
@@ -960,12 +1000,420 @@ static void test_disabled_passes_leave_the_graph_untouched() {
     generator.generate();
 
     ASSERT_TRUE(generator.graph().towns.empty());
+    ASSERT_TRUE(generator.graph().roads.empty());
     for (const MapEdge& edge : generator.graph().edges) {
         ASSERT_EQ(edge.river, 0);
         ASSERT_TRUE(!edge.road);
+        ASSERT_TRUE(edge.road_class == RoadClass::None);
+        ASSERT_EQ(edge.traffic, 0);
+        ASSERT_TRUE(!edge.bridge);
     }
     // Geometry is built before any pass runs, so it survives them all being off.
     ASSERT_TRUE(!generator.graph().centers.empty());
+}
+
+
+// --- Roads ---------------------------------------------------------------
+
+/** @brief A config big enough for the road network to have somewhere to go. */
+static MapConfig road_config(int seed = 77) {
+    MapConfig config;
+    config.grid_size = 32;
+    config.image_size = 256;
+    config.seed = seed;
+    config.noise_island.seed = seed;
+    return config;
+}
+
+/** @brief The cells a road run passes through, in order, from its edge chain. */
+static std::vector<CenterId> run_cells(const MapGraph& graph, const MapRoad& run) {
+    std::vector<CenterId> cells;
+    if (run.edges.empty()) {
+        return cells;
+    }
+    const MapEdge& first = graph.edges[static_cast<std::size_t>(run.edges[0])];
+    if (run.edges.size() == 1) {
+        return {first.d0, first.d1};
+    }
+    // Start at whichever end of the first edge the second edge does not share.
+    const MapEdge& second = graph.edges[static_cast<std::size_t>(run.edges[1])];
+    const bool d1_is_shared = second.d0 == first.d1 || second.d1 == first.d1;
+    CenterId cell = d1_is_shared ? first.d0 : first.d1;
+
+    cells.push_back(cell);
+    for (const EdgeId edge_id : run.edges) {
+        const MapEdge& edge = graph.edges[static_cast<std::size_t>(edge_id)];
+        cell = edge.d0 == cell ? edge.d1 : edge.d0;
+        cells.push_back(cell);
+    }
+    return cells;
+}
+
+static void test_biome_habitability_ranks_the_land() {
+    // Hard exclusions: nothing is built here, and no road is routed cheaply
+    // through it either -- both passes read this one table.
+    ASSERT_TRUE(biome_habitability(Biome::Ocean) == 0.0);
+    ASSERT_TRUE(biome_habitability(Biome::Lake) == 0.0);
+    ASSERT_TRUE(biome_habitability(Biome::Ice) == 0.0);
+    ASSERT_TRUE(biome_habitability(Biome::Glacier) == 0.0);
+    ASSERT_TRUE(biome_habitability(Biome::Scorched) == 0.0);
+    ASSERT_TRUE(biome_habitability(Biome::VolcanicField) == 0.0);
+
+    // Grassland is the top of the table, and the ordering the passes rely on
+    // holds across the whole range.
+    ASSERT_TRUE(biome_habitability(Biome::Grassland) == 1.0);
+    ASSERT_TRUE(biome_habitability(Biome::Grassland)
+                > biome_habitability(Biome::TemperateDeciduousForest));
+    ASSERT_TRUE(biome_habitability(Biome::TemperateDeciduousForest)
+                > biome_habitability(Biome::Taiga));
+    ASSERT_TRUE(biome_habitability(Biome::Taiga) > biome_habitability(Biome::Tundra));
+    ASSERT_TRUE(biome_habitability(Biome::Savanna) > biome_habitability(Biome::Badlands));
+
+    // Every value is in range, and the switch covers the whole enum -- a biome
+    // added without a case would fall through to the 0.0 return and be silently
+    // uninhabitable.
+    for (std::size_t i = 0; i < k_biome_count; ++i) {
+        const double value = biome_habitability(static_cast<Biome>(i));
+        ASSERT_TRUE(value >= 0.0 && value <= 1.0);
+    }
+}
+
+static void test_road_class_names_round_trip() {
+    for (std::size_t i = 0; i < k_road_class_count; ++i) {
+        const RoadClass road_class = static_cast<RoadClass>(i);
+        ASSERT_TRUE(road_class_from_name(road_class_name(road_class)) == road_class);
+    }
+    // An unrecognised name keeps the road rather than erasing it.
+    ASSERT_TRUE(road_class_from_name("motorway") == RoadClass::Trail);
+}
+
+static void test_roads_form_one_network_reaching_the_towns() {
+    MapConfig config = road_config();
+    MapGenerator generator(config, maps_logger());
+    generator.generate();
+    const MapGraph& graph = generator.graph();
+
+    std::vector<EdgeId> road_edges;
+    for (const MapEdge& edge : graph.edges) {
+        if (edge.road) {
+            road_edges.push_back(edge.index);
+        }
+    }
+    ASSERT_TRUE(road_edges.size() > 8);
+
+    // Union-find over the cells the roads join. The old contour pass produced
+    // long unconnected arcs; a routed network is mostly one piece.
+    std::vector<CenterId> parent(graph.centers.size());
+    for (std::size_t i = 0; i < parent.size(); ++i) {
+        parent[i] = static_cast<CenterId>(i);
+    }
+    const std::function<CenterId(CenterId)> find = [&parent, &find](CenterId id) -> CenterId {
+        while (parent[static_cast<std::size_t>(id)] != id) {
+            parent[static_cast<std::size_t>(id)] =
+                parent[static_cast<std::size_t>(parent[static_cast<std::size_t>(id)])];
+            id = parent[static_cast<std::size_t>(id)];
+        }
+        return id;
+    };
+    for (const EdgeId edge_id : road_edges) {
+        const MapEdge& edge = graph.edges[static_cast<std::size_t>(edge_id)];
+        const CenterId a = find(edge.d0);
+        const CenterId b = find(edge.d1);
+        if (a != b) {
+            parent[static_cast<std::size_t>(a)] = b;
+        }
+    }
+
+    std::map<CenterId, int> component_size;
+    for (const EdgeId edge_id : road_edges) {
+        ++component_size[find(graph.edges[static_cast<std::size_t>(edge_id)].d0)];
+    }
+    int largest = 0;
+    for (const auto& entry : component_size) {
+        largest = std::max(largest, entry.second);
+    }
+    ASSERT_TRUE(largest * 2 >= static_cast<int>(road_edges.size()));
+
+    // The point of routing rather than contouring: the settlements placed two
+    // passes later are on the network. They are not hubs -- the town pass adds
+    // jitter and its own spacing -- so this is a majority, not a guarantee.
+    int on_a_road = 0;
+    for (const MapTown& town : graph.towns) {
+        const MapCenter& center = graph.centers[static_cast<std::size_t>(town.center)];
+        for (const EdgeId edge_id : center.borders) {
+            if (graph.edges[static_cast<std::size_t>(edge_id)].road) {
+                ++on_a_road;
+                break;
+            }
+        }
+    }
+    ASSERT_TRUE(!graph.towns.empty());
+    ASSERT_TRUE(on_a_road * 2 > static_cast<int>(graph.towns.size()));
+}
+
+static void test_road_class_follows_traffic() {
+    MapConfig config = road_config(1234);
+    MapGenerator generator(config, maps_logger());
+    generator.generate();
+    const MapGraph& graph = generator.graph();
+
+    int busiest_trail = 0;
+    int quietest_road = std::numeric_limits<int>::max();
+    int busiest_road = 0;
+    int quietest_highway = std::numeric_limits<int>::max();
+    bool saw_road = false;
+    bool saw_highway = false;
+
+    for (const MapEdge& edge : graph.edges) {
+        // The predicate and the class are two readings of one fact and may never
+        // disagree: the town packer asks the first, the renderer the second.
+        ASSERT_TRUE(edge.road == (edge.road_class != RoadClass::None));
+        ASSERT_TRUE(edge.road == (edge.traffic > 0));
+        if (!edge.road) {
+            ASSERT_EQ(edge.traffic, 0);
+            continue;
+        }
+        switch (edge.road_class) {
+            case RoadClass::Trail:
+                busiest_trail = std::max(busiest_trail, edge.traffic);
+                break;
+            case RoadClass::Road:
+                saw_road = true;
+                quietest_road = std::min(quietest_road, edge.traffic);
+                busiest_road = std::max(busiest_road, edge.traffic);
+                break;
+            case RoadClass::Highway:
+                saw_highway = true;
+                quietest_highway = std::min(quietest_highway, edge.traffic);
+                break;
+            case RoadClass::None:
+                break;
+        }
+    }
+
+    // Classification is a pair of thresholds on one number, so the tiers cannot
+    // interleave. A regression that cut the tiers on anything else would.
+    if (saw_road) {
+        ASSERT_TRUE(quietest_road > busiest_trail);
+    }
+    if (saw_highway) {
+        ASSERT_TRUE(quietest_highway > busiest_road);
+    }
+}
+
+static void test_roads_bridge_only_where_they_meet_water() {
+    MapConfig config = road_config(55);
+    MapGenerator generator(config, maps_logger());
+    generator.generate();
+    const MapGraph& graph = generator.graph();
+
+    for (const MapEdge& edge : graph.edges) {
+        const bool over_water =
+            (edge.d0 != k_invalid_id && graph.centers[static_cast<std::size_t>(edge.d0)].water)
+            || (edge.d1 != k_invalid_id && graph.centers[static_cast<std::size_t>(edge.d1)].water);
+
+        if (edge.bridge) {
+            ASSERT_TRUE(edge.road);
+            ASSERT_TRUE(edge.river > 0 || over_water);
+        }
+        // And the converse: a road over water without a bridge would be a road
+        // running through the river, which is what makes this an equivalence
+        // rather than a one-way check.
+        if (edge.road && (edge.river > 0 || over_water)) {
+            ASSERT_TRUE(edge.bridge);
+        }
+    }
+}
+
+static void test_roads_keep_off_the_border_and_the_open_sea() {
+    MapConfig config = road_config(8);
+    MapGenerator generator(config, maps_logger());
+    generator.generate();
+    const MapGraph& graph = generator.graph();
+
+    for (const MapEdge& edge : graph.edges) {
+        if (!edge.road) {
+            continue;
+        }
+        // The forced-water band at the map edge is not somewhere a road goes.
+        ASSERT_TRUE(!graph.centers[static_cast<std::size_t>(edge.d0)].border);
+        ASSERT_TRUE(!graph.centers[static_cast<std::size_t>(edge.d1)].border);
+    }
+
+    // A causeway may hop a strait but not strike out across the ocean, so no
+    // run may hold a stretch of water longer than max_water_span.
+    for (const MapRoad& run : graph.roads) {
+        int water_run = 0;
+        for (const CenterId cell : run_cells(graph, run)) {
+            water_run = graph.centers[static_cast<std::size_t>(cell)].water ? water_run + 1 : 0;
+            ASSERT_TRUE(water_run <= config.roads.max_water_span);
+        }
+    }
+}
+
+static void test_road_runs_partition_the_flagged_edges() {
+    MapConfig config = road_config(313);
+    MapGenerator generator(config, maps_logger());
+    generator.generate();
+    const MapGraph& graph = generator.graph();
+
+    std::vector<int> times_traced(graph.edges.size(), 0);
+    for (const MapRoad& run : graph.roads) {
+        ASSERT_TRUE(!run.edges.empty());
+        ASSERT_TRUE(run.points.size() >= 2);
+        ASSERT_TRUE(run.road_class != RoadClass::None);
+
+        for (const EdgeId edge_id : run.edges) {
+            ASSERT_TRUE(edge_id >= 0 && static_cast<std::size_t>(edge_id) < graph.edges.size());
+            const MapEdge& edge = graph.edges[static_cast<std::size_t>(edge_id)];
+            // A run is a chain of one class, which is what lets the renderer
+            // stroke it as a single polyline at a single width.
+            ASSERT_TRUE(edge.road_class == run.road_class);
+            ++times_traced[static_cast<std::size_t>(edge_id)];
+        }
+        for (const MapPoint& point : run.points) {
+            ASSERT_TRUE(std::isfinite(point.x) && std::isfinite(point.y));
+            ASSERT_TRUE(point.x >= 0.0 && point.x <= static_cast<double>(config.grid_size));
+            ASSERT_TRUE(point.y >= 0.0 && point.y <= static_cast<double>(config.grid_size));
+        }
+    }
+
+    // Every road edge is traced into exactly one run: none dropped, none drawn
+    // twice. Drawn twice would darken a road where two runs overlapped.
+    for (const MapEdge& edge : graph.edges) {
+        ASSERT_EQ(times_traced[static_cast<std::size_t>(edge.index)], edge.road ? 1 : 0);
+    }
+}
+
+static void test_road_runs_are_smoothed_only_when_asked() {
+    MapConfig straight = road_config(21);
+    straight.roads.smoothing_iterations = 0;
+    MapGenerator plain(straight, maps_logger());
+    plain.generate();
+
+    // Unsmoothed, a run is exactly the cell sites it passes through.
+    bool saw_multi_edge_run = false;
+    for (const MapRoad& run : plain.graph().roads) {
+        ASSERT_EQ(run.points.size(), run.edges.size() + 1);
+        saw_multi_edge_run = saw_multi_edge_run || run.edges.size() > 1;
+    }
+    ASSERT_TRUE(saw_multi_edge_run);
+
+    MapConfig curved = road_config(21);
+    MapGenerator smoothed(curved, maps_logger());
+    smoothed.generate();
+
+    ASSERT_EQ(smoothed.graph().roads.size(), plain.graph().roads.size());
+    for (std::size_t i = 0; i < smoothed.graph().roads.size(); ++i) {
+        const MapRoad& a = plain.graph().roads[i];
+        const MapRoad& b = smoothed.graph().roads[i];
+        // Smoothing changes the drawn path and nothing else: the same edges, in
+        // the same order, with more points between them.
+        ASSERT_EQ(a.edges.size(), b.edges.size());
+        if (a.edges.size() > 1) {
+            ASSERT_TRUE(b.points.size() > a.points.size());
+        }
+        // The ends are pinned, so a run still meets the junction it was traced to.
+        ASSERT_TRUE(std::abs(a.points.front().x - b.points.front().x) < 1e-12);
+        ASSERT_TRUE(std::abs(a.points.back().y - b.points.back().y) < 1e-12);
+    }
+}
+
+
+// --- Legend ---------------------------------------------------------------
+
+/** @brief Formats a palette colour the way the README legend spells it. */
+static std::string hex_of(const glm::vec3& color) {
+    char buffer[8];
+    std::snprintf(buffer, sizeof(buffer), "#%02X%02X%02X",
+                  static_cast<int>(color.r), static_cast<int>(color.g),
+                  static_cast<int>(color.b));
+    return std::string(buffer);
+}
+
+/** @brief Reads a whole file, or returns an empty string if it will not open. */
+static std::string read_file(const std::string& path) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        return {};
+    }
+    return std::string(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+}
+
+/**
+ * @brief The README legend is documentation of a table in the code, and drifts from it.
+ *
+ * A legend is only useful if it is true, and nothing else would catch a palette
+ * entry changed in `map_config.h` without the README following -- the renders
+ * would simply stop matching their own key. So the legend is checked here
+ * rather than trusted: every biome row must name a real biome, quote its
+ * palette colour exactly, and point at a swatch whose fill is that same colour.
+ */
+static void test_readme_legend_matches_the_palette() {
+    const std::string root = ROOT_DIR;
+    const std::string readme = read_file(root + "/README.md");
+    ASSERT_TRUE(!readme.empty());
+
+    const BiomePalette palette;
+    int rows_checked = 0;
+
+    for (std::size_t i = 0; i < k_biome_count; ++i) {
+        const Biome biome = static_cast<Biome>(i);
+        const std::string slug(biome_name(biome));
+        const std::string hex = hex_of(palette.color_for(biome));
+
+        // The exact row the legend generator emits, swatch included. Matching the
+        // whole row at once is what ties the three columns together: a swatch
+        // pointing at the wrong biome, or a hex that disagrees with its own RGB,
+        // both fail here rather than passing three separate looser checks.
+        const glm::vec3& color = palette.color_for(biome);
+        const std::string row = "| ![](docs/legend/" + slug + ".svg) | ";
+        const std::string tail = " | `" + slug + "` | `" + hex + "` | "
+                               + std::to_string(static_cast<int>(color.r)) + ", "
+                               + std::to_string(static_cast<int>(color.g)) + ", "
+                               + std::to_string(static_cast<int>(color.b)) + " |";
+
+        const std::size_t at = readme.find(row);
+        ASSERT_TRUE(at != std::string::npos);
+        ASSERT_TRUE(readme.find(tail, at) != std::string::npos);
+        ASSERT_TRUE(readme.find(tail, at) < readme.find('\n', at));
+
+        // And the swatch itself is that colour, not merely a file of the right name.
+        const std::string swatch = read_file(root + "/docs/legend/" + slug + ".svg");
+        ASSERT_TRUE(!swatch.empty());
+        ASSERT_TRUE(swatch.find("fill=\"" + hex + "\"") != std::string::npos);
+        ++rows_checked;
+    }
+    ASSERT_EQ(static_cast<std::size_t>(rows_checked), k_biome_count);
+
+    // The overlay half of the legend, keyed by the swatch each row points at.
+    const std::pair<const char*, glm::vec3> overlays[] = {
+        {"river", palette.river_color},
+        {"road-casing", palette.road_casing_color},
+        {"trail", palette.trail_color},
+        {"road", palette.road_color},
+        {"highway", palette.highway_color},
+        {"building", palette.building_color},
+        {"settlement", palette.town_color},
+        {"landmark-natural", palette.landmark_natural_color},
+        {"landmark-built", palette.landmark_built_color},
+        {"background", palette.background_color},
+    };
+    for (const auto& overlay : overlays) {
+        const std::string hex = hex_of(overlay.second);
+        const std::string row = "| ![](docs/legend/" + std::string(overlay.first) + ".svg) |";
+        const std::size_t at = readme.find(row);
+        ASSERT_TRUE(at != std::string::npos);
+        ASSERT_TRUE(readme.find("`" + hex + "`", at) < readme.find('\n', at));
+
+        const std::string swatch = read_file(root + "/docs/legend/" + overlay.first + ".svg");
+        ASSERT_TRUE(!swatch.empty());
+        ASSERT_TRUE(swatch.find("fill=\"" + hex + "\"") != std::string::npos);
+    }
+
+    // The tint caveat is the one thing a reader can check against a render and
+    // find false, so it may not quietly disappear either.
+    ASSERT_TRUE(readme.find("untinted") != std::string::npos);
 }
 
 } // namespace maps_test
@@ -1006,6 +1454,15 @@ int main() {
     RUN_TEST(maps_test::test_yaml_round_trip_preserves_the_graph);
     RUN_TEST(maps_test::test_yaml_round_trip_renders_identically);
     RUN_TEST(maps_test::test_disabled_passes_leave_the_graph_untouched);
+    RUN_TEST(maps_test::test_biome_habitability_ranks_the_land);
+    RUN_TEST(maps_test::test_road_class_names_round_trip);
+    RUN_TEST(maps_test::test_roads_form_one_network_reaching_the_towns);
+    RUN_TEST(maps_test::test_road_class_follows_traffic);
+    RUN_TEST(maps_test::test_roads_bridge_only_where_they_meet_water);
+    RUN_TEST(maps_test::test_roads_keep_off_the_border_and_the_open_sea);
+    RUN_TEST(maps_test::test_road_runs_partition_the_flagged_edges);
+    RUN_TEST(maps_test::test_road_runs_are_smoothed_only_when_asked);
+    RUN_TEST(maps_test::test_readme_legend_matches_the_palette);
 
     std::cout << "===========================================" << std::endl;
     std::cout << "Test Summary: " << g_tests_run - g_tests_failed << " / " << g_tests_run << " Passed." << std::endl;

@@ -1,8 +1,9 @@
 # Maps Module (`coopa::maps`)
 
 The `maps` module generates whole world maps from a seed: Voronoi cells carrying an
-elevation, a climate and a biome, threaded with rivers that run downhill to the sea and
-roads that follow the contours; nations divided into provinces whose borders settle on
+elevation, a climate and a biome, threaded with rivers that run downhill to the sea and a
+road network routed between the places worth travelling between, graded by the traffic
+each stretch carries; nations divided into provinces whose borders settle on
 ridgelines and coasts; settlements placed where people would actually live, each with a
 population counted from its buildings and a name in its region's own invented language;
 and landmarks read off the terrain itself. It is a port of Amit Patel's *Polygonal Map Generation*
@@ -40,18 +41,21 @@ coastline.
    └──────┬───────────────────────────────────────┘
           │ builds, then annotates in place
           ▼
-   ┌──────────────────────────────────────────────┐        ┌───────────────────┐
-   │                 MapGraph                      │        │      passes/       │
-   │                                               │◄───────│                    │
-   │  centers[]  Voronoi cells  (biome, elevation) │        │ 1 water            │
-   │  corners[]  Voronoi verts  (rivers, downslope)│        │ 2 coast            │
-   │  edges[]    Delaunay + Voronoi edge, shared   │        │ 3 elevation        │
-   │  towns[]    settlements + packed buildings    │        │ 4 rivers           │
-   │                                               │        │ 5 moisture         │
-   │  all adjacency by index, never by pointer     │        │ 6 biomes           │
-   └──────┬───────────────────────────┬───────────┘        │ 7 roads            │
-          │                            │                    │ 8 towns            │
-          ▼                            ▼                    │ 9 noisy edges      │
+   ┌───────────────────────────────────────────────┐        ┌───────────────────┐
+   │                 MapGraph                       │        │      passes/       │
+   │                                                │◄───────│                    │
+   │  centers[]  Voronoi cells  (biome, elevation)  │        │  1 water           │
+   │  corners[]  Voronoi verts  (rivers, downslope) │        │  2 coast           │
+   │  edges[]    Delaunay + Voronoi edge, shared    │        │  3 elevation       │
+   │  roads[]    routed runs, graded by traffic     │        │  4 temperature     │
+   │  towns[]    settlements + packed buildings     │        │  5 rivers          │
+   │  regions[]  provinces, countries[] nations     │        │  6 moisture        │
+   │  landmarks[] notable places                    │        │  7 biomes          │
+   │                                                │        │  8 roads           │
+   │  all adjacency by index, never by pointer      │        │  9 regions         │
+   └──────┬───────────────────────────┬────────────┘        │ 10 towns           │
+          │                            │                     │ 11 landmarks       │
+          ▼                            ▼                     │ 12 noisy edges     │
    ┌─────────────────┐        ┌─────────────────┐           └───────────────────┘
    │  map_renderer.h  │        │   map_yaml.h     │
    │  BiomeRenderer   │        │  save_map()      │
@@ -138,8 +142,10 @@ its strokes overlap.
 is pulled in with `STB_IMAGE_WRITE_STATIC`.
 
 ### [`map_renderer.h`](./map_renderer.h)
-`BiomeRenderer` (coloured terrain tinted by region, then rivers, roads, settlements and
-landmark markers) and
+`BiomeRenderer` (coloured terrain tinted by region, then rivers, then the road network —
+every casing first and every fill after, so a junction is not nicked by whichever road was
+drawn later — then bridge parapets, settlements and landmark markers; the colour and hex
+legend is in the [repository README](../../README.md#legend)) and
 `ElevationRenderer` (greyscale heightmap, with rivers dimming the terrain beneath them by
 a fixed amount — stencilled, so a confluence is no darker than the reaches feeding it).
 Both are debugging aids: a consumer wanting a smooth heightfield should sample

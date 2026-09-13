@@ -41,10 +41,12 @@ void print_usage() {
         << "  --image-size=N   render size in pixels, square (default 2048)\n"
         << "  --rivers=N       river sources to attempt (default 55)\n"
         << "  --towns=N        settlements to place (default 28)\n"
+        << "  --road-hubs=N    places the road network is routed between (default 32)\n"
         << "  --countries=N    nations to carve out (default 5)\n"
         << "  --regions=N      provinces per nation (default 3)\n"
         << "  --no-regions     skip political geography entirely\n"
         << "  --no-landmarks   skip notable places\n"
+        << "  --no-roads       skip the road network\n"
         << "  --no-subdivide   draw straight cell boundaries instead of wobbled ones\n"
         << "  --out=PATH       output prefix (default \"map_out\")\n"
         << "  --help           show this message\n"
@@ -106,6 +108,8 @@ int main(int argc, char** argv) {
             config.show_regions = false;
         } else if (argument == "--no-landmarks") {
             config.enable_landmarks = false;
+        } else if (argument == "--no-roads") {
+            config.enable_roads = false;
         } else if (match_option(argument, "seed", value)) {
             config.seed = std::atoi(std::string(value).c_str());
             seed_given = true;
@@ -117,6 +121,8 @@ int main(int argc, char** argv) {
             config.river_count = std::atoi(std::string(value).c_str());
         } else if (match_option(argument, "towns", value)) {
             config.towns.town_count = std::atoi(std::string(value).c_str());
+        } else if (match_option(argument, "road-hubs", value)) {
+            config.roads.hub_count = std::atoi(std::string(value).c_str());
         } else if (match_option(argument, "countries", value)) {
             config.regions.country_count = std::atoi(std::string(value).c_str());
         } else if (match_option(argument, "regions", value)) {

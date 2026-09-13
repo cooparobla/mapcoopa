@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <vector>
 
@@ -24,10 +25,18 @@ namespace maps {
  * @class BiomeRenderer
  * @brief Draws the map as coloured terrain, with rivers, roads and settlements.
  *
- * Cells are filled first, then rivers over them, then roads, then towns, so
- * each layer covers the one below. Rivers follow the Voronoi edge between two
- * corners, roads follow the Delaunay edge between two cell sites -- the same
- * `MapEdge` read two different ways.
+ * Cells are filled first, then rivers over them, then the road network, then
+ * towns, so each layer covers the one below. Rivers follow the Voronoi edge
+ * between two corners, roads follow the Delaunay edge between two cell sites --
+ * the same `MapEdge` read two different ways, which is also why a bridge needs
+ * no geometry of its own.
+ *
+ * Roads are stroked from `MapGraph::roads`, each run twice: a dark casing, then
+ * the class colour one pixel narrower on top. The casing is what separates a
+ * road from the ground it crosses -- without it a trail over dark forest
+ * vanishes and a highway over pale desert is a smudge -- and the warm earth
+ * colours are what stop a road reading as an administrative border, which is
+ * what the old flat-black uniform stroke did.
  */
 class BiomeRenderer {
 public:
@@ -83,16 +92,56 @@ public:
                       palette.river_color);
         }
 
-        for (const MapEdge& edge : graph.edges) {
-            if (!edge.road || edge.d0 == k_invalid_id || edge.d1 == k_invalid_id) {
-                continue;
+        // Every casing first, then every fill, rather than casing-and-fill per
+        // run: drawn run by run, the dark casing of whichever road happens to
+        // come later cuts a notch straight across the one already there, and
+        // every junction in the network ends up nicked. Within each phase the
+        // order is least to most travelled, so a highway is never interrupted
+        // by the trail that joins it.
+        static constexpr std::array<RoadClass, 3> k_road_order = {
+            RoadClass::Trail, RoadClass::Road, RoadClass::Highway};
+
+        for (int phase = 0; phase < 2; ++phase) {
+            const bool casing = phase == 0;
+            for (const RoadClass road_class : k_road_order) {
+                const int half_width =
+                    half_width_pixels_(road_width_for(config, road_class), scale)
+                    + (casing ? 1 : 0);
+                const glm::vec3& color =
+                    casing ? palette.road_casing_color : palette.color_for(road_class);
+
+                if (graph.roads.empty()) {
+                    // A map loaded from a document written before roads were
+                    // traced into runs still has its per-edge flags. Stroke
+                    // those straight rather than drawing nothing.
+                    for (const MapEdge& edge : graph.edges) {
+                        if (edge.road_class != road_class || edge.d0 == k_invalid_id
+                            || edge.d1 == k_invalid_id) {
+                            continue;
+                        }
+                        draw_segment_(image, graph.centers[static_cast<std::size_t>(edge.d0)].point,
+                                      graph.centers[static_cast<std::size_t>(edge.d1)].point,
+                                      scale, half_width, color);
+                    }
+                    continue;
+                }
+
+                for (const MapRoad& run : graph.roads) {
+                    if (run.road_class != road_class) {
+                        continue;
+                    }
+                    for (std::size_t i = 0; i + 1 < run.points.size(); ++i) {
+                        draw_segment_(image, run.points[i], run.points[i + 1], scale, half_width,
+                                      color);
+                    }
+                }
             }
-            const MapPoint& d0 = graph.centers[static_cast<std::size_t>(edge.d0)].point;
-            const MapPoint& d1 = graph.centers[static_cast<std::size_t>(edge.d1)].point;
-            draw_line(image,
-                      static_cast<int>(d0.x * scale), static_cast<int>(d0.y * scale),
-                      static_cast<int>(d1.x * scale), static_cast<int>(d1.y * scale),
-                      half_width_pixels_(config.road_width, scale), palette.road_color);
+        }
+
+        for (const MapEdge& edge : graph.edges) {
+            if (edge.bridge) {
+                draw_bridge_(image, graph, edge, config, scale, palette);
+            }
         }
 
         for (const MapTown& town : graph.towns) {
@@ -127,6 +176,53 @@ private:
     static int half_width_pixels_(double width_grid, double scale) {
         return std::max(1, static_cast<int>(width_grid * scale * 0.5));
     }
+
+    /** @brief Strokes one grid-space segment, converting to pixels on the way. */
+    static void draw_segment_(Image& image, const MapPoint& from, const MapPoint& to, double scale,
+                              int half_width, const glm::vec3& color) {
+        draw_line(image,
+                  static_cast<int>(from.x * scale), static_cast<int>(from.y * scale),
+                  static_cast<int>(to.x * scale), static_cast<int>(to.y * scale),
+                  half_width, color);
+    }
+
+    /**
+     * @brief Draws the parapet of a bridge or causeway, across the road.
+     *
+     * Placed at the midpoint of the Delaunay edge, which is exactly where the
+     * road crosses the water: the dual Voronoi edge the river runs along lies on
+     * the perpendicular bisector of `d0`-`d1`, so it meets the road there and
+     * nowhere else. The tick runs along that bisector -- square across the
+     * road -- so a crossing reads as a crossing at a glance, the same way
+     * `draw_landmark_()` shapes a marker to its kind.
+     */
+    static void draw_bridge_(Image& image, const MapGraph& graph, const MapEdge& edge,
+                             const MapConfig& config, double scale, const BiomePalette& palette) {
+        if (edge.d0 == k_invalid_id || edge.d1 == k_invalid_id) {
+            return;
+        }
+        const MapPoint& d0 = graph.centers[static_cast<std::size_t>(edge.d0)].point;
+        const MapPoint& d1 = graph.centers[static_cast<std::size_t>(edge.d1)].point;
+
+        const double dx = d1.x - d0.x;
+        const double dy = d1.y - d0.y;
+        const double length = std::hypot(dx, dy);
+        if (length == 0.0) {
+            return;
+        }
+        const double reach = road_width_for(config, edge.road_class) * k_bridge_span;
+        const double offset_x = -dy / length * reach;
+        const double offset_y = dx / length * reach;
+        const MapPoint crossing{(d0.x + d1.x) * 0.5, (d0.y + d1.y) * 0.5};
+
+        draw_segment_(image, {crossing.x + offset_x, crossing.y + offset_y},
+                      {crossing.x - offset_x, crossing.y - offset_y}, scale,
+                      half_width_pixels_(road_width_for(config, edge.road_class) * 0.5, scale),
+                      palette.road_casing_color);
+    }
+
+    /** @brief How far a bridge parapet reaches either side of the road, in road widths. */
+    static constexpr double k_bridge_span = 1.1;
 
     /** @brief Marker half-width in pixels for each settlement size class. */
     static int marker_radius_(TownTier tier) {
