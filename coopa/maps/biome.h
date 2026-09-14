@@ -70,10 +70,16 @@ enum class Biome {
 /** @brief Number of distinct `Biome` values; the size of any biome-indexed table. */
 inline constexpr std::size_t k_biome_count = 33;
 
-/** @brief Elevation above which a water cell freezes into `Biome::Ice`. */
-inline constexpr double k_biome_ice_elevation = 0.8;
-/** @brief Elevation below which a water cell is shallow enough to be `Biome::Marsh`. */
-inline constexpr double k_biome_marsh_elevation = 0.1;
+/**
+ * @brief Elevation below which land is basin floor: wetland if wet, salt flat if dry.
+ *
+ * A fraction of the *land* range rather than an absolute height -- `PassBiomes`
+ * passes `land_height()`, so 0.12 is the lowest eighth of the ground above the
+ * waterline, wherever the waterline happens to sit.
+ */
+inline constexpr double k_biome_basin_elevation = 0.12;
+/** @brief Moisture above which basin floor is waterlogged rather than merely low. */
+inline constexpr double k_biome_wetland_moisture = 0.7;
 /** @brief Temperature below which the land is permanently frozen. */
 inline constexpr double k_biome_frigid = 0.2;
 /** @brief Temperature below which the land is boreal. */
@@ -223,8 +229,8 @@ inline double biome_habitability(Biome biome) {
  * @brief Classifies a cell from its terrain state and climate.
  *
  * Water state wins over climate: an ocean cell is `Ocean` at any latitude, an
- * inland water cell is `Marsh`, `Ice` or `Lake`, and a land cell touching the
- * ocean is a shore. Only the remaining interior land consults the climate
+ * inland water cell is `Ice` or `Lake` and never anything else, and a land cell
+ * touching the ocean is a shore. Only the remaining interior land consults the climate
  * diagram.
  *
  * That diagram is three-dimensional -- temperature, then elevation, then
@@ -251,18 +257,38 @@ inline Biome classify_biome(double elevation, double moisture, double temperatur
         return Biome::Ocean;
     }
     if (is_water) {
-        if (temperature < k_biome_frigid) return Biome::Ice;
-        if (elevation < k_biome_marsh_elevation) {
-            return temperature > k_biome_tropical ? Biome::Swamp : Biome::Marsh;
-        }
-        if (elevation > k_biome_ice_elevation) return Biome::Ice;
-        return Biome::Lake;
+        // Every water cell gets a water biome, without exception. A cell with a
+        // `water_level` is a body of water and has to *read* as one: this used to
+        // hand a shallow lake `Marsh` or `Swamp`, which are dark greens, so on the
+        // biome and composite layers 18% of rivers ended in what looked like
+        // forest. Ending in a lake you cannot see is indistinguishable from ending
+        // nowhere, and "a river ends in water" is worth nothing if the map
+        // disagrees. `Marsh` and `Swamp` are now what the words mean -- wet
+        // *ground*, classified below.
+        //
+        // Freezing is on temperature alone. The elevation test that used to sit
+        // here double-counted altitude, because `PassTemperature` already applies
+        // an altitude lapse rate -- a high lake was frozen twice over and a cold
+        // low one not at all. A tarn in a temperate zone is a lake.
+        return temperature < k_biome_frigid ? Biome::Ice : Biome::Lake;
     }
     if (is_coast) {
         // A warm, wet shore grows mangrove; a cold one is bare shingle.
         if (temperature > k_biome_tropical && moisture > 0.6) return Biome::Mangrove;
         if (temperature < k_biome_frigid) return Biome::Tundra;
         return Biome::Beach;
+    }
+
+    // --- Wetland: waterlogged basin floor ---
+    // Ahead of the climate bands because being under water most of the year
+    // decides a biome more than latitude does. Moisture is seeded from lakes and
+    // rivers, so this lands where it should: the low, wet ground beside water.
+    // Frigid is excluded -- below freezing a basin is permafrost, not marsh, and
+    // the frigid band below already answers for it.
+    if (temperature >= k_biome_frigid && elevation < k_biome_basin_elevation
+        && moisture > k_biome_wetland_moisture) {
+        if (temperature < k_biome_cold) return Biome::BorealWetland;
+        return temperature > k_biome_tropical ? Biome::Swamp : Biome::Marsh;
     }
 
     // --- Frigid: ice caps, glaciers and cold desert ---
@@ -321,7 +347,7 @@ inline Biome classify_biome(double elevation, double moisture, double temperatur
     if (moisture > 0.5) return Biome::TropicalSeasonalForest;
     if (moisture > 0.3) return Biome::Savanna;
     if (moisture > 0.12) return Biome::SubtropicalDesert;
-    return elevation < k_biome_marsh_elevation ? Biome::SaltFlat : Biome::Dunes;
+    return elevation < k_biome_basin_elevation ? Biome::SaltFlat : Biome::Dunes;
 }
 
 } // namespace maps

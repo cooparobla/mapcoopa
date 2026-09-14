@@ -44,7 +44,7 @@ coastline.
    ┌───────────────────────────────────────────────┐        ┌───────────────────┐
    │                 MapGraph                       │        │      passes/       │
    │                                                │◄───────│                    │
-   │  centers[]  Voronoi cells  (biome, elevation)  │        │  1 water           │
+   │  centers[]  cells (biome, elevation, water)    │        │  1 water           │
    │  corners[]  Voronoi verts  (rivers, downslope) │        │  2 coast           │
    │  edges[]    Delaunay + Voronoi edge, shared    │        │  3 elevation       │
    │  roads[]    routed runs, graded by traffic     │        │  4 temperature     │
@@ -137,8 +137,8 @@ The nine annotation stages, one header each. See [`passes/README.md`](./passes/R
 `Image` (an 8-bit interleaved buffer, not a texture — mapcoopa carries no graphics
 dependency) plus half-space triangle fill, convex polygon fan fill and Bresenham strokes.
 ### [`map_renderer.h`](./map_renderer.h)
-`MapLayers` renders any of seven views of a map — elevation, water surface, biomes, roads,
-structures, landmarks, and a hillshaded composite of all of them. The three overlay layers
+`MapLayers` renders any of eight views of a map — elevation, water surface, biomes, roads,
+structures, landmarks, regions, and a lit composite of all of them. The three overlay layers
 are RGBA on transparency so they stack; the rest are RGB. Every layer is drawn at the same
 scale, so at the default one pixel per metre a width measured off a render is a
 measurement of the ground. See the [repository README](../../README.md#layers) for the file
@@ -159,6 +159,30 @@ ruin a *gradient* taken from that function are harmless to its *value*.
 
 All of it is a debugging aid: a consumer wanting a smooth heightfield should sample
 `MapGraph::elevation_at()` rather than re-derive it from a lossy 8-bit image.
+
+`elevation_at()` interpolates barycentrically over the Delaunay triangle containing the
+sample, blending the three cell-site heights at its vertices — the natural piecewise-linear
+surface through samples taken at the sites. It reached that via two worse interpolations:
+inverse-distance weighting over a cell's corners, which read as a plateau, and barycentric
+over the cell's own corner fan, which creased six times per cell, put a tent pole at every
+site, and left 1.78% of drawn pixels outside every triangle because the fan covers the
+straight corner polygon while the renderer draws the subdivided one. An overload
+takes a `TerrainDetail` — a borrowed `Noise` plus an amplitude, built by
+`make_terrain_detail()` — and displaces the result, tapered by the local height so a
+coastline stays at sea level. The detail deliberately lives in the sampler and not in the
+graph: cells and corners stay the smooth control field that biomes, rivers and roads are
+classified from.
+
+`MapCenter::water_level` is the *surface* of whatever water covers a cell, flat per body,
+as against `elevation` which is the height of the ground underneath. That distinction is
+the whole reason the water layer can draw a sheet: drawing `elevation` drew the sea bed.
+
+`MapConfig::sea_level` is a real height partway up the field, not zero, so the sea bed sits
+below it and land above — which is what makes "under water" a comparison rather than a
+tautology, and what makes the sea's surface visible on the same greyscale as the ground.
+Land therefore spans `[sea_level, 1]`, and any threshold describing land goes through
+`land_height()`. `elevation_range_m` gives the field a vertical scale in metres, so depths
+and overhangs can be stated physically like every horizontal size already could.
 
 ### [`map_task.h`](./map_task.h)
 `MapTask` — the token an asynchronous generation or export is observed through:

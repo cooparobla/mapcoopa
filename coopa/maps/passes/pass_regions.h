@@ -358,13 +358,28 @@ private:
         const float t = v * (1.0f - saturation * (1.0f - fraction));
 
         switch (sector % 6) {
-            case 0: return glm::vec3(v, t, p);
-            case 1: return glm::vec3(q, v, p);
-            case 2: return glm::vec3(p, v, t);
-            case 3: return glm::vec3(p, q, v);
-            case 4: return glm::vec3(t, p, v);
-            default: return glm::vec3(v, p, q);
+            case 0: return whole_(v, t, p);
+            case 1: return whole_(q, v, p);
+            case 2: return whole_(p, v, t);
+            case 3: return whole_(p, q, v);
+            case 4: return whole_(t, p, v);
+            default: return whole_(v, p, q);
         }
+    }
+
+    /**
+     * @brief Rounds a colour to whole 0-255 components.
+     *
+     * Because these colours are *written to disk*. Every other colour in the
+     * library is an integer triple, but a hue-wheel conversion lands on values
+     * like 231.478, and the YAML keeps six significant digits -- so a region
+     * reloaded from a saved map came back a step off, and the regions layer
+     * rendered a pixel different across every province it filled. Rounding here
+     * makes the colours exactly representable rather than making the round-trip
+     * test tolerate the loss.
+     */
+    static glm::vec3 whole_(float r, float g, float b) {
+        return glm::vec3(std::round(r), std::round(g), std::round(b));
     }
 
     /** @brief One language per country, kept between the build and subdivide steps. */

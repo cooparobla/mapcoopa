@@ -33,8 +33,31 @@
 
 meters_per_grid_unit: 60    # side length of one grid cell on the ground. A cell holds a
                             # cluster of ten or so buildings, which is what a village is.
-meters_per_pixel: 1         # ground covered by one rendered pixel
-# image_size: DERIVED from the two above, not set here.
+elevation_range_m: 600      # metres of height the normalised [0,1] elevation field spans —
+                            # the VERTICAL scale, which the world had none of: a grid unit
+                            # had a size across the ground while height stayed a bare
+                            # fraction, so "a river one metre deep" had nowhere to land.
+                            # Sea floor at 0 m, waterline at sea_level * this, peak at this.
+                            # 600 m over 4.8 km is hilly without being alpine.
+meters_per_pixel: 1         # ground covered by one rendered pixel. ALWAYS 1 by default: a
+                            # PNG is then a literal one-pixel-per-metre map, so a pixel
+                            # count read off a render IS a measurement — a 6 m road is
+                            # 6 px wide because it is 6 m wide. Every size in this file is
+                            # in metres on that understanding. Raise it to render the same
+                            # world smaller and faster.
+
+# image_size: 4800          # side length in pixels of every PNG. The same knob from the
+                            # other end, and interchangeable with meters_per_pixel: set
+                            # EITHER and the other is computed from it, so the two can
+                            # never disagree about how much ground a pixel covers. Left
+                            # commented because meters_per_pixel: 1 above already yields
+                            # 4800 px here (80 cells × 60 m ÷ 1 m); uncomment it when you
+                            # want a fixed resolution instead of a fixed scale.
+                            #
+                            # image_size WINS if you set both. --image-size overrides
+                            # either. Worth knowing which you mean: at a fixed image_size,
+                            # changing grid_size or meters_per_grid_unit re-scales the
+                            # pixels; at a fixed meters_per_pixel it re-sizes the PNG.
 
 # --- Sampling ---------------------------------------------------------------
 
@@ -91,6 +114,29 @@ noise_island:             # the field the water pass thresholds to decide land f
   gain: 0.5               # amplitude multiplier between successive octaves
   weighted_strength: 0.45
 
+noise_relief:             # the large-scale field terrain_relief shapes the highlands with
+  seed: 7717
+  frequency: 0.055        # low, because this makes massifs — a feature spans many cells
+  type: 0
+  fractal_type: 1
+  octaves: 5
+  lacunarity: 2.0
+  gain: 0.5
+  weighted_strength: 0.45
+
+noise_terrain:            # the detail field terrain_roughness displaces the surface with
+  # seed: settable here, unlike the two below — this field is texture, not landform,
+  #       so it is not tied to the master seed.
+  seed: 4919
+  frequency: 0.35         # deliberately finer than the fields below: cells are 60 m across,
+                          # so detail has to be smaller than that to read as detail
+  type: 0
+  fractal_type: 1
+  octaves: 5
+  lacunarity: 2.0
+  gain: 0.5
+  weighted_strength: 0.45
+
 noise_temperature:        # the variation that keeps isotherms from running straight
   # seed: NOT settable. Always derived from the master seed (master + 1).
   frequency: 0.035
@@ -101,6 +147,25 @@ noise_temperature:        # the variation that keeps isotherms from running stra
   gain: 0.5
   weighted_strength: 0.45
 
+# --- Landmass shape ---------------------------------------------------------
+#
+# The outline land may occupy. The CANVAS is always grid_size square; the shape is
+# inscribed in it and centred, and whatever margin is left over becomes open sea. So a
+# smaller shape means a smaller world on the same size of map, not a smaller image.
+#
+# Every dimension defaults to 0, meaning "fill the canvas" — which makes the default a
+# canvas-spanning rectangle, exactly what the generator did before shapes existed.
+# --shape, --shape-size, --shape-height and --shape-rot override for one run.
+
+shape:
+  shape: rectangle        # rectangle | circle | triangle
+  width_m: 0              # rectangle
+  height_m: 0
+  diameter_m: 4600           # circle
+  edge_length_m: 4500        # equilateral triangle, apex up before rotation
+  rotation: 45.0           # radians about the centre; only the triangle is not symmetric
+                          # enough for this to show
+
 # --- Terrain ----------------------------------------------------------------
 
 threshold_water: 0.3          # noise value above which a corner is water
@@ -109,6 +174,40 @@ elevation_smoothing_iterations: 6   # Laplacian relaxation passes over the heigh
                                     # Distance-from-coast elevation is terraced; without
                                     # these it reads as facets rather than terrain.
 elevation_smoothing_strength: 0.5   # how far toward the neighbour mean each pass moves
+sea_level: 0.25               # THE WATERLINE, in the normalised [0,1] height field, and a
+                              # real height rather than a convention. The sea bed occupies
+                              # everything below it and land everything above, so "this
+                              # ground is under water" is an honest comparison — it was a
+                              # vacuous one when the whole field started at zero and the sea
+                              # was pinned to the bottom of it. Two consequences: the
+                              # elevation layer carries genuine bathymetry, and the sea's
+                              # surface is a visible mid-grey on the same scale as
+                              # everything else rather than the black that made it
+                              # indistinguishable from dry land.
+                              # Land therefore spans [sea_level, 1], and every threshold
+                              # that describes LAND — biome rows, town elevation penalty,
+                              # peak and canyon heights — is taken land-relative so moving
+                              # this does not silently shift them.
+terrain_relief: 0.65          # how much fractal relief reshapes the height field, 0 to 1.
+                              # Height is breadth-first DISTANCE FROM THE COAST, which models
+                              # how high land gets well and where badly: the maximum of a
+                              # distance field is its medial axis, so on its own it puts every
+                              # summit on a thin ridge equidistant between the bays either
+                              # side — bright closed loops around dark basins, which reads as
+                              # foam, not terrain. This blends toward noise instead, so the
+                              # interior becomes massifs and valleys. A coastal mask keeps the
+                              # shore the lowest land there is, and land is lifted clear of
+                              # water, so rivers still run off the land into the sea.
+                              # 0 restores the pure distance field. --relief=F overrides.
+terrain_roughness: 0.0        # how strongly the detail field displaces the SAMPLED surface,
+                              # 0 to 1. Zero leaves it exactly as the passes computed it.
+                              # Raising it adds jaggedness without touching cell or corner
+                              # heights, so biomes, rivers and roads still classify on the
+                              # smooth control field — only the surface roughens. Scaled by
+                              # local height, so coastlines stay at sea level however high.
+                              # Pair with elevation_smoothing_iterations: that sets how
+                              # smooth the landform is, this how rough the skin over it is.
+                              # --roughness=F overrides for one run.
 temperature_lapse_rate: 0.40  # how much a full unit of elevation cools the air; what puts
                               # snow on equatorial peaks
 temperature_falloff: 1.7      # shapes the pole-to-equator curve. A straight ramp (1.0)
@@ -130,6 +229,15 @@ river_smoothing_iterations: 2 # Chaikin corner-cutting passes per watercourse. R
                               # downslope chain itself and survives intact.
 river_width_base_m: 5         # width of a volume-zero stream, in metres
 river_width_per_volume_m: 2   # additional width per unit of river volume, in metres
+river_depth_m: 1.0            # how far a river's surface sits ABOVE the ground it runs over.
+river_depth_per_volume_m: 0.35 # A river is water standing in a channel, not a line painted
+                              # on the terrain — without this a mesh built from the ground
+                              # and the water fights itself along every watercourse.
+water_edge_overlap_m: 1.0     # how far every water surface is extended past its own edge,
+                              # so it clips INTO the terrain rather than meeting it exactly.
+                              # Two surfaces sharing an edge exactly show a seam wherever the
+                              # meshes disagree by a rounding error, and along a coastline
+                              # they always do.
 
 # --- Roads ------------------------------------------------------------------
 

@@ -13,11 +13,13 @@
 #include <limits>
 #include <numeric>
 #include <queue>
+#include <utility>
 #include <vector>
 
 #include <coopa/debug/logger.h>
 #include <coopa/maps/map_config.h>
 #include <coopa/maps/map_data.h>
+#include <coopa/maps/noise.h>
 
 namespace coopa {
 namespace maps {
@@ -45,10 +47,17 @@ public:
         logger.info("map pass: elevation");
 
         assign_corner_elevations_(graph);
-        redistribute_elevations_(graph);
+        // Between the two on purpose: the distance field decides the ordering of
+        // heights and the redistribution only reshapes their histogram, so this
+        // is the one place a change can move where the mountains are.
+        apply_relief_(graph, config);
+        redistribute_elevations_(graph, config);
         // Before downslopes, not after: the flow direction has to be derived from
         // the field rivers will actually run on, or they carve uphill.
         smooth_elevations_(graph, config);
+        // Strictly before downslopes: filling is what makes a downhill walk from
+        // any land corner actually arrive somewhere wet.
+        fill_depressions_(graph);
         assign_downslopes_(graph);
         assign_center_elevations_(graph);
         // Cells carry the mean of their corners, and a cell with few corners can
@@ -56,13 +65,32 @@ public:
         // smooth. Relaxing the cell field too is what the renderer and the biome
         // classifier actually read.
         smooth_center_elevations_(graph, config);
+        // Last, because it reads the finished heights. It cannot live in
+        // PassWater, which is where sea and lake are told apart -- that pass runs
+        // first and has no elevations to level anything against yet.
+        assign_water_levels_(graph, config);
     }
 
 private:
+    /**
+     * @brief Height added per step when `fill_depressions_` raises a pit.
+     *
+     * Small enough to be invisible, large enough that `double` comparison sees
+     * it as a real difference over a chain of a few hundred corners.
+     */
+    static constexpr double k_fill_epsilon = 1e-7;
+
     /** @brief Cost of a step between two corners, before the land surcharge. */
     static constexpr double k_step_cost = 0.01;
     /** @brief Extra cost charged when both ends of a step are dry land. */
     static constexpr double k_land_step_cost = 1.0;
+    /**
+     * @brief Fraction of the distance range the relief noise fades in over.
+     *
+     * Narrow, so only the immediate shore is held down and the interior is free
+     * to be shaped by noise. Widen it and the coastal plain grows.
+     */
+    static constexpr double k_coast_band = 0.12;
     /**
      * @brief Shapes the height histogram.
      *
@@ -105,31 +133,146 @@ private:
     }
 
     /**
-     * @brief Remaps heights onto `sqrt(k) - sqrt(k * (1 - y))` by rank.
+     * @brief Reshapes the distance field with fractal noise, so peaks stop tracing a skeleton.
      *
-     * Ranks are computed over an index array rather than by sorting the corner
-     * storage: `MapGraph` guarantees `corners[i].index == i`, and every
-     * adjacency list in the graph is expressed in those indices, so reordering
-     * the array itself would silently corrupt the whole map.
+     * Distance from the coast models *how high* land tends to get well, and
+     * *where* badly: the maximum of a distance field is its medial axis, so on
+     * its own it puts every summit on a thin ridge running equidistant between
+     * the bays either side of a landmass. That reads as foam -- bright closed
+     * loops around dark basins -- and not as terrain.
+     *
+     * So the two are **blended, not multiplied**. Scaling the distance field by
+     * noise cannot fix it: distances span tens of units while a noise factor
+     * spans one, so the ordering stays the distance field's and the ridge
+     * survives however hard it is attenuated. Mixing toward noise replaces that
+     * ordering outright, and at `relief = 1` the interior is shaped by noise
+     * alone.
+     *
+     * Two things keep that from breaking everything downstream:
+     *
+     * - **A coastal mask.** The noise term is faded in over the first
+     *   `k_coast_band` of the distance range, so the shore stays the lowest land
+     *   there is and a coastline cannot be handed a summit.
+     * Land is kept clear of the sea by the split rank remap that follows, not
+     * here -- see `redistribute_elevations_()`.
+     *
+     * Skipped entirely at zero, so `terrain_relief = 0` is bit-for-bit the pure
+     * distance field Amit Patel's original produced, offset and all.
+     *
+     * @param graph The graph to reshape; requires `assign_corner_elevations_()`.
+     * @param config Supplies the relief amount and its noise field.
      */
-    void redistribute_elevations_(MapGraph& graph) const {
-        const std::size_t count = graph.corners.size();
-        if (count < 2) {
+    void apply_relief_(MapGraph& graph, const MapConfig& config) const {
+        if (config.terrain_relief <= 0.0) {
+            return;
+        }
+        const double relief = std::clamp(config.terrain_relief, 0.0, 1.0);
+
+        double land_ceiling = 0.0;
+        for (const MapCorner& corner : graph.corners) {
+            if (corner.ocean || corner.border || !std::isfinite(corner.elevation)) {
+                continue;
+            }
+            land_ceiling = std::max(land_ceiling, corner.elevation);
+        }
+        if (land_ceiling <= 0.0) {
             return;
         }
 
-        std::vector<CornerId> order(count);
-        std::iota(order.begin(), order.end(), static_cast<CornerId>(0));
+        const Noise noise(config.noise_relief);
+        for (MapCorner& corner : graph.corners) {
+            if (corner.ocean || corner.border || !std::isfinite(corner.elevation)) {
+                continue;
+            }
+            const double distance = std::clamp(corner.elevation / land_ceiling, 0.0, 1.0);
+            // Noise arrives in [-1, 1].
+            const double unit = std::clamp(
+                0.5 * (static_cast<double>(noise.sample(corner.point.x, corner.point.y)) + 1.0),
+                0.0, 1.0);
+            const double coast_mask = std::min(1.0, distance / k_coast_band);
+
+            const double shaped = (1.0 - relief) * distance + relief * coast_mask * unit;
+            // No shore offset any more: the split rank remap that follows puts the
+            // sea below the waterline and everything else above it, so lifting
+            // land clear of water here would be doing that job twice.
+            corner.elevation = land_ceiling * shaped;
+        }
+    }
+
+    /**
+     * @brief Remaps heights by rank, into the sea below the waterline and land above it.
+     *
+     * Two separate remaps over one shared curve, because the sea bed and the land
+     * are two different things measured in the same units. Ranking them together
+     * -- which is what this did -- interleaved them: a corner far out to sea
+     * accumulates enough hundredths of a step to outrank a coastal one, so the
+     * sea had no consistent depth, the shoreline had no consistent height, and
+     * `elevation` under water meant nothing at all. That is what made the water
+     * layer render the open sea as a mottled field.
+     *
+     * Split, the sea occupies `[0, sea_level)` and everything else
+     * `[sea_level, 1]`. Depth becomes real bathymetry, the shoreline becomes a
+     * definite height, and "this ground is under water" becomes a comparison
+     * worth making.
+     *
+     * Lakes are ranked with the *land*, not the sea. A tarn sits at altitude; the
+     * only thing below sea level is the sea.
+     *
+     * Ranks are computed over an index array rather than by sorting the corner
+     * storage: `MapGraph` guarantees `corners[i].index == i`, and every adjacency
+     * list in the graph is expressed in those indices, so reordering the array
+     * itself would silently corrupt the whole map.
+     */
+    void redistribute_elevations_(MapGraph& graph, const MapConfig& config) const {
+        std::vector<CornerId> sea;
+        std::vector<CornerId> ground;
+        for (const MapCorner& corner : graph.corners) {
+            (corner.ocean ? sea : ground).push_back(corner.index);
+        }
+
+        const double waterline = std::clamp(config.sea_level, 0.0, 1.0);
+        remap_range_(graph, sea, 0.0, waterline);
+        remap_range_(graph, ground, waterline, 1.0);
+    }
+
+    /**
+     * @brief Rank-remaps one set of corners onto `[low, high]` through the height curve.
+     *
+     * The curve, `sqrt(k) - sqrt(k(1-y))`, places more of the set toward the
+     * bottom of its band, so land reads as broad plains under a few peaks and the
+     * sea shelves gently before it drops away.
+     *
+     * @param graph The graph whose corners to rewrite.
+     * @param order Corner ids to rank among themselves.
+     * @param low Height the lowest-ranked corner takes.
+     * @param high Height the highest-ranked corner takes.
+     */
+    void remap_range_(MapGraph& graph, std::vector<CornerId>& order, double low,
+                      double high) const {
+        if (order.empty()) {
+            return;
+        }
+        if (order.size() == 1) {
+            graph.corners[static_cast<std::size_t>(order.front())].elevation = low;
+            return;
+        }
+
         std::sort(order.begin(), order.end(), [&graph](CornerId a, CornerId b) {
-            return graph.corners[static_cast<std::size_t>(a)].elevation
-                 < graph.corners[static_cast<std::size_t>(b)].elevation;
+            const double ea = graph.corners[static_cast<std::size_t>(a)].elevation;
+            const double eb = graph.corners[static_cast<std::size_t>(b)].elevation;
+            if (ea != eb) {
+                return ea < eb;
+            }
+            return a < b; // Stable against ties, so a run is reproducible.
         });
 
-        for (std::size_t rank = 0; rank < count; ++rank) {
-            const double y = static_cast<double>(rank) / static_cast<double>(count - 1);
+        const double span = high - low;
+        const double last = static_cast<double>(order.size() - 1);
+        for (std::size_t rank = 0; rank < order.size(); ++rank) {
+            const double y = static_cast<double>(rank) / last;
             double x = std::sqrt(k_scale_factor) - std::sqrt(k_scale_factor * (1.0 - y));
-            if (x > 1.0) x = 1.0;
-            graph.corners[static_cast<std::size_t>(order[rank])].elevation = x;
+            x = std::clamp(x, 0.0, 1.0);
+            graph.corners[static_cast<std::size_t>(order[rank])].elevation = low + span * x;
         }
     }
 
@@ -156,30 +299,122 @@ private:
                 if (corner.border || corner.adjacent.empty()) {
                     continue;
                 }
+                // Averaged only with neighbours on the same side of the
+                // waterline. Relaxing across it drags the sea up onto the shore
+                // and the shore down under it, which is how land ended up ranked
+                // below water even after the split remap had separated them --
+                // and the shoreline is the one edge every other pass is derived
+                // from.
                 double sum = 0.0;
+                std::size_t counted = 0;
                 for (const CornerId neighbor_id : corner.adjacent) {
+                    if (graph.corners[static_cast<std::size_t>(neighbor_id)].ocean
+                        != corner.ocean) {
+                        continue;
+                    }
                     sum += previous[static_cast<std::size_t>(neighbor_id)];
+                    ++counted;
                 }
-                const double mean = sum / static_cast<double>(corner.adjacent.size());
-                corner.elevation = previous[static_cast<std::size_t>(corner.index)]
-                                 + strength * (mean - previous[static_cast<std::size_t>(corner.index)]);
+                if (counted == 0) {
+                    continue;
+                }
+                const double mean = sum / static_cast<double>(counted);
+                const double own = previous[static_cast<std::size_t>(corner.index)];
+                corner.elevation = own + strength * (mean - own);
             }
         }
     }
 
-    /** @brief Points each corner at its lowest neighbour, or at itself in a basin. */
+    /**
+     * @brief Points each corner at its lowest neighbour, or at itself in a basin.
+     *
+     * The comparison is strictly `<`, not `<=`. An equal-height neighbour is not
+     * downhill, and accepting one lets two corners at exactly the same elevation
+     * name each other as their downslope -- a two-cycle that a flow walk follows
+     * until it hits its step guard. After `fill_depressions_` no such tie exists
+     * along a flow path anyway, but the strict test is what makes "points at
+     * itself" mean "has nowhere lower to go" rather than "happens to have been
+     * scanned last".
+     */
     void assign_downslopes_(MapGraph& graph) const {
         for (MapCorner& corner : graph.corners) {
             CornerId lowest = corner.index;
             double lowest_elevation = corner.elevation;
             for (const CornerId neighbor_id : corner.adjacent) {
                 const MapCorner& neighbor = graph.corners[static_cast<std::size_t>(neighbor_id)];
-                if (neighbor.elevation <= lowest_elevation) {
+                if (neighbor.elevation < lowest_elevation) {
                     lowest = neighbor.index;
                     lowest_elevation = neighbor.elevation;
                 }
             }
             corner.downslope = lowest;
+        }
+    }
+
+    /**
+     * @brief Raises closed basins until every land corner drains to water.
+     *
+     * The distance-from-coast field is monotone, but nothing after it is: relief
+     * noise, the rank remap and the smoothing passes all move corners
+     * independently, and any of them can leave a corner lower than every
+     * neighbour. Such a corner is a pit, and a downhill walk that reaches one
+     * stops on dry land. On a default map 80 of 11 438 land corners were pits,
+     * which is why 23 of 55 rivers used to end in the middle of a field.
+     *
+     * This is the priority-flood fill (Barnes, Lehman & Mulla 2014), which is
+     * what DEM processing uses for the same problem. Every corner already at or
+     * on water seeds a min-heap; popping the lowest unresolved corner and
+     * raising each of its dry neighbours to just above it walks the terrain
+     * outward from the sea in ascending order of the height water would have to
+     * reach to get there. Each corner is therefore resolved *from* a strictly
+     * lower one, and following that chain backwards is a descending path to
+     * water. Since steepest descent from any corner also strictly descends, and
+     * only a seed can have no lower neighbour, every land corner now drains.
+     *
+     * The epsilon is what buys strictness rather than a flat spillway, and it is
+     * deliberately tiny: chains run a few hundred corners at most, so the total
+     * rise is on the order of 1e-4 of the height range -- well under a tenth of
+     * a millimetre at the default 600 m. Filling a pit is not a visible change
+     * to the terrain; it is the difference between a puddle and a river mouth.
+     *
+     * Lake corners seed the queue alongside the sea, so an inflow that reaches a
+     * lake has arrived and the lake bed is never filled in to force the water
+     * onward. That is also what keeps an endorheic basin a lake instead of a
+     * river running over its rim.
+     */
+    void fill_depressions_(MapGraph& graph) const {
+        if (graph.corners.empty()) {
+            return;
+        }
+
+        // (elevation, corner), so the heap orders on height and ties break on a
+        // stable index rather than on whatever the allocator handed back.
+        using Entry = std::pair<double, CornerId>;
+        std::priority_queue<Entry, std::vector<Entry>, std::greater<Entry>> pending;
+        std::vector<bool> resolved(graph.corners.size(), false);
+
+        for (const MapCorner& corner : graph.corners) {
+            if (!corner.water && !corner.coast) {
+                continue;
+            }
+            resolved[static_cast<std::size_t>(corner.index)] = true;
+            pending.emplace(corner.elevation, corner.index);
+        }
+
+        while (!pending.empty()) {
+            const Entry entry = pending.top();
+            pending.pop();
+            const MapCorner& corner = graph.corners[static_cast<std::size_t>(entry.second)];
+            for (const CornerId neighbor_id : corner.adjacent) {
+                const std::size_t index = static_cast<std::size_t>(neighbor_id);
+                if (resolved[index]) {
+                    continue;
+                }
+                MapCorner& neighbor = graph.corners[index];
+                neighbor.elevation = std::max(neighbor.elevation, entry.first + k_fill_epsilon);
+                resolved[index] = true;
+                pending.emplace(neighbor.elevation, neighbor.index);
+            }
         }
     }
 
@@ -220,6 +455,76 @@ private:
                 const double mean = sum / static_cast<double>(counted);
                 const double own = previous[static_cast<std::size_t>(center.index)];
                 center.elevation = own + strength * (mean - own);
+            }
+        }
+    }
+
+    /**
+     * @brief Gives every body of water one flat surface height.
+     *
+     * `elevation` is the height of the *ground*, which under water is the bed.
+     * `water_level` is the height of the *surface*, and a surface is flat --
+     * which a bed is not. Stating them separately is what lets a consumer flood a
+     * terrain mesh, and what lets the water layer draw a sheet instead of a
+     * mottled field.
+     *
+     * The sea takes `MapConfig::sea_level` everywhere, which after the split rank
+     * remap is exactly the height its bed rises to meet. Each lake is found by
+     * flooding the `water && !ocean` cells -- the same neighbour walk `PassWater`
+     * uses to tell a lake from the sea -- and the whole body takes the *highest*
+     * bed in it, so no part of a basin pokes up through its own surface.
+     *
+     * @param graph The graph to annotate; requires cell elevations to be final.
+     * @param config Supplies the waterline.
+     */
+    void assign_water_levels_(MapGraph& graph, const MapConfig& config) const {
+        std::vector<bool> visited(graph.centers.size(), false);
+
+        for (MapCenter& center : graph.centers) {
+            // Below the waterline the ground is sea bed whatever the water pass
+            // decided, so the sea's surface is the waterline there too. This is
+            // the comparison that only became meaningful once `sea_level` stopped
+            // being the bottom of the range.
+            center.water_level = (center.ocean || center.elevation < config.sea_level)
+                                     ? config.sea_level
+                                     : 0.0;
+        }
+
+        for (MapCenter& seed : graph.centers) {
+            const std::size_t seed_index = static_cast<std::size_t>(seed.index);
+            if (!seed.water || seed.ocean || visited[seed_index]) {
+                continue;
+            }
+
+            std::vector<CenterId> body;
+            std::queue<CenterId> pending;
+            pending.push(seed.index);
+            visited[seed_index] = true;
+
+            double surface = seed.elevation;
+            while (!pending.empty()) {
+                const CenterId current = pending.front();
+                pending.pop();
+                body.push_back(current);
+                surface = std::max(surface,
+                                   graph.centers[static_cast<std::size_t>(current)].elevation);
+
+                for (const CenterId neighbor_id :
+                     graph.centers[static_cast<std::size_t>(current)].neighbors) {
+                    const std::size_t index = static_cast<std::size_t>(neighbor_id);
+                    const MapCenter& neighbor = graph.centers[index];
+                    if (visited[index] || !neighbor.water || neighbor.ocean) {
+                        continue;
+                    }
+                    visited[index] = true;
+                    pending.push(neighbor_id);
+                }
+            }
+
+            // A lake never sits below the sea it would otherwise drain into.
+            surface = std::max(surface, config.sea_level);
+            for (const CenterId cell_id : body) {
+                graph.centers[static_cast<std::size_t>(cell_id)].water_level = surface;
             }
         }
     }

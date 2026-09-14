@@ -59,7 +59,7 @@ cmake --build build && ./build/mapcoopa --out=world
 |---|---|---|
 | `--seed=N` | random, printed | Master seed; reproduces a map exactly |
 | `--grid-size=N` | 80 | Cells per axis. The island noise frequency scales with this, so a bigger map resolves more finely instead of fragmenting |
-| `--image-size=N` | 2048 | Render size in pixels, square |
+| `--image-size=N` | 4800 | Render size in pixels, square. Back-computes `meters_per_pixel`, so the two cannot disagree — see [Scale](#scale) |
 | `--rivers=N` | 55 | River sources to attempt |
 | `--towns=N` | 28 | Settlements to place |
 | `--road-hubs=N` | 32 | Places the road network is routed between |
@@ -95,10 +95,33 @@ render size  = world extent / meters_per_pixel  = 4800 / 1  = 4800 px square
 ```
 
 `meters_per_grid_unit` is how much ground a cell covers — 60 m, about enough to hold the
-ten or so buildings that make a village. `meters_per_pixel` is the render resolution; at
-the default of 1 a PNG is a literal one-pixel-per-metre map. **`image_size` is derived from
-these and is not set in the file**; `--image-size=N` still works and back-computes
-`meters_per_pixel`, so the two can never disagree about how much ground a pixel covers.
+ten or so buildings that make a village.
+
+#### Render resolution
+
+`meters_per_pixel` and `image_size` are **one knob with two ends**, and either may be the
+one you set:
+
+| Set | In | Effect |
+|---|---|---|
+| `meters_per_pixel: 1` | `config.yaml` | The default, always. 4.8 km ÷ 1 m → **4800 px** |
+| `image_size: 2048` | `config.yaml` | 4.8 km ÷ 2048 px → `meters_per_pixel` becomes 2.34 |
+| `--image-size=2048` | CLI | Same, and overrides the file |
+
+Naming either computes the other, so they can never disagree about how much ground a pixel
+covers. `image_size` wins if you set both, a pixel count being the more concrete statement
+of intent. The invariant is `image_size × meters_per_pixel == grid_size × meters_per_grid_unit`,
+and `MapConfig` satisfies it from construction.
+
+**`meters_per_pixel` defaults to 1 and that is deliberate**: a PNG is then a literal
+one-pixel-per-metre map, so a pixel count read off a render *is* a measurement — a 6 m road
+is 6 px wide because it is 6 m wide. Fix the resolution instead and you fix the pixel count
+while the scale floats: at `image_size: 2048`, changing `grid_size` re-scales the ground a
+pixel covers rather than resizing the PNG. Which you want depends on whether you are
+measuring the map or fitting it somewhere.
+
+Below roughly 4 m/px, thin features stop being reliable — river strokes fragment at 8 m/px
+simply because a 7 m river is narrower than a pixel.
 
 Every physical size is therefore in **metres** and carries an `_m` suffix — `road_width_m: 6`,
 `building_size_max_m: 14`, `river_width_base_m: 5`. Counts, costs, scores and ratios are
@@ -118,8 +141,11 @@ Settings are resolved in four layers, each overriding the one before it:
 | 4 | command-line flags | |
 
 Layer 2 exists so that deleting or moving the config file still produces the 80-cell,
-2048-pixel world this README documents instead of silently dropping to the library's much
-smaller defaults. Layer 4 means trying something never requires editing a version-controlled
+4800-pixel world this README documents instead of silently dropping to the library's much
+smaller defaults. It sets no `image_size`: `meters_per_pixel` is 1, and 80 cells of 60 m at
+one pixel to the metre *is* 4800 px. (It used to say `image_size = 2048` there, which was
+dead — the derivation overwrote it before anything read it, and the tool has always
+rendered at 4800.) Layer 4 means trying something never requires editing a version-controlled
 file.
 
 Every key is optional and falls back to the layer beneath it, so deleting a line is always
@@ -149,16 +175,17 @@ To load the same settings from C++, `coopa::maps::load_config()` in
 
 Each run writes one PNG per layer rather than a single composited image, so a consumer can
 take the height field without the roads drawn over it, or the road network without the
-terrain under it. All seven register pixel for pixel.
+terrain under it. All eight register pixel for pixel.
 
 | File | Format | Contents |
 |---|---|---|
-| `_elevation.png` | RGB | Terrain height, black at sea level and white at the summit. Height and nothing else — no rivers cut into it. |
-| `_water.png` | RGB | Water-surface height: sea near 0, a lake at the height of its basin, river channels at the height of the ground they cross. Dry land is black, meaning *no water* rather than water at zero. |
+| `_elevation.png` | RGB | Ground height, sea bed included: black at the deepest water, `sea_level` at the shore, white at the summit. Height and nothing else — no rivers cut into it. |
+| `_water.png` | RGB | Water-surface height, **on the same scale as `_elevation.png`**. Flat per body: the sea at `sea_level`, each lake at one height across all its cells, rivers at the ground height plus a depth. Dry land is black. |
 | `_biomes.png` | RGB | Flat terrain colour, no overlays. |
 | `_roads.png` | RGBA | The road network by class, transparent elsewhere. |
 | `_structures.png` | RGBA | Building footprints as rotated quads, transparent elsewhere. |
 | `_landmarks.png` | RGBA | Settlement and landmark markers, transparent elsewhere. |
+| `_regions.png` | RGB | Provinces in flat colour, and nothing over them — the political counterpart of the biome layer, registering with it pixel for pixel. Every pixel is exactly one region's colour or exactly the background, so a consumer can recover which region covers a pixel; countries are not drawn. |
 | `_composite.png` | RGB | All of it: biome colour lit from the elevation field, then water, roads, buildings and markers. See **Shading** below. |
 
 The three overlay layers carry real transparency, so they stack over the terrain in any
@@ -259,6 +286,145 @@ for l in elevation water biomes roads structures landmarks composite; do
 done
 ```
 
+## Water
+
+`sea_level` (default **0.25**) is a **real height** in the normalised field, not a
+convention. The sea bed occupies everything below it and land everything above, so
+"this ground is under water" is an honest comparison — and the sea's surface comes
+out a visible mid-grey on the same scale as everything else.
+
+It was not always so. With the whole field starting at zero and the sea pinned to the
+bottom of it, nothing was ever below sea level, the sea's surface rendered as the same
+black as dry land, and a river running into the ocean appeared to run into nothing.
+
+| | |
+|---|---|
+| `_elevation.png` | the **ground**, sea bed included — genuine bathymetry |
+| `_water.png` | the **surface** of whatever water covers it, same scale |
+
+`MapCenter::water_level` carries that surface as data. It is flat per *body*, which
+`elevation` is not: the sea at `sea_level` everywhere, each lake at one height across
+all of its cells. A consumer floods a terrain mesh to it directly.
+
+Land therefore spans `[sea_level, 1]`, so every threshold that describes *land* — the
+Whittaker biome rows, `elevation_penalty_start`, `peak_elevation`, `canyon_elevation` —
+is taken through `land_height()` first. Moving the waterline does not silently shift
+them.
+
+### Vertical scale
+
+`elevation_range_m` (default **600**) is how many metres the `[0, 1]` field spans — the
+vertical counterpart of `meters_per_grid_unit`, which the world previously had no
+equivalent of. Sea floor at 0 m, waterline at `sea_level × elevation_range_m`, summit at
+the full range. Without it "a river one metre deep" had nowhere to land.
+
+### Rivers and shorelines
+
+- **Every river ends in a water body** — a lake or the sea, never in the middle of a field.
+  This took fixing in two independent places, because the requirement has two halves: the
+  river has to *arrive* at water, and the map has to *show* it.
+  - *Arriving.* A river is a walk down the flow field, so where it ends is decided by the
+    height field and not by the river pass: relief noise, the rank remap and the smoothing
+    passes each move corners independently, and any of them can leave a corner lower than
+    all its neighbours. A walk that reaches such a pit stops on dry land, and 42% of rivers
+    used to. The elevation pass now fills the pits (priority flood — see
+    [`passes/README.md`](./coopa/maps/passes/README.md)), which leaves *every* land corner
+    with a strictly descending path to water; the river pass discards anything that still
+    ends dry, so the guarantee holds even if the terrain changes under it.
+  - *Showing it.* These layers are coloured by **biome**, and `classify_biome()` used to
+    hand a shallow lake `Marsh` — a dark green. 18% of rivers therefore ended in a cell
+    that reads as forest, on a map whose data said "lake". Water cells now only ever get
+    `Ocean`, `Lake` or `Ice`.
+- **`river_depth_m`** (+ `river_depth_per_volume_m`) lifts a river's surface *above* the
+  ground it runs over, because a river is water standing in a channel rather than a line
+  painted on the terrain. Interpolated along the smoothed centreline, so the fall
+  downstream is continuous instead of terracing at every corner.
+- **Bodies are drawn after rivers**, so a lake's flat surface wins inside its own
+  outline. The other way round, a river stroked at ground height gouged a channel across
+  every lake it flowed into.
+- **`water_edge_overlap_m`** (default **1**) extends every water surface past its own
+  edge so it clips *into* the terrain. Two surfaces sharing an edge exactly will show a
+  seam wherever their meshes disagree by a rounding error, and along a coastline they
+  always do.
+
+## Landmass shape
+
+Land is confined to a shape centred on the canvas; everything outside it is sea. The
+**canvas itself is always `grid_size` square** — the shape is inscribed in it, and the
+margin left over becomes open ocean. A smaller shape is a smaller world on the same size
+of map, not a smaller image.
+
+| Shape | Dimensions | Flag |
+|---|---|---|
+| `rectangle` *(default)* | `width_m`, `height_m` | `--shape=rect --shape-size=M --shape-height=M` |
+| `circle` | `diameter_m` | `--shape=circle --shape-size=M` |
+| `triangle` | `edge_length_m`, equilateral and apex-up | `--shape=triangle --shape-size=M --shape-rot=DEG` |
+
+**Every dimension defaults to 0, meaning "fill the canvas"**, which makes the default a
+canvas-spanning rectangle — byte for byte what the generator produced before shapes
+existed. `rotation` turns the shape about the centre; only the triangle is asymmetric
+enough for it to show.
+
+```bash
+cplay --shape=circle   --shape-size=3600
+cplay --shape=triangle --shape-size=4000 --shape-rot=30
+cplay --shape=rect     --shape-size=3000 --shape-height=1800
+```
+
+It is one predicate: `shape_inset()` in
+[`coopa/maps/map_config.h`](./coopa/maps/map_config.h) returns how far inside the shape a
+point lies, and `border_check_()` flags anything within `border_length` of the edge. The
+water pass floods those cells and the elevation pass measures height outward from them, so
+coastlines, mountains, regions and roads all follow the shape without any of them knowing
+shapes exist.
+
+## Terrain
+
+Height is breadth-first **distance from the coast**, which is what keeps coastlines at sea
+level and puts mountains inland. Taken alone, though, it makes the high ground the literal
+*medial axis* of the landmass — every summit on a thin ridge running equidistant between the
+bays either side, which renders as bright closed loops around dark basins. That reads as
+foam, not terrain.
+
+Three knobs, at three scales:
+
+- **`terrain_relief`** (0 to 1, default **0.65**) blends the distance field toward fractal
+  noise, so the interior becomes massifs and valleys instead of a skeleton. `--relief=F`.
+  A coastal mask keeps the shore the lowest land there is, and land is lifted clear of
+  water, so rivers still run off the land into the sea. **0 restores the pure distance
+  field** — what Amit Patel's original produced.
+- **`elevation_smoothing_iterations`** relaxes the height field — how smooth the *landform*
+  is.
+- **`terrain_roughness`** (0 to 1, default 0) displaces the *sampled surface* with a much
+  finer detail field — how rough the skin over it is. `--roughness=F`.
+
+Blended rather than multiplied, incidentally, because scaling the distance field by noise
+cannot reorder it: distances span tens of units and a noise factor spans one, so the ridge
+survives however hard it is attenuated.
+
+The roughness lives in the sampler, not in the graph. Cell and corner heights stay exactly
+as the passes computed them, so biomes, rivers and roads are still classified on the smooth
+control field; only what you get from `MapGraph::elevation_at()` — and therefore the
+elevation layer and the composite — roughens. The displacement is scaled by the local
+height, so a coastline stays exactly at sea level however high the knob goes.
+
+Separately, `elevation_at()` interpolates barycentrically over the **Delaunay triangle**
+containing the sample, blending the three cell-site heights at its vertices — the natural
+piecewise-linear surface through samples taken at the sites, and what a terrain mesh built
+from this data would be. Two earlier interpolations were worse:
+
+- **Inverse-distance weighting** over a cell's corners read as a plateau: every corner is
+  roughly equidistant from the middle of a cell, so the interior came out near the mean of
+  the corners.
+- **Barycentric over the cell's own corner fan** creased at each of the six-odd internal fan
+  edges *and* put a tent pole at every site, so the surface came out visibly crumpled — and
+  the fan covers only the *straight* corner polygon while the renderer draws the
+  *subdivided* outline, so 1.78% of pixels missed every triangle and fell through to the
+  inverse-distance formula, speckling every cell boundary.
+
+The Delaunay triangulation tiles the hull, so there is nothing to fall through, and it
+creases once per edge rather than six times per cell.
+
 ## Legend
 
 ### Biomes
@@ -280,7 +446,7 @@ from `BiomePalette`.
 | ![](assets/svg/ocean.svg) | Ocean | `ocean` | `#5EB6DF` | 94, 182, 223 |
 | ![](assets/svg/lake.svg) | Lake | `lake` | `#5EB6DF` | 94, 182, 223 |
 | ![](assets/svg/marsh.svg) | Marsh | `marsh` | `#215E21` | 33, 94, 33 |
-| ![](assets/svg/ice.svg) | Ice | `ice` | `#D2FFFC` | 210, 255, 252 |
+| ![](assets/svg/ice.svg) | Ice | `ice` | `#92CEE7` | 146, 206, 231 |
 | ![](assets/svg/beach.svg) | Beach | `beach` | `#F5DEB3` | 245, 222, 179 |
 | ![](assets/svg/snow.svg) | Snow | `snow` | `#FFFAFA` | 255, 250, 250 |
 | ![](assets/svg/tundra.svg) | Tundra | `tundra` | `#A9A9A9` | 169, 169, 169 |
@@ -313,11 +479,17 @@ from `BiomePalette`.
 
 `ocean` and `lake` share a colour deliberately — they are the same water to look at, and
 what separates them is whether the body reaches the edge of the map, which a reader can
-see from the shape rather than the hue.
+see from the shape rather than the hue. `ice` is a *frozen* body and is coloured as a pale
+version of that same blue rather than as a fourth near-white beside `snow`, `glacier` and
+`salt_flat`: a river has to visibly end in water, and ending in something the eye files
+with snowfields does not count.
+
+Only those three ever colour a water cell. `marsh`, `swamp` and `boreal_wetland` are dry
+land — waterlogged basin floor beside the water, not the water itself.
 
 > **These are the untinted, unshaded colours.** Two things move a rendered pixel off the
 > table value. At the default `show_regions = true` and `region_tint = 0.13`, every claimed
-> land cell is mixed 13% toward its region's colour so that borders are visible — generate
+> land cell is mixed 13% toward its region's colour so that provinces are visible — generate
 > with `--no-regions`, or set `MapConfig::show_regions = false`, for exact matches. And the
 > **composite** additionally lights every land pixel by its elevation or its slope, so match
 > against `_biomes.png` rather than `_composite.png`.
@@ -357,7 +529,7 @@ cbuild
 ./build/mapcoopa_tests      # or: ctest --test-dir build
 ```
 
-57 cases covering determinism, the graph invariants, every pass, both renderers, the
+69 cases covering determinism, the graph invariants, every pass, both renderers, the
 configuration loader, the world scale, the asynchronous API and the YAML round
 trip — including that every parallel path reproduces its serial one exactly.
 

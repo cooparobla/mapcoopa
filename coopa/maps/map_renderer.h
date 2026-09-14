@@ -39,11 +39,12 @@ enum class MapLayer {
     Roads,      /**< @brief The road network, transparent elsewhere. */
     Structures, /**< @brief Building footprints, transparent elsewhere. */
     Landmarks,  /**< @brief Settlement and landmark markers, transparent elsewhere. */
-    Composite   /**< @brief Every layer above, hillshaded and blended. */
+    Regions,    /**< @brief Provinces in flat colour, one fill per region and nothing over them. */
+    Composite   /**< @brief Every layer above, lit and blended. */
 };
 
 /** @brief Number of distinct `MapLayer` values. */
-inline constexpr std::size_t k_map_layer_count = 7;
+inline constexpr std::size_t k_map_layer_count = 8;
 
 /**
  * @brief Maps a layer to the suffix its file takes, after the output prefix.
@@ -58,6 +59,7 @@ inline std::string_view map_layer_name(MapLayer layer) {
         case MapLayer::Roads:      return "roads";
         case MapLayer::Structures: return "structures";
         case MapLayer::Landmarks:  return "landmarks";
+        case MapLayer::Regions:    return "regions";
         case MapLayer::Composite:  return "composite";
     }
     return "composite";
@@ -247,7 +249,8 @@ public:
             image.reset(config.image_size, config.image_size, 4, glm::vec4(0.0f));
             return image;
         }
-        const bool on_background = layer == MapLayer::Biomes || layer == MapLayer::Composite;
+        const bool on_background = layer == MapLayer::Biomes || layer == MapLayer::Regions
+                                || layer == MapLayer::Composite;
         image.reset(config.image_size, config.image_size, 3,
                     on_background ? palette.background_color : glm::vec3(0.0f));
         return image;
@@ -278,6 +281,7 @@ public:
             case MapLayer::Roads:      draw_roads_layer_(image, graph, config, palette, slice); return;
             case MapLayer::Structures: draw_structures_layer_(image, graph, config, palette, slice); return;
             case MapLayer::Landmarks:  draw_landmarks_layer_(image, graph, config, palette, slice); return;
+            case MapLayer::Regions:    draw_regions_(image, graph, config, palette, slice); return;
             case MapLayer::Composite:  break;
         }
         draw_composite_(image, graph, config, palette, slice);
@@ -301,6 +305,7 @@ public:
             case MapLayer::Roads:      return roads(graph, config, palette, slice);
             case MapLayer::Structures: return structures(graph, config, palette, slice);
             case MapLayer::Landmarks:  return landmarks(graph, config, palette, slice);
+            case MapLayer::Regions:    return regions(graph, config, palette, slice);
             case MapLayer::Composite:  break;
         }
         return composite(graph, config, palette, slice);
@@ -323,13 +328,27 @@ public:
     }
 
     /**
-     * @brief Height of the water surface: sea, lakes and river channels.
+     * @brief Height of every water surface, on the same scale as the elevation layer.
      *
-     * Dry land is black, meaning *no water* rather than water at zero. The sea
-     * sits near 0 and a lake at the height of the basin holding it, so a consumer
-     * can flood a terrain mesh to these values directly. River channels are
-     * stroked along their smoothed centrelines at the height of the ground they
-     * run over, widening with volume.
+     * Read it exactly as `_elevation.png`: the same normalised height, the same
+     * greyscale mapping. Where there is water this is the height of its
+     * *surface*; where there is none it is black. That works only because
+     * `sea_level` is a real height partway up the range, so the sea reads as a
+     * visible mid-grey rather than the black that made it indistinguishable from
+     * dry land -- which is what it was when sea level sat at the bottom of the
+     * field.
+     *
+     * Three kinds of surface, drawn in an order that matters:
+     *
+     * - **Rivers first**, at the ground height they run over plus a depth, so the
+     *   water stands *in* its channel rather than being painted on the terrain.
+     *   Interpolated along the smoothed centreline rather than stepped per
+     *   corner, so the fall downstream is continuous.
+     * - **Then lakes and the sea**, flat, which therefore win inside their own
+     *   outlines. Drawn the other way round -- which they were -- a river stroked
+     *   at ground height gouges a channel across the flat lake it flows into.
+     * - **Then a rim** along every body's edge, `water_edge_overlap_m` wide, so
+     *   the water clips into the terrain instead of meeting it exactly.
      */
     static Image water(const MapGraph& graph, const MapConfig& config,
                        const BiomePalette& palette = BiomePalette{},
@@ -345,6 +364,38 @@ public:
                         const RenderSlice& slice = RenderSlice{}) {
         Image image = allocate(MapLayer::Biomes, config, palette);
         draw_biomes_(image, graph, config, palette, slice);
+        return image;
+    }
+
+    /**
+     * @brief Provinces in flat colour, one fill per region and nothing else.
+     *
+     * The political counterpart of the biome layer, and it registers with it
+     * pixel for pixel. Region colours are spread around the hue circle by the
+     * region pass, so neighbouring provinces are told apart by hue.
+     *
+     * No ink over the fills -- no borders, no outlines, no shading. That makes
+     * the layer readable as *data*: every pixel is either exactly one region's
+     * colour or exactly the background, so a consumer can recover which region
+     * covers a pixel by looking it up. Country borders used to be stroked over
+     * the top in near-black, which broke that property for the 93 k pixels they
+     * covered, and read as an artefact besides: a border only exists on a
+     * land-to-land edge, so every one of them dangled into the sea instead of
+     * closing around its country.
+     *
+     * Countries are therefore not distinguishable here. `MapCountry` is still in
+     * the graph and in `world.yaml` for anyone who needs it, and the composite
+     * still tints each cell toward its region colour.
+     *
+     * Ocean and unclaimed land are left on the background colour rather than
+     * given a colour of their own -- there is nothing political about them, and a
+     * fill would imply otherwise.
+     */
+    static Image regions(const MapGraph& graph, const MapConfig& config,
+                         const BiomePalette& palette = BiomePalette{},
+                         const RenderSlice& slice = RenderSlice{}) {
+        Image image = allocate(MapLayer::Regions, config, palette);
+        draw_regions_(image, graph, config, palette, slice);
         return image;
     }
 
@@ -408,6 +459,10 @@ private:
         (void)palette;
         const double scale = pixels_per_grid_unit_(config);
         const double inverse_scale = 1.0 / scale;
+        // One sampler for the whole layer, not one per pixel: `Noise` wraps a
+        // FastNoiseLite and is not free to build.
+        const Noise terrain(config.noise_terrain);
+        const TerrainDetail detail = make_terrain_detail(config, terrain);
         Outlines outlines(graph, config, slice);
         for (const MapCenter& center : graph.centers) {
             const std::vector<MapPoint>& outline = outlines.of(center, slice);
@@ -415,9 +470,9 @@ private:
                 continue;
             }
             fill_polygon_shaded(image, outline,
-                [&graph, &center, inverse_scale](double px, double py) {
+                [&graph, &center, &detail, inverse_scale](double px, double py) {
                     const double height = graph.elevation_at(center, px * inverse_scale,
-                                                             py * inverse_scale);
+                                                             py * inverse_scale, detail);
                     const float grey = static_cast<float>(std::clamp(height, 0.0, 1.0) * 255.0);
                     return glm::vec3(grey, grey, grey);
                 }, slice.band);
@@ -426,24 +481,94 @@ private:
 
     /** @brief Draws the water layer into an already-allocated buffer. */
     static void draw_water_(Image& image, const MapGraph& graph, const MapConfig& config,
-                         const BiomePalette& palette, const RenderSlice& slice) {
+                            const BiomePalette& palette, const RenderSlice& slice) {
         (void)palette;
+        const double scale = pixels_per_grid_unit_(config);
+        const double overlap = meters_to_grid(config, config.water_edge_overlap_m);
+
+        // Rivers first, so a body drawn over them keeps its flat surface.
+        for (const MapRiver& river : graph.rivers) {
+            stroke_river_surface_(image, graph, river, config, overlap, slice.band);
+        }
+
         Outlines outlines(graph, config, slice);
         for (const MapCenter& center : graph.centers) {
-            if (!center.water) {
+            if (center.water_level <= 0.0) {
                 continue;
             }
             const std::vector<MapPoint>& outline = outlines.of(center, slice);
             if (outline.empty()) {
                 continue;
             }
-            fill_polygon(image, outline, height_grey_(center.elevation), slice.band);
-        }
+            const glm::vec3 surface = height_grey_(center.water_level);
+            fill_polygon(image, outline, surface, slice.band);
 
-        for (const MapRiver& river : graph.rivers) {
-            stroke_river_(image, graph, river, config,
-                [](const MapCorner& corner) { return height_grey_(corner.elevation); },
-                slice.band);
+            // And a rim, so the sheet overhangs its own edge and clips into the
+            // terrain rather than sharing a boundary with it exactly.
+            if (overlap > 0.0) {
+                const double half_width = half_width_pixels_(overlap * 2.0, scale);
+                for (std::size_t i = 0; i < outline.size(); ++i) {
+                    const MapPoint& from = outline[i];
+                    const MapPoint& to = outline[(i + 1) % outline.size()];
+                    draw_line(image, from.x, from.y, to.x, to.y, half_width, surface,
+                              slice.band);
+                }
+            }
+        }
+    }
+
+    /**
+     * @brief Strokes a river's water surface: the ground it runs over, plus a depth.
+     *
+     * The height is interpolated along the centreline between the corner heights
+     * either end of each segment, rather than held constant across a whole
+     * segment. Corner-cutting multiplied the point count, so a per-corner step
+     * would put a visible terrace every few metres down a watercourse that in
+     * reality falls smoothly.
+     *
+     * Depth rises with volume: a headwater stream is a trickle in a groove and a
+     * trunk river is neither.
+     */
+    static void stroke_river_surface_(Image& image, const MapGraph& graph,
+                                      const MapRiver& river, const MapConfig& config,
+                                      double overlap, const RowBand& band) {
+        if (river.points.size() < 2 || river.corners.empty()) {
+            return;
+        }
+        const double scale = pixels_per_grid_unit_(config);
+        const std::size_t segments = river.points.size() - 1;
+        const std::size_t last_corner = river.corners.size() - 1;
+
+        const auto corner_at = [&graph, &river, last_corner](std::size_t index) -> const MapCorner& {
+            return graph.corners[static_cast<std::size_t>(
+                river.corners[std::min(index, last_corner)])];
+        };
+
+        for (std::size_t i = 0; i < segments; ++i) {
+            // Where along the corner chain this segment sits, as a real number, so
+            // both the height and the volume can be interpolated rather than
+            // stepped.
+            const double along = static_cast<double>(last_corner)
+                               * static_cast<double>(i) / static_cast<double>(segments);
+            const std::size_t index = static_cast<std::size_t>(along);
+            const double fraction = along - static_cast<double>(index);
+
+            const MapCorner& from = corner_at(index);
+            const MapCorner& to = corner_at(index + 1);
+            const double ground = from.elevation + (to.elevation - from.elevation) * fraction;
+            const double volume = static_cast<double>(from.river)
+                                + (static_cast<double>(to.river)
+                                   - static_cast<double>(from.river)) * fraction;
+
+            const double depth = config.river_depth_m
+                               + config.river_depth_per_volume_m * volume;
+            const double surface = std::clamp(ground + meters_to_height(config, depth),
+                                              0.0, 1.0);
+            const double width = river_width(config, static_cast<int>(volume)) + overlap * 2.0;
+
+            draw_line(image, river.points[i].x * scale, river.points[i].y * scale,
+                      river.points[i + 1].x * scale, river.points[i + 1].y * scale,
+                      half_width_pixels_(width, scale), height_grey_(surface), band);
         }
     }
 
@@ -457,6 +582,26 @@ private:
                 continue;
             }
             fill_polygon(image, outline, biome_color_(graph, center, config, palette),
+                         slice.band);
+        }
+    }
+
+    /** @brief Draws the regions layer into an already-allocated buffer. */
+    static void draw_regions_(Image& image, const MapGraph& graph, const MapConfig& config,
+                              const BiomePalette& palette, const RenderSlice& slice) {
+        (void)palette;
+        Outlines outlines(graph, config, slice);
+        for (const MapCenter& center : graph.centers) {
+            if (center.region == k_invalid_id
+                || static_cast<std::size_t>(center.region) >= graph.regions.size()) {
+                continue;
+            }
+            const std::vector<MapPoint>& outline = outlines.of(center, slice);
+            if (outline.empty()) {
+                continue;
+            }
+            fill_polygon(image, outline,
+                         graph.regions[static_cast<std::size_t>(center.region)].color,
                          slice.band);
         }
     }
@@ -485,6 +630,8 @@ private:
         (void)palette;
         const double scale = pixels_per_grid_unit_(config);
         const double inverse_scale = 1.0 / scale;
+        const Noise terrain(config.noise_terrain);
+        const TerrainDetail detail = make_terrain_detail(config, terrain);
         Outlines outlines(graph, config, slice);
 
         // Only the slope mode needs the rasterised height field, and it is the
@@ -526,9 +673,9 @@ private:
                     }, slice.band);
             } else {
                 fill_polygon_shaded(image, outline,
-                    [&graph, &center, base, inverse_scale](double px, double py) {
+                    [&graph, &center, &detail, base, inverse_scale](double px, double py) {
                         return base * elevation_shade_(graph, center, px * inverse_scale,
-                                                       py * inverse_scale);
+                                                       py * inverse_scale, detail);
                     }, slice.band);
             }
         }
@@ -615,10 +762,26 @@ private:
         return glm::vec3(grey, grey, grey);
     }
 
-    /** @brief Converts a length in metres to whole pixels, at least 1. */
+    /**
+     * @brief Converts a length in metres to whole pixels, at least 1.
+     *
+     * Routed through `pixels_per_grid_unit_()` -- the same scale every other
+     * width in this renderer uses -- rather than dividing by
+     * `MapConfig::meters_per_pixel` directly. The two are equal whenever
+     * `image_size * meters_per_pixel == grid_size * meters_per_grid_unit`, which
+     * is the invariant `MapConfig::image_size` documents and the config loader
+     * enforces. They are *not* equal when a caller sets `image_size` by hand and
+     * leaves the scale behind: this used to draw markers 7.5x oversized on every
+     * test render for exactly that reason, while the roads and rivers beside them
+     * came out right.
+     *
+     * Taking one scale for the whole renderer means a resolution set either way
+     * round scales every feature together, and the invariant stops being load
+     * bearing here.
+     */
     static int meters_to_pixels_(double meters, const MapConfig& config) {
-        const double per_pixel = config.meters_per_pixel > 0.0 ? config.meters_per_pixel : 1.0;
-        return std::max(1, static_cast<int>(meters / per_pixel));
+        return std::max(1, static_cast<int>(meters_to_grid(config, meters)
+                                            * pixels_per_grid_unit_(config)));
     }
 
     /**
@@ -714,12 +877,13 @@ private:
      * @param center The cell the pixel falls in.
      * @param x Horizontal grid position.
      * @param y Vertical grid position.
+     * @param detail The terrain detail field, so the shading matches the height layer.
      * @return A multiplier for the surface colour, in
      *         `[k_elevation_shade_min, k_elevation_shade_max]`.
      */
     static float elevation_shade_(const MapGraph& graph, const MapCenter& center, double x,
-                                  double y) {
-        const double height = std::clamp(graph.elevation_at(center, x, y), 0.0, 1.0);
+                                  double y, const TerrainDetail& detail) {
+        const double height = std::clamp(graph.elevation_at(center, x, y, detail), 0.0, 1.0);
         return static_cast<float>(k_elevation_shade_min
                                   + (k_elevation_shade_max - k_elevation_shade_min) * height);
     }

@@ -19,6 +19,7 @@
 #include <coopa/maps/biome.h>
 #include <coopa/maps/landmark.h>
 #include <coopa/maps/map_config.h>
+#include <coopa/maps/noise.h>
 
 namespace coopa {
 namespace maps {
@@ -172,6 +173,19 @@ struct MapCenter {
 
     Biome biome = Biome::Ocean; /**< @brief Terrain classification, assigned by the biome pass. */
     double elevation = 0.0;     /**< @brief Mean of the cell's corner elevations, in `[0, 1]`. */
+    /**
+     * @brief Height of the water surface over this cell; meaningless on dry land.
+     *
+     * Flat per *body* of water, which `elevation` is not. The sea sits at
+     * `MapConfig::sea_level` everywhere, and every cell of one lake shares that
+     * lake's single surface -- so a consumer can flood a terrain mesh to this
+     * number directly, and the water layer can draw a sheet rather than a
+     * mottled field.
+     *
+     * `elevation` remains the height of the *ground* underneath, which for a
+     * water cell is its bed.
+     */
+    double water_level = 0.0;
     double moisture = 0.0;      /**< @brief Mean of the cell's corner moistures, in `[0, 1]`. */
     /** @brief Mean of the cell's corner temperatures, in `[0, 1]`; 0 polar, 1 equatorial. */
     double temperature = 0.0;
@@ -515,6 +529,39 @@ struct MapCountry {
 };
 
 /**
+ * @struct TerrainDetail
+ * @brief A fractal field sampled on top of the control mesh, and how hard to apply it.
+ *
+ * Built from a `MapConfig` by `make_terrain_detail()` and handed to
+ * `MapGraph::elevation_at()`. Holds a borrowed pointer rather than a `Noise` by
+ * value so one sampler serves a whole render: `Noise` wraps a FastNoiseLite,
+ * which is not free to construct.
+ */
+struct TerrainDetail {
+    const Noise* noise = nullptr; /**< @brief The detail field; null disables displacement. */
+    double roughness = 0.0;       /**< @brief Displacement amplitude; 0 disables it. */
+};
+
+/**
+ * @brief Builds the detail sampler `MapGraph::elevation_at()` displaces with.
+ *
+ * The `Noise` must outlive every sample taken through the returned struct, which
+ * only borrows it -- build both once per render, not per pixel.
+ *
+ * @param config Supplies the roughness amplitude.
+ * @param noise A sampler built from `MapConfig::noise_terrain`.
+ * @return The detail field, or a disabled one when roughness is zero.
+ */
+inline TerrainDetail make_terrain_detail(const MapConfig& config, const Noise& noise) {
+    TerrainDetail detail;
+    if (config.terrain_roughness > 0.0) {
+        detail.noise = &noise;
+        detail.roughness = config.terrain_roughness;
+    }
+    return detail;
+}
+
+/**
  * @class MapGraph
  * @brief Owns every cell, corner, edge, road run and settlement of one generated map.
  *
@@ -549,21 +596,177 @@ public:
     }
 
     /**
-     * @brief Interpolates elevation inside a cell from its corner heights.
+     * @brief Interpolates the ground height at a point.
      *
-     * Inverse-distance weighted across the cell's corners, which gives a smooth
-     * surface that agrees with the neighbouring cell along their shared edge.
+     * Barycentric over the **Delaunay triangle** containing the point, blending
+     * the three cell-site heights at its vertices. That is the natural
+     * piecewise-linear surface through samples taken at the sites, and it is what
+     * a terrain mesh built from this data would be.
      *
-     * @param center The cell to sample within.
+     * `center` is a hint, not a constraint: the triangles searched are the ones
+     * incident to that cell, found through `MapCorner::touches` -- each corner of
+     * a cell is the circumcentre of a Delaunay triangle that cell is a vertex of.
+     * The nearest site to any point is always a vertex of the Delaunay triangle
+     * containing it, so for a point in the cell the answer is in that set.
+     *
+     * ### Two interpolations this replaced, and why both were wrong
+     *
+     * **Inverse-distance weighting over the cell's corners** read as a plateau.
+     * Every corner is roughly equidistant from the middle of a cell, so the
+     * interior came out near the mean of the corners and only approached a
+     * corner's own value in the last few pixels before it.
+     *
+     * **Barycentric over the cell's own corner fan** -- site to two consecutive
+     * corners -- was worse. It put a crease at each of the six-odd internal fan
+     * edges *and* a tent pole at every site, whose height is the mean of its
+     * corners, so the surface came out visibly crumpled. And the fan covers only
+     * the *straight* corner polygon while the renderer draws the *subdivided*
+     * outline, which bulges outside it: 1.78% of drawn pixels missed every fan
+     * triangle and fell through to the inverse-distance formula, speckling every
+     * cell boundary with slivers of a different surface.
+     *
+     * The Delaunay triangulation has neither problem. It tiles the hull, so there
+     * is no outside to fall through, and it creases once per edge rather than six
+     * times per cell.
+     *
+     * @param center The cell to search from; the point need not be strictly inside it.
      * @param x Horizontal grid position.
      * @param y Vertical grid position.
      * @return The interpolated height, or 0 if the cell has no corners.
      */
     double elevation_at(const MapCenter& center, double x, double y) const {
+        if (center.corners.empty()) {
+            return 0.0;
+        }
         const MapPoint query{x, y};
+
+        double height = 0.0;
+        if (triangle_elevation_(center, query, height)) {
+            return height;
+        }
+        // The cell's own triangles cover its Voronoi region, but the renderer
+        // draws the *subdivided* outline, which bulges past it into a
+        // neighbour's -- about 2% of drawn pixels. Those belong to a
+        // neighbour's triangles, so look there before giving up.
+        for (const CenterId neighbor_id : center.neighbors) {
+            if (triangle_elevation_(centers[static_cast<std::size_t>(neighbor_id)], query,
+                                    height)) {
+                return height;
+            }
+        }
+        return inverse_distance_elevation_(center, query);
+    }
+
+    /**
+     * @brief Interpolates the ground height, with fractal detail on top.
+     *
+     * The control mesh gives the landform; the detail field gives it texture.
+     * Keeping the two apart is what stops the noise reaching the data everything
+     * else is derived from -- biomes, rivers and roads all classify on the cell
+     * and corner heights, which stay exactly as the passes left them, while
+     * anyone sampling the *surface* sees the displaced version.
+     *
+     * The displacement is scaled by the base height, so it fades to nothing at
+     * the coast: a shoreline stays exactly at sea level and no land is nudged
+     * below it.
+     *
+     * @param center The cell to sample within.
+     * @param x Horizontal grid position.
+     * @param y Vertical grid position.
+     * @param detail The detail field and how strongly to apply it.
+     * @return The displaced height, clamped to `[0, 1]`.
+     */
+    double elevation_at(const MapCenter& center, double x, double y,
+                        const TerrainDetail& detail) const {
+        const double base = elevation_at(center, x, y);
+        if (detail.noise == nullptr || detail.roughness <= 0.0) {
+            return base;
+        }
+        // Taper by the base height itself. Anything that does not vanish at zero
+        // would either lift the shoreline off sea level or push it under.
+        const double amplitude = detail.roughness * base;
+        const double displaced = base + amplitude * static_cast<double>(detail.noise->sample(x, y));
+        return std::clamp(displaced, 0.0, 1.0);
+    }
+
+    /**
+     * @brief Interpolates over whichever of a cell's Delaunay triangles claims a point.
+     *
+     * A cell's corners are exactly the circumcentres of the Delaunay triangles it
+     * is a vertex of, so `MapCorner::touches` enumerates that cell's whole star.
+     *
+     * @param center The cell whose triangles to try.
+     * @param query The point to sample.
+     * @param out_height Receives the interpolated height when one claims it.
+     * @return True if a triangle contained the point.
+     */
+    bool triangle_elevation_(const MapCenter& center, const MapPoint& query,
+                             double& out_height) const {
+        for (const CornerId corner_id : center.corners) {
+            const MapCorner& corner = corners[static_cast<std::size_t>(corner_id)];
+            if (corner.touches.size() != 3) {
+                continue; // Not a complete triangle; only possible at the hull.
+            }
+            const MapCenter& a = centers[static_cast<std::size_t>(corner.touches[0])];
+            const MapCenter& b = centers[static_cast<std::size_t>(corner.touches[1])];
+            const MapCenter& c = centers[static_cast<std::size_t>(corner.touches[2])];
+
+            double wa = 0.0;
+            double wb = 0.0;
+            double wc = 0.0;
+            if (barycentric_(a.point, b.point, c.point, query, wa, wb, wc)) {
+                out_height = wa * a.elevation + wb * b.elevation + wc * c.elevation;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * @brief Barycentric coordinates of a point in a triangle, if it falls inside.
+     *
+     * A small negative tolerance on each weight, so a sample sitting exactly on a
+     * shared edge is claimed by a triangle rather than falling through every one
+     * of them to the fallback.
+     *
+     * @param a First vertex.
+     * @param b Second vertex.
+     * @param c Third vertex.
+     * @param point The point to locate.
+     * @param out_a Weight of `a`.
+     * @param out_b Weight of `b`.
+     * @param out_c Weight of `c`.
+     * @return True if the point lies in the triangle.
+     */
+    static bool barycentric_(const MapPoint& a, const MapPoint& b, const MapPoint& c,
+                             const MapPoint& point, double& out_a, double& out_b,
+                             double& out_c) {
+        const double v0x = b.x - a.x, v0y = b.y - a.y;
+        const double v1x = c.x - a.x, v1y = c.y - a.y;
+        const double denominator = v0x * v1y - v1x * v0y;
+        if (denominator == 0.0) {
+            return false; // Degenerate sliver; let the next triangle try.
+        }
+        const double px = point.x - a.x, py = point.y - a.y;
+        out_b = (px * v1y - v1x * py) / denominator;
+        out_c = (v0x * py - px * v0y) / denominator;
+        out_a = 1.0 - out_b - out_c;
+
+        constexpr double tolerance = -1e-9;
+        return out_a >= tolerance && out_b >= tolerance && out_c >= tolerance;
+    }
+
+    /**
+     * @brief The inverse-distance fallback, for a point no incident triangle claims.
+     *
+     * Only reachable at the convex hull, where a corner may not have three
+     * touching cells and the triangulation runs out. Inside the map it should
+     * never be hit -- `test_elevation_interpolation_has_no_gaps` is what holds
+     * that to account.
+     */
+    double inverse_distance_elevation_(const MapCenter& center, const MapPoint& query) const {
         double total_weight = 0.0;
         double weighted_elevation = 0.0;
-
         for (const CornerId corner_id : center.corners) {
             const MapCorner& corner = corners[static_cast<std::size_t>(corner_id)];
             const double distance = query.distance_to(corner.point);
@@ -574,7 +777,6 @@ public:
             weighted_elevation += weight * corner.elevation;
             total_weight += weight;
         }
-
         if (total_weight == 0.0) {
             return 0.0;
         }

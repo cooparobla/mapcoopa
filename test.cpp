@@ -1,6 +1,6 @@
 /**
  * @file test.cpp
- * @brief mapcoopa's test suite -- 57 cases over the generator, its passes, the
+ * @brief mapcoopa's test suite -- 69 cases over the generator, its passes, the
  *        renderers and the YAML round trip.
  *
  * Build target `mapcoopa_tests` (the bare `mapcoopa` target is the generator,
@@ -116,10 +116,29 @@ static coopa::job::JobEngine& maps_engine() {
 // the passes have real terrain to work on.
 static constexpr double k_pi = 3.14159265358979323846;
 
+/**
+ * @brief Sets a render resolution the way the loader and `--image-size` do.
+ *
+ * By back-computing the scale, so `image_size` and `meters_per_pixel` cannot
+ * disagree -- see `MapConfig::image_size`. Assigning `image_size` alone leaves a
+ * fixture claiming a 960 m world is 128 px across *at one pixel to the metre*,
+ * which these fixtures did for as long as they existed.
+ *
+ * @param config Configured in place; `grid_size` and `meters_per_grid_unit` must
+ *     already be set.
+ * @param pixels Desired side length of the render.
+ */
+static void set_render_size(MapConfig& config, int pixels) {
+    const double world =
+        static_cast<double>(config.grid_size) * config.meters_per_grid_unit;
+    config.meters_per_pixel = world / static_cast<double>(pixels);
+    config.image_size = derive_image_size(config);
+}
+
 static MapConfig small_config(int seed = 251) {
     MapConfig config;
     config.grid_size = 16;
-    config.image_size = 128;
+    set_render_size(config, 128);
     config.seed = seed;
     config.noise_island.seed = seed;
     return config;
@@ -138,10 +157,27 @@ static void test_biome_name_round_trips() {
 static void test_classify_biome_table() {
     // Water and shore states short-circuit the climate diagram.
     ASSERT_TRUE(classify_biome(0.9, 0.9, 0.5, false, true, false) == Biome::Ocean);
-    ASSERT_TRUE(classify_biome(0.05, 0.5, 0.5, true, false, false) == Biome::Marsh);
-    ASSERT_TRUE(classify_biome(0.9, 0.5, 0.5, true, false, false) == Biome::Ice);
-    ASSERT_TRUE(classify_biome(0.5, 0.5, 0.5, true, false, false) == Biome::Lake);
     ASSERT_TRUE(classify_biome(0.5, 0.5, 0.5, false, false, true) == Biome::Beach);
+
+    // A water cell is `Ice` or `Lake` and nothing else, at any elevation and any
+    // moisture -- see `test_water_cells_always_get_a_water_biome` for why that
+    // matters. A shallow lake used to come back `Marsh` and a high one `Ice`.
+    ASSERT_TRUE(classify_biome(0.05, 0.5, 0.5, true, false, false) == Biome::Lake);
+    ASSERT_TRUE(classify_biome(0.9, 0.5, 0.5, true, false, false) == Biome::Lake);
+    ASSERT_TRUE(classify_biome(0.5, 0.5, 0.5, true, false, false) == Biome::Lake);
+    ASSERT_TRUE(classify_biome(0.05, 0.9, 0.9, true, false, false) == Biome::Lake);
+    // Frozen on temperature alone, which already carries the altitude lapse rate.
+    ASSERT_TRUE(classify_biome(0.5, 0.5, 0.1, true, false, false) == Biome::Ice);
+    ASSERT_TRUE(classify_biome(0.05, 0.5, 0.1, true, false, false) == Biome::Ice);
+
+    // Wetlands are *land* now: low, wet ground beside the water rather than the
+    // water itself.
+    ASSERT_TRUE(classify_biome(0.05, 0.9, 0.5, false, false, false) == Biome::Marsh);
+    ASSERT_TRUE(classify_biome(0.05, 0.9, 0.9, false, false, false) == Biome::Swamp);
+    ASSERT_TRUE(classify_biome(0.05, 0.9, 0.3, false, false, false) == Biome::BorealWetland);
+    // Low but dry is not a wetland, and frozen ground is permafrost not marsh.
+    ASSERT_TRUE(classify_biome(0.05, 0.4, 0.5, false, false, false) != Biome::Marsh);
+    ASSERT_TRUE(classify_biome(0.05, 0.9, 0.1, false, false, false) != Biome::Marsh);
     // A warm wet shore is mangrove; a frozen one is tundra.
     ASSERT_TRUE(classify_biome(0.5, 0.8, 0.9, false, false, true) == Biome::Mangrove);
     ASSERT_TRUE(classify_biome(0.5, 0.5, 0.1, false, false, true) == Biome::Tundra);
@@ -1013,13 +1049,42 @@ static void test_yaml_round_trip_renders_every_layer() {
         ASSERT_EQ(before.pixels.size(), after.pixels.size());
         ASSERT_TRUE(before.pixels.size() > 0);
 
-        const bool from_height = layer == MapLayer::Elevation || layer == MapLayer::Composite;
-        const int tolerance = from_height ? 1 : 0;
+        // Two different tolerances, because there are two different ways six
+        // significant digits can show up in a render.
+        //
+        // On a layer derived from the *height field* the loss is smooth: a
+        // slightly different corner height tilts a Delaunay facet and moves a
+        // greyscale value by a step. Bounded per pixel.
+        //
+        // On a layer made of *hard-edged shapes* it is not smooth at all. A
+        // building footprint whose corner round-trips a ten-thousandth of a grid
+        // unit away can put one boundary pixel on the other side of the edge --
+        // a full 0-to-255 flip on that pixel, however exact everything else is.
+        // So those are bounded by *how many* pixels may differ, not by how much.
+        // Elevation only. The composite is *both* kinds of layer at once -- height
+        // shading underneath, then water, roads, building footprints and markers
+        // on top -- so one of its boundary pixels can flip a full 0-to-255 just
+        // like a structures pixel can. Classing it as smooth was over-claiming,
+        // and it held only as long as no footprint edge happened to straddle a
+        // pixel centre. The count bound below still covers it, and is what
+        // actually catches a structural regression here.
+        const bool from_height = layer == MapLayer::Elevation;
+        std::size_t differing = 0;
         for (std::size_t k = 0; k < before.pixels.size(); ++k) {
             const int delta = std::abs(static_cast<int>(before.pixels[k])
                                      - static_cast<int>(after.pixels[k]));
-            ASSERT_TRUE(delta <= tolerance);
+            if (delta == 0) {
+                continue;
+            }
+            ++differing;
+            if (from_height) {
+                ASSERT_TRUE(delta <= 1);
+            }
         }
+        // A thousandth of the image, which a structural regression would dwarf:
+        // dropping the corner elevations entirely moved 12 bytes on one layer and
+        // a whole building is some hundreds.
+        ASSERT_TRUE(differing * 1000 <= before.pixels.size());
     }
 }
 
@@ -1052,7 +1117,7 @@ static void test_disabled_passes_leave_the_graph_untouched() {
 static MapConfig road_config(int seed = 77) {
     MapConfig config;
     config.grid_size = 32;
-    config.image_size = 256;
+    set_render_size(config, 256);
     config.seed = seed;
     config.noise_island.seed = seed;
     return config;
@@ -1474,8 +1539,27 @@ static MapConfig perturbed_config() {
     config.jitter = 0.41;
     config.seed = 90210;
     config.border_length = 1.75;
-    config.image_size = 333;
+    // The render scale, set from the metres end. `image_size` is not listed
+    // separately: it is not independent of this, and the two are reconciled on
+    // load -- see the assertions in `test_config_round_trips_every_field`. It
+    // used to say `image_size = 333` beside a `meters_per_pixel` of 1.0 on a
+    // 37 x 60 m world, which is 2220 m of ground claiming to be 333 px at one
+    // pixel to the metre: a pair that could not both be true, and which only went
+    // unnoticed because the value was overwritten before anything read it.
+    config.meters_per_pixel = 3.0;
     config.png_compression_level = 4;
+    config.sea_level = 0.18;
+    config.elevation_range_m = 777.0;
+    config.river_depth_m = 2.5;
+    config.river_depth_per_volume_m = 0.6;
+    config.water_edge_overlap_m = 3.0;
+    config.terrain_relief = 0.31;
+    config.terrain_roughness = 0.44;
+    config.noise_relief = {44, 0.11, FastNoiseLite::NoiseType_Perlin,
+                           FastNoiseLite::FractalType_FBm, 3, 2.1, 0.55, 0.4};
+    config.noise_terrain = {33, 0.77, FastNoiseLite::NoiseType_Value,
+                            FastNoiseLite::FractalType_FBm, 4, 1.9, 0.45, 0.3};
+    config.shape = {MapShape::Triangle, 111.0, 222.0, 333.0, 444.0, 0.55};
     config.show_regions = false;
     config.composite_shading = CompositeShading::Hillshade;
     config.region_tint = 0.42f;
@@ -1517,6 +1601,13 @@ static MapConfig perturbed_config() {
     config.enable_towns = false;
     config.enable_landmarks = false;
     config.enable_noisy_edges = false;
+
+    // Derived last, from the grid and the scale above, so this fixture satisfies
+    // the `image_size * meters_per_pixel == grid_size * meters_per_grid_unit`
+    // invariant. A fixture that did not could not round-trip: the loader
+    // reconciles the pair, so writing out a contradiction and reading it back
+    // necessarily changes one of the two.
+    config.image_size = derive_image_size(config);
     return config;
 }
 
@@ -1577,8 +1668,25 @@ static void test_config_round_trips_every_field() {
     ASSERT_TRUE(std::abs(loaded.jitter - original.jitter) < 1e-9);
     ASSERT_EQ(loaded.seed, original.seed);
     ASSERT_TRUE(std::abs(loaded.border_length - original.border_length) < 1e-9);
+    // Both ends of the render scale, and the invariant tying them together.
+    ASSERT_TRUE(std::abs(loaded.meters_per_pixel - original.meters_per_pixel) < 1e-9);
     ASSERT_EQ(loaded.image_size, original.image_size);
+    ASSERT_EQ(loaded.image_size, derive_image_size(loaded));
     ASSERT_EQ(loaded.png_compression_level, original.png_compression_level);
+    ASSERT_TRUE(std::abs(loaded.sea_level - original.sea_level) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.elevation_range_m - original.elevation_range_m) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.river_depth_m - original.river_depth_m) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.river_depth_per_volume_m
+                         - original.river_depth_per_volume_m) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.water_edge_overlap_m - original.water_edge_overlap_m) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.terrain_relief - original.terrain_relief) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.terrain_roughness - original.terrain_roughness) < 1e-9);
+    ASSERT_TRUE(loaded.shape.shape == original.shape.shape);
+    ASSERT_TRUE(std::abs(loaded.shape.width_m - original.shape.width_m) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.shape.height_m - original.shape.height_m) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.shape.diameter_m - original.shape.diameter_m) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.shape.edge_length_m - original.shape.edge_length_m) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.shape.rotation - original.shape.rotation) < 1e-9);
     ASSERT_TRUE(loaded.show_regions == original.show_regions);
     ASSERT_TRUE(loaded.composite_shading == original.composite_shading);
     ASSERT_TRUE(std::abs(loaded.region_tint - original.region_tint) < 1e-6f);
@@ -1599,9 +1707,11 @@ static void test_config_round_trips_every_field() {
 
     // Both noise fields, which is the reason they share one pair of helpers: a
     // second hand-written copy is what falls behind.
-    const NoiseConfig* noises[2][2] = {
+    const NoiseConfig* noises[4][2] = {
         {&loaded.noise_island, &original.noise_island},
         {&loaded.noise_temperature, &original.noise_temperature},
+        {&loaded.noise_relief, &original.noise_relief},
+        {&loaded.noise_terrain, &original.noise_terrain},
     };
     for (const auto& pair : noises) {
         ASSERT_EQ(pair[0]->seed, pair[1]->seed);
@@ -1742,6 +1852,90 @@ static void test_shipped_config_matches_the_documented_defaults() {
  * what make every other size in the config mean something, so an error here
  * silently rescales the entire world rather than breaking anything visibly.
  */
+/**
+ * @brief `image_size` is an input, and setting it cannot leave the scale stale.
+ *
+ * The two render-scale fields are one knob with two ends, and the invariant
+ * `image_size * meters_per_pixel == grid_size * meters_per_grid_unit` has to
+ * hold however a caller arrives at it -- every feature is stroked in metres and
+ * converted through the scale, so a contradictory pair draws features at a width
+ * the resolution does not agree with.
+ *
+ * `image_size` used to be read out of a document and then thrown away, so
+ * `image_size: 2048` in a configuration file was silently ignored. It is now
+ * honoured, and honouring it means back-computing `meters_per_pixel`.
+ */
+static void test_config_image_size_sets_the_scale() {
+    const std::string path = "test_image_size.yaml";
+    const auto write = [&path](const char* body) {
+        std::ofstream out(path);
+        out << body;
+    };
+
+    // 1. A document naming image_size is honoured, and the scale follows it.
+    //    40 cells x 60 m = 2400 m of world in 600 px is 4 m to the pixel.
+    write("grid_size: 40\nimage_size: 600\n");
+    MapConfig from_pixels;
+    ASSERT_TRUE(load_config(path, from_pixels).status == ConfigLoad::Ok);
+    ASSERT_EQ(from_pixels.image_size, 600);
+    ASSERT_TRUE(std::abs(from_pixels.meters_per_pixel - 4.0) < 1e-12);
+    ASSERT_EQ(from_pixels.image_size, derive_image_size(from_pixels));
+
+    // 2. The other end: naming the scale sizes the render.
+    write("grid_size: 40\nmeters_per_pixel: 3\n");
+    MapConfig from_scale;
+    ASSERT_TRUE(load_config(path, from_scale).status == ConfigLoad::Ok);
+    ASSERT_EQ(from_scale.image_size, 800);
+    ASSERT_TRUE(std::abs(from_scale.meters_per_pixel - 3.0) < 1e-12);
+
+    // 3. Both given and disagreeing: image_size wins, being the more concrete
+    //    statement of intent, and the scale is corrected rather than kept.
+    write("grid_size: 40\nimage_size: 1200\nmeters_per_pixel: 37\n");
+    MapConfig both;
+    ASSERT_TRUE(load_config(path, both).status == ConfigLoad::Ok);
+    ASSERT_EQ(both.image_size, 1200);
+    ASSERT_TRUE(std::abs(both.meters_per_pixel - 2.0) < 1e-12);
+    ASSERT_EQ(both.image_size, derive_image_size(both));
+
+    // 4. Neither given: meters_per_pixel is 1.0, always, so a render is a
+    //    one-pixel-per-metre map and a pixel count off it is a measurement.
+    write("grid_size: 40\n");
+    MapConfig neither;
+    ASSERT_TRUE(load_config(path, neither).status == ConfigLoad::Ok);
+    ASSERT_TRUE(std::abs(neither.meters_per_pixel - 1.0) < 1e-12);
+    ASSERT_EQ(neither.image_size, 2400);
+
+    // 5. A default-constructed config already satisfies the invariant, rather
+    //    than starting out contradicting itself.
+    const MapConfig fresh;
+    ASSERT_TRUE(std::abs(fresh.meters_per_pixel - 1.0) < 1e-12);
+    ASSERT_EQ(fresh.image_size, derive_image_size(fresh));
+
+    std::remove(path.c_str());
+
+    // 6. And the renderer takes ONE scale: a resolution set either way round
+    //    scales markers and roads together. Two configs describing the same
+    //    world at the same resolution must render identically, whichever end
+    //    they were written from.
+    MapConfig by_pixels = small_config(5);
+    set_render_size(by_pixels, 160);
+    MapConfig by_scale = small_config(5);
+    by_scale.meters_per_pixel =
+        static_cast<double>(by_scale.grid_size) * by_scale.meters_per_grid_unit / 160.0;
+    by_scale.image_size = derive_image_size(by_scale);
+    ASSERT_EQ(by_pixels.image_size, by_scale.image_size);
+
+    MapGenerator generator(by_pixels, maps_logger());
+    generator.generate();
+    for (std::size_t i = 0; i < k_map_layer_count; ++i) {
+        const MapLayer layer = static_cast<MapLayer>(i);
+        const Image a = MapLayers::render(layer, generator.graph(), by_pixels);
+        const Image b = MapLayers::render(layer, generator.graph(), by_scale);
+        ASSERT_EQ(a.pixels.size(), b.pixels.size());
+        ASSERT_TRUE(a.pixels == b.pixels);
+    }
+}
+
 static void test_world_scale_arithmetic() {
     MapConfig config;
     config.grid_size = 80;
@@ -2039,6 +2233,15 @@ static void test_composite_shading_modes() {
 
     MapConfig by_height = small_config(12);
     by_height.composite_shading = CompositeShading::Elevation;
+    // Stripped back to bare terrain, because the brightness comparison below
+    // samples a cell at its own site and the composite draws things there. Region
+    // tint would give two grassland cells in different provinces different base
+    // colours; a landmark or settlement marker would cover the pixel outright,
+    // which is what it was doing -- both samples came back as marker blue.
+    by_height.show_regions = false;
+    by_height.enable_landmarks = false;
+    by_height.enable_towns = false;
+    by_height.enable_roads = false;
     MapConfig by_slope = by_height;
     by_slope.composite_shading = CompositeShading::Hillshade;
 
@@ -2248,7 +2451,7 @@ static void test_parallel_export_matches_serial() {
  */
 static void test_band_rendering_matches_whole_image() {
     MapConfig config = small_config(21);
-    config.image_size = 96;
+    set_render_size(config, 96);
     for (const CompositeShading shading : {CompositeShading::Elevation,
                                            CompositeShading::Hillshade}) {
         config.composite_shading = shading;
@@ -2316,6 +2519,659 @@ static void test_export_tuning_does_not_change_output() {
     ASSERT_TRUE(!reference.pixels.empty());
 }
 
+
+// --- Water levels ---------------------------------------------------------
+
+/**
+ * @brief Every body of water has one flat surface, which `elevation` does not.
+ *
+ * The sea used to render mottled because the water layer drew `elevation` -- the
+ * height of the *bed*. Only `border` corners are pinned to zero, and the rank
+ * remap then spreads every corner across [0, 1], so an ocean cell away from the
+ * map edge has a small but nonzero height. Flat water has to be stated.
+ */
+static void test_water_bodies_are_flat() {
+    MapConfig config = world_config(17);
+    MapGenerator generator(config, maps_logger());
+    generator.generate();
+    const MapGraph& graph = generator.graph();
+
+    std::size_t ocean_cells = 0;
+    for (const MapCenter& center : graph.centers) {
+        if (!center.ocean) {
+            continue;
+        }
+        ++ocean_cells;
+        ASSERT_TRUE(center.water_level == config.sea_level);
+    }
+    ASSERT_TRUE(ocean_cells > 0);
+
+    // And the bug this guards: the bed really does vary, so a flat surface is
+    // not something that would have fallen out by accident.
+    double lowest_bed = 1.0;
+    double highest_bed = 0.0;
+    for (const MapCenter& center : graph.centers) {
+        if (center.ocean) {
+            lowest_bed = std::min(lowest_bed, center.elevation);
+            highest_bed = std::max(highest_bed, center.elevation);
+        }
+    }
+    ASSERT_TRUE(highest_bed > lowest_bed);
+
+    // Each lake is one surface across every cell of the body, and that surface
+    // is at or above the highest bed in it, so no basin pokes through.
+    std::vector<bool> visited(graph.centers.size(), false);
+    std::size_t lakes = 0;
+    for (const MapCenter& seed : graph.centers) {
+        const std::size_t seed_index = static_cast<std::size_t>(seed.index);
+        if (!seed.water || seed.ocean || visited[seed_index]) {
+            continue;
+        }
+        ++lakes;
+        std::vector<CenterId> pending{seed.index};
+        visited[seed_index] = true;
+        const double level = seed.water_level;
+        while (!pending.empty()) {
+            const CenterId current = pending.back();
+            pending.pop_back();
+            const MapCenter& cell = graph.centers[static_cast<std::size_t>(current)];
+            ASSERT_TRUE(cell.water_level == level);
+            ASSERT_TRUE(level >= cell.elevation - 1e-12);
+            for (const CenterId neighbor_id : cell.neighbors) {
+                const std::size_t index = static_cast<std::size_t>(neighbor_id);
+                const MapCenter& neighbor = graph.centers[index];
+                if (!visited[index] && neighbor.water && !neighbor.ocean) {
+                    visited[index] = true;
+                    pending.push_back(neighbor_id);
+                }
+            }
+        }
+    }
+    ASSERT_TRUE(lakes > 0);
+}
+
+/** @brief The open sea renders as one grey, because it is one surface. */
+static void test_water_layer_draws_one_grey_over_open_sea() {
+    MapConfig config = small_config(17);
+    MapGenerator generator(config, maps_logger());
+    generator.generate();
+
+    const Image water = MapLayers::water(generator.graph(), config);
+    // The outermost ring is inside the forced-water border band under every
+    // shape, so it is open sea whatever the terrain did.
+    const glm::vec3 corner = water.color_at(0, 0);
+    for (int i = 0; i < water.width; ++i) {
+        for (const int y : {0, water.height - 1}) {
+            ASSERT_TRUE(water.color_at(i, y).r == corner.r);
+        }
+        for (const int x : {0, water.width - 1}) {
+            ASSERT_TRUE(water.color_at(x, i).r == corner.r);
+        }
+    }
+}
+
+// --- Elevation sampling ---------------------------------------------------
+
+/**
+ * @brief The sampled surface interpolates the control mesh, and joins across cells.
+ *
+ * Barycentric interpolation replaced inverse-distance weighting, which read as a
+ * plateau: every corner is roughly equidistant from the middle of a cell, so most
+ * of the interior came out near the mean of the corners. What has to survive the
+ * change is that the surface still passes through the values it interpolates and
+ * still meets itself at a shared edge.
+ */
+static void test_elevation_interpolates_and_joins() {
+    MapConfig config = world_config(23);
+    MapGenerator generator(config, maps_logger());
+    generator.generate();
+    const MapGraph& graph = generator.graph();
+
+    std::size_t checked = 0;
+    for (const MapCenter& center : graph.centers) {
+        if (center.corners.size() < 3 || center.border) {
+            continue;
+        }
+        // At a site the surface passes through that site's own height: the sites
+        // are the interpolation vertices now, not the corners. A Voronoi corner
+        // is interior to a Delaunay triangle, so its own `elevation` is *not*
+        // what the surface reads there, and asserting otherwise was a leftover
+        // from the corner-fan interpolation this replaced.
+        ASSERT_TRUE(std::abs(graph.elevation_at(center, center.point.x, center.point.y)
+                             - center.elevation) < 1e-9);
+        // A sample anywhere in the cell stays in range. Deliberately not asserted
+        // against the three sites around the nearest *corner*: a Delaunay triangle
+        // with an obtuse angle has its circumcentre outside itself, so the
+        // triangle claiming a corner need not be the one that corner belongs to,
+        // and bounding by that corner's own sites is not an invariant.
+        for (const CornerId corner_id : center.corners) {
+            const MapCorner& corner = graph.corners[static_cast<std::size_t>(corner_id)];
+            const double sampled = graph.elevation_at(center, corner.point.x, corner.point.y);
+            ASSERT_TRUE(sampled >= 0.0 && sampled <= 1.0);
+        }
+        if (++checked >= 40) {
+            break;
+        }
+    }
+    ASSERT_TRUE(checked > 0);
+
+    // Continuity: along an edge two cells share, both sides interpolate between
+    // the same two corner heights, so both must agree.
+    std::size_t seams = 0;
+    for (const MapEdge& edge : graph.edges) {
+        if (edge.d0 == k_invalid_id || edge.d1 == k_invalid_id
+            || edge.v0 == k_invalid_id || edge.v1 == k_invalid_id) {
+            continue;
+        }
+        const MapCenter& a = graph.centers[static_cast<std::size_t>(edge.d0)];
+        const MapCenter& b = graph.centers[static_cast<std::size_t>(edge.d1)];
+        if (a.corners.size() < 3 || b.corners.size() < 3) {
+            continue;
+        }
+        const MapPoint& mid = edge.midpoint;
+        const double from_a = graph.elevation_at(a, mid.x, mid.y);
+        const double from_b = graph.elevation_at(b, mid.x, mid.y);
+        ASSERT_TRUE(std::abs(from_a - from_b) < 1e-6);
+        if (++seams >= 200) {
+            break;
+        }
+    }
+    ASSERT_TRUE(seams > 0);
+}
+
+/**
+ * @brief Roughness displaces the surface inland and never at the coast.
+ *
+ * The taper is the whole point: scaled by the local height, so a shoreline stays
+ * exactly at sea level and no land is nudged below it however rough the rest gets.
+ */
+static void test_terrain_roughness_tapers_to_the_coast() {
+    MapConfig config = world_config(29);
+    MapGenerator generator(config, maps_logger());
+    generator.generate();
+    const MapGraph& graph = generator.graph();
+
+    const Noise terrain(config.noise_terrain);
+
+    MapConfig smooth = config;
+    smooth.terrain_roughness = 0.0;
+    const TerrainDetail none = make_terrain_detail(smooth, terrain);
+
+    MapConfig rough = config;
+    rough.terrain_roughness = 0.6;
+    const TerrainDetail detail = make_terrain_detail(rough, terrain);
+
+    std::size_t displaced = 0;
+    for (const MapCenter& center : graph.centers) {
+        if (center.corners.size() < 3) {
+            continue;
+        }
+        const double x = center.point.x;
+        const double y = center.point.y;
+        const double base = graph.elevation_at(center, x, y);
+
+        // Zero roughness is the control mesh, exactly.
+        ASSERT_TRUE(graph.elevation_at(center, x, y, none) == base);
+
+        const double displaced_height = graph.elevation_at(center, x, y, detail);
+        ASSERT_TRUE(displaced_height >= 0.0 && displaced_height <= 1.0);
+        if (base == 0.0) {
+            // At sea level the taper leaves nothing to displace.
+            ASSERT_TRUE(displaced_height == 0.0);
+        } else if (displaced_height != base) {
+            ++displaced;
+        }
+    }
+    // Inland, it actually does something -- otherwise the taper test above would
+    // pass on a knob that did nothing at all.
+    ASSERT_TRUE(displaced > 0);
+}
+
+// --- Regions layer --------------------------------------------------------
+
+static void test_regions_layer_draws_regions_and_borders() {
+    MapConfig config = world_config(37);
+    MapGenerator generator(config, maps_logger());
+    generator.generate();
+    const MapGraph& graph = generator.graph();
+    ASSERT_TRUE(!graph.regions.empty());
+
+    const BiomePalette palette;
+    const Image regions = MapLayers::regions(graph, config, palette);
+    ASSERT_EQ(regions.channels, 3);
+
+    // Every pixel is exactly one region's colour or exactly the background --
+    // nothing else, no third value. That is the property that makes the layer
+    // readable as data, and it is why the near-black country borders that used
+    // to be stroked over the fills are gone: they were neither, and a consumer
+    // recovering a region from a pixel had no answer for them.
+    std::size_t region_pixels = 0;
+    for (int y = 0; y < regions.height; ++y) {
+        for (int x = 0; x < regions.width; ++x) {
+            const glm::vec3 found = regions.color_at(x, y);
+            if (found == palette.background_color) {
+                continue;
+            }
+            bool matched = false;
+            for (const MapRegion& region : graph.regions) {
+                matched = matched || found == region.color;
+            }
+            ASSERT_TRUE(matched);
+            ++region_pixels;
+        }
+    }
+    ASSERT_TRUE(region_pixels > 0);
+
+    // With no political geography there is nothing to draw.
+    MapConfig stateless = config;
+    stateless.enable_regions = false;
+    MapGenerator plain(stateless, maps_logger());
+    plain.generate();
+    const Image empty = MapLayers::regions(plain.graph(), stateless, palette);
+    for (int y = 0; y < empty.height; ++y) {
+        for (int x = 0; x < empty.width; ++x) {
+            ASSERT_TRUE(empty.color_at(x, y) == palette.background_color);
+        }
+    }
+}
+
+// --- Landmass shapes ------------------------------------------------------
+
+/**
+ * @brief The default shape is the square frame it replaced, to the last bit.
+ *
+ * `shape_inset()` took over a hard-coded square test that every map ever
+ * generated went through, so this is the regression guard that matters most:
+ * `min(half - |dx|)` over a canvas-spanning rectangle has to equal
+ * `min(x, grid - x, y, grid - y)` for every point, or every existing map moves.
+ */
+static void test_default_shape_matches_the_square_frame() {
+    MapConfig config;
+    config.grid_size = 40;
+    const double grid = static_cast<double>(config.grid_size);
+
+    for (double y = -3.0; y <= grid + 3.0; y += 0.37) {
+        for (double x = -3.0; x <= grid + 3.0; x += 0.37) {
+            const double expected = std::min(std::min(x, grid - x), std::min(y, grid - y));
+            ASSERT_TRUE(std::abs(shape_inset(config, x, y) - expected) < 1e-9);
+        }
+    }
+}
+
+/** @brief Every shape names itself, and an unknown name falls back to a rectangle. */
+static void test_shape_names_round_trip() {
+    for (std::size_t i = 0; i < k_map_shape_count; ++i) {
+        const MapShape shape = static_cast<MapShape>(i);
+        ASSERT_TRUE(map_shape_from_name(map_shape_name(shape)) == shape);
+    }
+    ASSERT_TRUE(map_shape_from_name("rect") == MapShape::Rectangle);
+    ASSERT_TRUE(map_shape_from_name("hexagon") == MapShape::Rectangle);
+}
+
+/**
+ * @brief Land lands inside the chosen shape, and the sea fills the rest.
+ *
+ * Checked through a generated map rather than against `shape_inset()` directly,
+ * so what is verified is that the border flag really does propagate into the
+ * water pass and out the other side as coastline.
+ */
+static void test_shapes_confine_the_landmass() {
+    struct Case { MapShape shape; double size_m; double rotation; };
+    const Case cases[] = {
+        {MapShape::Rectangle, 1200.0, 0.0},
+        {MapShape::Circle, 1400.0, 0.0},
+        {MapShape::Triangle, 1600.0, 0.5},
+    };
+
+    for (const Case& test_case : cases) {
+        MapConfig config = world_config(41);
+        config.shape.shape = test_case.shape;
+        config.shape.width_m = test_case.size_m;
+        config.shape.height_m = test_case.size_m;
+        config.shape.diameter_m = test_case.size_m;
+        config.shape.edge_length_m = test_case.size_m;
+        config.shape.rotation = test_case.rotation;
+
+        MapGenerator generator(config, maps_logger());
+        generator.generate();
+        const MapGraph& graph = generator.graph();
+
+        std::size_t land = 0;
+        for (const MapCenter& center : graph.centers) {
+            const double inset = shape_inset(config, center.point.x, center.point.y);
+            if (!center.water) {
+                // Dry land is inside the shape. The cell's site can sit a little
+                // inside the border band while a corner of it reaches out, which
+                // is what the tolerance allows for.
+                ASSERT_TRUE(inset > 0.0);
+                ++land;
+            }
+            // Well outside the shape, everything is sea.
+            if (inset < -2.0) {
+                ASSERT_TRUE(center.water);
+            }
+        }
+        ASSERT_TRUE(land > 0);
+    }
+}
+
+
+/**
+ * @brief Relief reshapes where the high ground is without breaking what depends on it.
+ *
+ * The distance-from-coast field puts every summit on the medial axis of the
+ * landmass, so relief blends it toward noise. Three things have to survive that:
+ * the coast stays the lowest land, land stays above water so rivers run the right
+ * way, and zero still means the untouched field.
+ */
+static void test_terrain_relief_reshapes_without_breaking_drainage() {
+    MapConfig flat = world_config(53);
+    flat.terrain_relief = 0.0;
+    MapGenerator plain(flat, maps_logger());
+    plain.generate();
+
+    MapConfig shaped = flat;
+    shaped.terrain_relief = 0.7;
+    MapGenerator hilly(shaped, maps_logger());
+    hilly.generate();
+
+    // It actually changes the terrain -- otherwise the invariants below would
+    // hold on a knob that did nothing.
+    std::size_t moved = 0;
+    ASSERT_EQ(plain.graph().corners.size(), hilly.graph().corners.size());
+    for (std::size_t i = 0; i < plain.graph().corners.size(); ++i) {
+        if (plain.graph().corners[i].elevation != hilly.graph().corners[i].elevation) {
+            ++moved;
+        }
+    }
+    ASSERT_TRUE(moved * 4 > plain.graph().corners.size());
+
+    // The drainage still drains, which is the property the relief blend was built
+    // around. `apply_relief_` lifts land clear of water precisely so that water
+    // cannot outrank a coastal corner -- but it is not asserted directly here,
+    // because `smooth_elevations_` runs afterwards and deliberately relaxes
+    // corners across the shore, so the strict separation is gone by the time the
+    // graph is observable. What survives is that no watercourse climbs, and that
+    // every single one of them ends in water -- see
+    // `test_every_river_ends_in_a_water_body` for why that is not a majority.
+    const MapGraph& graph = hilly.graph();
+    ASSERT_TRUE(!graph.rivers.empty());
+
+    for (const MapRiver& river : graph.rivers) {
+        for (std::size_t i = 0; i + 1 < river.corners.size(); ++i) {
+            const MapCorner& from =
+                graph.corners[static_cast<std::size_t>(river.corners[i])];
+            const MapCorner& to =
+                graph.corners[static_cast<std::size_t>(river.corners[i + 1])];
+            ASSERT_TRUE(to.elevation <= from.elevation);
+        }
+        const MapCorner& mouth =
+            graph.corners[static_cast<std::size_t>(river.corners.back())];
+        ASSERT_TRUE(mouth.coast || mouth.water);
+    }
+}
+
+
+/**
+ * @brief Every river ends in a lake or the sea, and the terrain guarantees it.
+ *
+ * Two properties, and the second is the one that makes the first hold rather
+ * than merely happen to be true on this seed.
+ *
+ * A river is a walk down `downslope`, so where it ends is decided entirely by
+ * the height field. Relief noise, the rank remap and two smoothing passes each
+ * move corners independently of their neighbours, and any of them can leave a
+ * corner lower than everything around it. That corner is a pit, and a river that
+ * reaches one stops in the middle of a field. It was not a rare accident: 80 of
+ * 11 438 land corners were pits, and 23 of 55 rivers ended dry.
+ *
+ * `PassElevation::fill_depressions_` removes them, so the assertion here is on
+ * the terrain and not on the rivers: *every* dry corner must have a strictly
+ * lower neighbour, which by induction gives it a descending path to water. That
+ * is a much stronger statement than "the 55 rivers this seed happened to place
+ * all found the sea", and it is what a caller adding rivers, changing their
+ * sources or sampling flow directly can rely on.
+ */
+/**
+ * @brief A cell with water in it is classified as water, on every map.
+ *
+ * The layer a reader actually looks at is coloured by *biome*, not by
+ * `MapCenter::water`, so those two disagreeing is a visible defect however sound
+ * the underlying data is. `classify_biome()` used to hand a low water cell
+ * `Marsh` and a high one `Ice` -- dark green and near-white -- so a river that
+ * ended in a shallow lake ended in what reads as forest. 18% of them did, and a
+ * lake you cannot see is indistinguishable from no lake at all.
+ *
+ * Asserted over a generated map rather than on the classifier alone because the
+ * two can disagree through the *arguments*: `PassBiomes` passes
+ * `land_height()`, so the thresholds are fractions of the land range, and it was
+ * exactly that rescale -- moving the waterline off zero -- that pushed most
+ * lakes under the old 0.1 marsh threshold. A table test on
+ * `classify_biome()` would have stayed green throughout.
+ */
+static void test_water_cells_always_get_a_water_biome() {
+    MapGenerator generator(world_config(), maps_logger());
+    generator.generate();
+    const MapGraph& graph = generator.graph();
+
+    std::size_t water_cells = 0;
+    for (const MapCenter& center : graph.centers) {
+        if (!center.water) {
+            // And the converse: dry land never claims a water biome.
+            ASSERT_TRUE(center.biome != Biome::Ocean && center.biome != Biome::Lake
+                        && center.biome != Biome::Ice);
+            continue;
+        }
+        ++water_cells;
+        ASSERT_TRUE(center.biome == Biome::Ocean || center.biome == Biome::Lake
+                    || center.biome == Biome::Ice);
+        ASSERT_TRUE(center.ocean == (center.biome == Biome::Ocean));
+    }
+    ASSERT_TRUE(water_cells > 0);
+
+    // Which is what makes this true: every river empties into a cell whose
+    // *colour* is water.
+    ASSERT_TRUE(!graph.rivers.empty());
+    for (const MapRiver& river : graph.rivers) {
+        const MapCorner& mouth =
+            graph.corners[static_cast<std::size_t>(river.corners.back())];
+        bool into_water = false;
+        for (const CenterId center_id : mouth.touches) {
+            const MapCenter& center = graph.centers[static_cast<std::size_t>(center_id)];
+            into_water = into_water
+                || center.biome == Biome::Ocean || center.biome == Biome::Lake
+                || center.biome == Biome::Ice;
+        }
+        ASSERT_TRUE(into_water);
+    }
+}
+
+static void test_every_river_ends_in_a_water_body() {
+    MapGenerator generator(world_config(), maps_logger());
+    generator.generate();
+    const MapGraph& graph = generator.graph();
+    ASSERT_TRUE(!graph.rivers.empty());
+
+    const auto wet = [](const MapCorner& corner) { return corner.water || corner.coast; };
+
+    // 1. No pit anywhere on dry land.
+    std::size_t dry_corners = 0;
+    for (const MapCorner& corner : graph.corners) {
+        if (wet(corner)) {
+            continue;
+        }
+        ++dry_corners;
+        bool has_lower = false;
+        for (const CornerId neighbor_id : corner.adjacent) {
+            has_lower = has_lower
+                || graph.corners[static_cast<std::size_t>(neighbor_id)].elevation
+                       < corner.elevation;
+        }
+        ASSERT_TRUE(has_lower);
+        // Which is exactly the condition under which `downslope` leaves.
+        ASSERT_TRUE(corner.downslope != corner.index);
+    }
+    ASSERT_TRUE(dry_corners > 0);
+
+    // 2. Therefore a downhill walk from any dry corner at all -- not just from
+    //    the corners rivers were seeded on -- arrives at water.
+    for (const MapCorner& start : graph.corners) {
+        if (wet(start)) {
+            continue;
+        }
+        CornerId current = start.index;
+        std::size_t steps = 0;
+        while (!wet(graph.corners[static_cast<std::size_t>(current)])) {
+            const MapCorner& corner = graph.corners[static_cast<std::size_t>(current)];
+            ASSERT_TRUE(corner.downslope != current);
+            current = corner.downslope;
+            ++steps;
+            ASSERT_TRUE(steps <= graph.corners.size());
+        }
+    }
+
+    // 3. And the rivers themselves land on it: a mouth in water, and no corner
+    //    before the mouth already in water -- a river that ran on past a
+    //    shoreline would be drawing a channel across a lake's surface.
+    for (const MapRiver& river : graph.rivers) {
+        ASSERT_TRUE(wet(graph.corners[static_cast<std::size_t>(river.corners.back())]));
+        for (std::size_t i = 0; i + 1 < river.corners.size(); ++i) {
+            ASSERT_TRUE(!wet(graph.corners[static_cast<std::size_t>(river.corners[i])]));
+        }
+    }
+}
+
+
+/**
+ * @brief The waterline is a real height: the sea below it, everything else above.
+ *
+ * This is what makes "the ground here is under water" a comparison worth making,
+ * and it was vacuous before -- the whole field started at zero with the sea
+ * pinned to the bottom of it, so nothing was ever below sea level and the sea's
+ * own surface rendered as the same black as dry land.
+ */
+static void test_waterline_separates_sea_from_land() {
+    MapConfig config = world_config(61);
+    MapGenerator generator(config, maps_logger());
+    generator.generate();
+    const MapGraph& graph = generator.graph();
+
+    std::size_t sea_corners = 0;
+    std::size_t ground_corners = 0;
+    for (const MapCorner& corner : graph.corners) {
+        if (corner.ocean) {
+            ASSERT_TRUE(corner.elevation < config.sea_level);
+            ++sea_corners;
+        } else {
+            ASSERT_TRUE(corner.elevation >= config.sea_level);
+            ++ground_corners;
+        }
+    }
+    ASSERT_TRUE(sea_corners > 0);
+    ASSERT_TRUE(ground_corners > 0);
+
+    // Land-relative height is what every threshold describing land is phrased
+    // against, so it has to put the shoreline at 0 and the summit at 1.
+    ASSERT_TRUE(land_height(config, config.sea_level) == 0.0f);
+    ASSERT_TRUE(std::abs(land_height(config, 1.0) - 1.0) < 1e-12);
+    ASSERT_TRUE(land_height(config, 0.0) == 0.0);  // submerged clamps to the shore
+
+    // And the vertical scale round-trips, which is what lets a depth be stated
+    // in metres at all.
+    ASSERT_TRUE(std::abs(height_to_meters(config, meters_to_height(config, 42.0)) - 42.0) < 1e-9);
+}
+
+/**
+ * @brief A river's surface stands above the ground it runs over, and only falls.
+ *
+ * A river is water in a channel, not a line painted on the terrain. Drawn at
+ * exactly ground height -- which it was -- a mesh built from the ground and the
+ * water fights itself along every watercourse.
+ */
+static void test_river_surface_sits_above_the_ground() {
+    MapConfig config = world_config(67);
+    MapGenerator generator(config, maps_logger());
+    generator.generate();
+    const MapGraph& graph = generator.graph();
+    ASSERT_TRUE(!graph.rivers.empty());
+
+    for (const MapRiver& river : graph.rivers) {
+        for (std::size_t i = 0; i < river.corners.size(); ++i) {
+            const MapCorner& corner =
+                graph.corners[static_cast<std::size_t>(river.corners[i])];
+            const double depth = config.river_depth_m
+                               + config.river_depth_per_volume_m
+                                     * static_cast<double>(corner.river);
+            ASSERT_TRUE(depth > 0.0);
+            const double surface = corner.elevation + meters_to_height(config, depth);
+            ASSERT_TRUE(surface > corner.elevation);
+
+            if (i + 1 < river.corners.size()) {
+                const MapCorner& next =
+                    graph.corners[static_cast<std::size_t>(river.corners[i + 1])];
+                ASSERT_TRUE(next.elevation <= corner.elevation);
+            }
+        }
+    }
+}
+
+/**
+ * @brief Inside a body of water the flat surface wins, and it overhangs its edge.
+ *
+ * Rivers are stroked at ground height plus a depth, so drawing them *after* the
+ * bodies -- which is what happened -- gouged a channel across every flat lake a
+ * river ran into. And two surfaces that share an edge exactly show a seam
+ * wherever their meshes disagree by a rounding error, which along a coastline is
+ * everywhere, so the water is extended past its own edge.
+ */
+static void test_water_bodies_win_inside_and_overhang_their_edge() {
+    MapConfig config = small_config(71);
+    MapGenerator generator(config, maps_logger());
+    generator.generate();
+    const MapGraph& graph = generator.graph();
+
+    const Image water = MapLayers::water(graph, config);
+    const double scale =
+        static_cast<double>(config.image_size) / static_cast<double>(config.grid_size);
+
+    std::size_t checked = 0;
+    for (const MapCenter& center : graph.centers) {
+        if (!center.water) {
+            continue;
+        }
+        const int expected =
+            static_cast<int>(std::clamp(center.water_level, 0.0, 1.0) * 255.0);
+        for (const CornerId corner_id : center.corners) {
+            // Sampled well inside the cell, so the overlap rim of a neighbour
+            // cannot account for a mismatch.
+            const MapPoint& corner = graph.corners[static_cast<std::size_t>(corner_id)].point;
+            const int x = static_cast<int>((corner.x + (center.point.x - corner.x) * 0.7) * scale);
+            const int y = static_cast<int>((corner.y + (center.point.y - corner.y) * 0.7) * scale);
+            if (x < 0 || y < 0 || x >= water.width || y >= water.height) {
+                continue;
+            }
+            ASSERT_EQ(static_cast<int>(water.color_at(x, y).r), expected);
+            ++checked;
+        }
+    }
+    ASSERT_TRUE(checked > 0);
+
+    // The overhang: some pixels that are dry land carry a water height, because
+    // the sheet reaches past its own shoreline.
+    MapConfig sharp = config;
+    sharp.water_edge_overlap_m = 0.0;
+    const Image tight = MapLayers::water(graph, sharp);
+    std::size_t wider = 0;
+    for (int y = 0; y < water.height; ++y) {
+        for (int x = 0; x < water.width; ++x) {
+            if (water.color_at(x, y).r > 0.0f && tight.color_at(x, y).r == 0.0f) {
+                ++wider;
+            }
+        }
+    }
+    ASSERT_TRUE(wider > 0);
+}
+
 } // namespace maps_test
 
 
@@ -2333,6 +3189,8 @@ int main() {
     RUN_TEST(maps_test::test_graph_invariants_hold);
     RUN_TEST(maps_test::test_water_separates_ocean_from_lakes);
     RUN_TEST(maps_test::test_rivers_terminate_on_hostile_terrain);
+    RUN_TEST(maps_test::test_every_river_ends_in_a_water_body);
+    RUN_TEST(maps_test::test_water_cells_always_get_a_water_biome);
     RUN_TEST(maps_test::test_rivers_flow_downhill_to_the_coast);
     RUN_TEST(maps_test::test_noisy_edges_subdivide_only_when_enabled);
     RUN_TEST(maps_test::test_towns_sit_on_habitable_land_and_stay_apart);
@@ -2367,6 +3225,7 @@ int main() {
     RUN_TEST(maps_test::test_config_round_trips_every_field);
     RUN_TEST(maps_test::test_load_config_overrides_only_what_it_names);
     RUN_TEST(maps_test::test_shipped_config_matches_the_documented_defaults);
+    RUN_TEST(maps_test::test_config_image_size_sets_the_scale);
     RUN_TEST(maps_test::test_world_scale_arithmetic);
     RUN_TEST(maps_test::test_features_render_at_their_configured_size);
     RUN_TEST(maps_test::test_stroke_width_is_direction_independent);
@@ -2381,6 +3240,18 @@ int main() {
     RUN_TEST(maps_test::test_parallel_export_matches_serial);
     RUN_TEST(maps_test::test_band_rendering_matches_whole_image);
     RUN_TEST(maps_test::test_export_tuning_does_not_change_output);
+    RUN_TEST(maps_test::test_water_bodies_are_flat);
+    RUN_TEST(maps_test::test_water_layer_draws_one_grey_over_open_sea);
+    RUN_TEST(maps_test::test_elevation_interpolates_and_joins);
+    RUN_TEST(maps_test::test_terrain_roughness_tapers_to_the_coast);
+    RUN_TEST(maps_test::test_regions_layer_draws_regions_and_borders);
+    RUN_TEST(maps_test::test_default_shape_matches_the_square_frame);
+    RUN_TEST(maps_test::test_shape_names_round_trip);
+    RUN_TEST(maps_test::test_shapes_confine_the_landmass);
+    RUN_TEST(maps_test::test_terrain_relief_reshapes_without_breaking_drainage);
+    RUN_TEST(maps_test::test_waterline_separates_sea_from_land);
+    RUN_TEST(maps_test::test_river_surface_sits_above_the_ground);
+    RUN_TEST(maps_test::test_water_bodies_win_inside_and_overhang_their_edge);
 
     std::cout << "===========================================" << std::endl;
     std::cout << "Test Summary: " << g_tests_run - g_tests_failed << " / " << g_tests_run << " Passed." << std::endl;

@@ -261,11 +261,15 @@ inline fkyaml::node config_to_node(const MapConfig& config) {
     node["grid_size"] = config.grid_size;
     node["jitter"] = config.jitter;
     node["meters_per_grid_unit"] = config.meters_per_grid_unit;
+    node["elevation_range_m"] = config.elevation_range_m;
     node["meters_per_pixel"] = config.meters_per_pixel;
     node["composite_shading"] = std::string(composite_shading_name(config.composite_shading));
     node["image_size"] = config.image_size;
     node["png_compression_level"] = config.png_compression_level;
     node["border_length"] = config.border_length;
+    node["sea_level"] = config.sea_level;
+    node["terrain_relief"] = config.terrain_relief;
+    node["terrain_roughness"] = config.terrain_roughness;
     node["threshold_water"] = config.threshold_water;
     node["threshold_water_count"] = config.threshold_water_count;
     node["river_count"] = config.river_count;
@@ -275,6 +279,9 @@ inline fkyaml::node config_to_node(const MapConfig& config) {
     node["river_smoothing_iterations"] = config.river_smoothing_iterations;
     node["river_width_base_m"] = config.river_width_base_m;
     node["river_width_per_volume_m"] = config.river_width_per_volume_m;
+    node["river_depth_m"] = config.river_depth_m;
+    node["river_depth_per_volume_m"] = config.river_depth_per_volume_m;
+    node["water_edge_overlap_m"] = config.water_edge_overlap_m;
     node["trail_width_m"] = config.trail_width_m;
     node["road_width_m"] = config.road_width_m;
     node["highway_width_m"] = config.highway_width_m;
@@ -287,6 +294,17 @@ inline fkyaml::node config_to_node(const MapConfig& config) {
     node["region_tint"] = config.region_tint;
     node["noise_island"] = detail::noise_to_node(config.noise_island);
     node["noise_temperature"] = detail::noise_to_node(config.noise_temperature);
+    node["noise_relief"] = detail::noise_to_node(config.noise_relief);
+    node["noise_terrain"] = detail::noise_to_node(config.noise_terrain);
+    fkyaml::node shape = fkyaml::node::mapping();
+    shape["shape"] = std::string(map_shape_name(config.shape.shape));
+    shape["width_m"] = config.shape.width_m;
+    shape["height_m"] = config.shape.height_m;
+    shape["diameter_m"] = config.shape.diameter_m;
+    shape["edge_length_m"] = config.shape.edge_length_m;
+    shape["rotation"] = config.shape.rotation;
+
+    node["shape"] = std::move(shape);
     node["towns"] = std::move(towns);
     node["roads"] = std::move(roads);
     node["regions"] = std::move(regions);
@@ -303,8 +321,13 @@ inline fkyaml::node config_to_node(const MapConfig& config) {
  * caller's defaults rather than replace them wholesale, and it is also why a map
  * saved before a parameter existed still loads.
  *
+ * The one field that does not simply pass through is `MapConfig::image_size`,
+ * which is reconciled against `meters_per_pixel` at the end: naming either one
+ * sets the other, so the pair cannot leave here disagreeing about how much
+ * ground a pixel covers. See `MapConfig::image_size`.
+ *
  * @param node The mapping node to decode; a non-mapping node applies nothing.
- * @param config Updated in place.
+ * @param config Updated in place; its render scale is left self-consistent.
  */
 inline void apply_config_node(const fkyaml::node& node, MapConfig& config) {
     if (!node.is_mapping()) {
@@ -316,6 +339,8 @@ inline void apply_config_node(const fkyaml::node& node, MapConfig& config) {
     config.jitter = detail::read_or(node, "jitter", config.jitter);
     config.meters_per_grid_unit =
         detail::read_or(node, "meters_per_grid_unit", config.meters_per_grid_unit);
+    config.elevation_range_m =
+        detail::read_or(node, "elevation_range_m", config.elevation_range_m);
     config.meters_per_pixel = detail::read_or(node, "meters_per_pixel", config.meters_per_pixel);
     config.composite_shading = composite_shading_from_name(detail::read_or(
         node, "composite_shading", std::string(composite_shading_name(config.composite_shading))));
@@ -323,6 +348,10 @@ inline void apply_config_node(const fkyaml::node& node, MapConfig& config) {
     config.png_compression_level =
         detail::read_or(node, "png_compression_level", config.png_compression_level);
     config.border_length = detail::read_or(node, "border_length", config.border_length);
+    config.sea_level = detail::read_or(node, "sea_level", config.sea_level);
+    config.terrain_relief = detail::read_or(node, "terrain_relief", config.terrain_relief);
+    config.terrain_roughness =
+        detail::read_or(node, "terrain_roughness", config.terrain_roughness);
     config.threshold_water = detail::read_or(node, "threshold_water", config.threshold_water);
     config.threshold_water_count = detail::read_or(node, "threshold_water_count", config.threshold_water_count);
     config.river_count = detail::read_or(node, "river_count", config.river_count);
@@ -336,6 +365,11 @@ inline void apply_config_node(const fkyaml::node& node, MapConfig& config) {
     config.river_width_base_m = detail::read_or(node, "river_width_base_m", config.river_width_base_m);
     config.river_width_per_volume_m =
         detail::read_or(node, "river_width_per_volume_m", config.river_width_per_volume_m);
+    config.river_depth_m = detail::read_or(node, "river_depth_m", config.river_depth_m);
+    config.river_depth_per_volume_m =
+        detail::read_or(node, "river_depth_per_volume_m", config.river_depth_per_volume_m);
+    config.water_edge_overlap_m =
+        detail::read_or(node, "water_edge_overlap_m", config.water_edge_overlap_m);
     config.trail_width_m = detail::read_or(node, "trail_width_m", config.trail_width_m);
     config.road_width_m = detail::read_or(node, "road_width_m", config.road_width_m);
     config.highway_width_m = detail::read_or(node, "highway_width_m", config.highway_width_m);
@@ -383,6 +417,8 @@ inline void apply_config_node(const fkyaml::node& node, MapConfig& config) {
 
     detail::noise_from_node(node, "noise_island", config.noise_island);
     detail::noise_from_node(node, "noise_temperature", config.noise_temperature);
+    detail::noise_from_node(node, "noise_relief", config.noise_relief);
+    detail::noise_from_node(node, "noise_terrain", config.noise_terrain);
 
     if (node.contains("regions")) {
         const fkyaml::node& regions = node.at("regions");
@@ -462,6 +498,18 @@ inline void apply_config_node(const fkyaml::node& node, MapConfig& config) {
             detail::read_or(roads, "smoothing_iterations", target.smoothing_iterations);
     }
 
+    if (node.contains("shape")) {
+        const fkyaml::node& shape = node.at("shape");
+        ShapeConfig& target = config.shape;
+        target.shape = map_shape_from_name(
+            detail::read_or(shape, "shape", std::string(map_shape_name(target.shape))));
+        target.width_m = detail::read_or(shape, "width_m", target.width_m);
+        target.height_m = detail::read_or(shape, "height_m", target.height_m);
+        target.diameter_m = detail::read_or(shape, "diameter_m", target.diameter_m);
+        target.edge_length_m = detail::read_or(shape, "edge_length_m", target.edge_length_m);
+        target.rotation = detail::read_or(shape, "rotation", target.rotation);
+    }
+
     if (node.contains("towns")) {
         const fkyaml::node& towns = node.at("towns");
         config.towns.town_count = detail::read_or(towns, "town_count", config.towns.town_count);
@@ -503,6 +551,32 @@ inline void apply_config_node(const fkyaml::node& node, MapConfig& config) {
         config.towns.rotation_jitter = detail::read_or(towns, "rotation_jitter", config.towns.rotation_jitter);
         config.towns.infill_attempts = detail::read_or(towns, "infill_attempts", config.towns.infill_attempts);
     }
+
+    // Last, because reconciling the two render-scale fields needs all of
+    // `grid_size`, `meters_per_grid_unit`, `meters_per_pixel` and `image_size`
+    // already read.
+    //
+    // The two ends of the scale must never disagree -- every feature is stroked
+    // in METRES and converted through `meters_per_pixel`, so a document naming a
+    // resolution and leaving a stale scale beside it would render a "10 m
+    // highway" at whatever width the stale number implied. `image_size` wins
+    // where both appear, because a pixel count is the more concrete statement of
+    // intent, and the scale is back-computed to match it.
+    //
+    // Presence has to be tested rather than inferred: `image_size` has an
+    // in-struct default, so a document naming that exact value is
+    // indistinguishable from a document that said nothing -- the same problem
+    // `ConfigLoadResult::has_seed` exists to solve.
+    //
+    // This lives here rather than in the generator so that *every* consumer of a
+    // configuration gets a coherent pair, not just the one command-line tool that
+    // happened to remember to derive it.
+    const double world_meters =
+        static_cast<double>(config.grid_size) * config.meters_per_grid_unit;
+    if (node.contains("image_size") && config.image_size > 0 && world_meters > 0.0) {
+        config.meters_per_pixel = world_meters / static_cast<double>(config.image_size);
+    }
+    config.image_size = derive_image_size(config);
 }
 
 /**
@@ -640,6 +714,7 @@ inline fkyaml::node map_to_node(const MapGraph& graph, const MapConfig& config) 
         node["x"] = center.point.x;
         node["y"] = center.point.y;
         node["elevation"] = center.elevation;
+        node["water_level"] = center.water_level;
         node["moisture"] = center.moisture;
         node["temperature"] = center.temperature;
         node["biome"] = std::string(biome_name(center.biome));
@@ -854,6 +929,7 @@ inline bool map_from_node(const fkyaml::node& root, MapGraph& out_graph, MapConf
             center.index = static_cast<CenterId>(detail::read_or(node, "i", 0));
             center.point = {detail::read_or(node, "x", 0.0), detail::read_or(node, "y", 0.0)};
             center.elevation = detail::read_or(node, "elevation", 0.0);
+            center.water_level = detail::read_or(node, "water_level", 0.0);
             center.moisture = detail::read_or(node, "moisture", 0.0);
             center.temperature = detail::read_or(node, "temperature", 0.0);
             center.biome = biome_from_name(detail::read_or(node, "biome", std::string("ocean")));

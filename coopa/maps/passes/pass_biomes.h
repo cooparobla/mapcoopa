@@ -34,7 +34,13 @@ public:
         logger.info("map pass: biomes");
 
         for (MapCenter& center : graph.centers) {
-            center.biome = classify_biome(center.elevation, center.moisture, center.temperature,
+            // Land-relative, because the Whittaker rows are described in terms of
+            // *land*: the alpine band begins four fifths of the way up the
+            // mountains, not four fifths of the way up from the sea bed. Passing
+            // the raw height would silently shift every row once the waterline
+            // moved off zero.
+            center.biome = classify_biome(land_height(config, center.elevation),
+                                          center.moisture, center.temperature,
                                           center.water, center.ocean, center.coast);
         }
     }

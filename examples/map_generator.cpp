@@ -49,6 +49,9 @@ namespace {
 /** @brief Grid size the library's default noise frequency is tuned for. */
 constexpr double k_reference_grid_size = 40.0;
 
+/** @brief Degrees to radians, for the shape rotation flag. */
+constexpr double k_degrees_to_radians = 3.14159265358979323846 / 180.0;
+
 /** @brief Prints the accepted flags and their defaults. */
 void print_usage() {
     std::cout
@@ -71,6 +74,12 @@ void print_usage() {
         << "  --shading=MODE   composite lighting: elevation (default) | hillshade\n"
         << "  --threads=N      worker threads; 0 = all cores (default), 1 = serial\n"
         << "  --png-level=N    PNG deflate effort 1-9; lower is faster and larger\n"
+        << "  --shape=S        landmass outline: rect (default) | circle | triangle\n"
+        << "  --shape-size=M   width / diameter / edge length in metres; 0 fills the canvas\n"
+        << "  --shape-height=M rectangle height in metres; defaults to --shape-size\n"
+        << "  --shape-rot=DEG  rotation of the shape in degrees (triangle)\n"
+        << "  --relief=F       fractal reshaping of the height field, 0 to 1\n"
+        << "  --roughness=F    terrain detail amplitude, 0 (default) to 1\n"
         << "  --help           show this message\n"
         << "\n"
         << "writes PATH.yaml and one PNG per layer: elevation, water, biomes,\n"
@@ -105,11 +114,15 @@ int main(int argc, char** argv) {
     coopa::maps::MapConfig config;
     // This tool's own defaults, applied before the configuration file so that a
     // run without one still produces the world the README documents rather than
-    // quietly dropping to MapConfig's library defaults of grid 50 at 1024 px.
+    // quietly dropping to MapConfig's library defaults of a grid of 50.
     // Large enough that climate bands, several nations and a spread of landmarks
     // all have room to appear; the YAML lands around 15 MB.
+    //
+    // No image_size here: it is derived from the world extent and
+    // `meters_per_pixel`, which defaults to 1.0 so that a render is measurable at
+    // one pixel to the metre. Setting it would only have back-computed a scale
+    // that is not 1.
     config.grid_size = 80;
-    config.image_size = 2048;
     config.towns.town_count = 28;
     config.river_count = 55;
     config.landmarks.max_natural = 70;
@@ -125,6 +138,11 @@ int main(int argc, char** argv) {
     // 0 means one worker per core. 1 means no engine at all -- the serial path,
     // which is what the byte-for-byte comparison in the README is run against.
     int threads = 0;
+    // One flag drives whichever dimension the chosen shape actually uses, so a
+    // caller does not have to know that a circle reads `diameter_m` and a
+    // triangle `edge_length_m`. Negative means "not given".
+    double shape_size_m = -1.0;
+    double shape_height_m = -1.0;
 
     // --config has to be found before the file is read, and every other flag has
     // to be applied after -- so the argument list is walked twice. Doing it in one
@@ -204,6 +222,32 @@ int main(int argc, char** argv) {
                 std::cerr << "coopa_mapgen: --png-level must be between 1 and 9\n";
                 return 1;
             }
+        } else if (match_option(argument, "shape", value)) {
+            const std::string name(value);
+            if (name != "rect" && name != "rectangle" && name != "circle"
+                && name != "triangle") {
+                std::cerr << "coopa_mapgen: --shape must be rect, circle or triangle\n";
+                return 1;
+            }
+            config.shape.shape = coopa::maps::map_shape_from_name(name);
+        } else if (match_option(argument, "shape-size", value)) {
+            shape_size_m = std::atof(std::string(value).c_str());
+        } else if (match_option(argument, "shape-height", value)) {
+            shape_height_m = std::atof(std::string(value).c_str());
+        } else if (match_option(argument, "shape-rot", value)) {
+            config.shape.rotation = std::atof(std::string(value).c_str()) * k_degrees_to_radians;
+        } else if (match_option(argument, "relief", value)) {
+            config.terrain_relief = std::atof(std::string(value).c_str());
+            if (config.terrain_relief < 0.0 || config.terrain_relief > 1.0) {
+                std::cerr << "coopa_mapgen: --relief must be between 0 and 1\n";
+                return 1;
+            }
+        } else if (match_option(argument, "roughness", value)) {
+            config.terrain_roughness = std::atof(std::string(value).c_str());
+            if (config.terrain_roughness < 0.0 || config.terrain_roughness > 1.0) {
+                std::cerr << "coopa_mapgen: --roughness must be between 0 and 1\n";
+                return 1;
+            }
         } else if (match_option(argument, "shading", value)) {
             const std::string mode(value);
             if (mode != "elevation" && mode != "hillshade") {
@@ -235,6 +279,24 @@ int main(int argc, char** argv) {
         config.meters_per_pixel = world_meters / static_cast<double>(image_size_override);
     }
     config.image_size = coopa::maps::derive_image_size(config);
+
+    if (shape_size_m >= 0.0) {
+        switch (config.shape.shape) {
+            case coopa::maps::MapShape::Circle:
+                config.shape.diameter_m = shape_size_m;
+                break;
+            case coopa::maps::MapShape::Triangle:
+                config.shape.edge_length_m = shape_size_m;
+                break;
+            case coopa::maps::MapShape::Rectangle:
+                config.shape.width_m = shape_size_m;
+                config.shape.height_m = shape_size_m;
+                break;
+        }
+    }
+    if (shape_height_m >= 0.0) {
+        config.shape.height_m = shape_height_m;
+    }
 
     if (!seed_given) {
         std::random_device entropy;
@@ -305,7 +367,8 @@ int main(int argc, char** argv) {
         static_cast<double>(config.grid_size) * config.meters_per_grid_unit / 1000.0;
     std::cout << "\nseed:       " << config.seed << "  (rerun with --seed=" << config.seed << ")\n"
               << "world:      " << world_km << " km square, " << config.meters_per_grid_unit
-              << " m per cell\n"
+              << " m per cell, " << coopa::maps::map_shape_name(config.shape.shape)
+              << " landmass\n"
               << "render:     " << config.image_size << " px square, "
               << config.meters_per_pixel << " m per pixel, "
               << coopa::maps::composite_shading_name(config.composite_shading) << " shading\n"

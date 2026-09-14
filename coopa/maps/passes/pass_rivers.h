@@ -58,7 +58,10 @@ public:
         for (int attempt = 0; attempt < max_attempts && placed < config.river_count; ++attempt) {
             const CornerId source = static_cast<CornerId>(pick(rng));
             const MapCorner& candidate = graph.corners[static_cast<std::size_t>(source)];
-            if (candidate.ocean
+            // `water` as well as `ocean`: a lake corner is a legitimate low
+            // point, and a river that starts in one is a river that starts in a
+            // lake.
+            if (candidate.ocean || candidate.water
                 || candidate.elevation < config.river_source_min_elevation
                 || candidate.elevation > config.river_source_max_elevation) {
                 continue;
@@ -101,13 +104,13 @@ private:
 
         CornerId current = source;
         path.push_back(current);
-        // The walk is strictly downhill and terminates at the coast or at a
-        // basin, but guard the step count anyway: a downslope chain is only
-        // acyclic because the elevations it was built from are, and a NaN
-        // height would make that false.
+        // The walk is strictly downhill and terminates at water or at a basin,
+        // but guard the step count anyway: a downslope chain is only acyclic
+        // because the elevations it was built from are, and a NaN height would
+        // make that false.
         for (std::size_t step = 0; step < graph.corners.size(); ++step) {
             const MapCorner& corner = graph.corners[static_cast<std::size_t>(current)];
-            if (corner.coast) {
+            if (reaches_water_(corner)) {
                 break;
             }
             const CornerId next = corner.downslope;
@@ -124,6 +127,17 @@ private:
         }
 
         if (static_cast<int>(path.size()) < config.river_min_length) {
+            return false;
+        }
+        // A river has to end somewhere. `PassElevation::fill_depressions_` is
+        // what makes that true -- it leaves every land corner with a strictly
+        // descending path to water -- so this rejection should never fire, and
+        // `execute()` logs it if it does. It stays because "always ends in a
+        // water body" is a property of the output that a caller can rely on, and
+        // a property enforced only by an invariant two passes away is one a
+        // future change to elevation can quietly break. Enforcing it here costs
+        // one comparison and cannot be got wrong.
+        if (!reaches_water_(graph.corners[static_cast<std::size_t>(path.back())])) {
             return false;
         }
 
@@ -150,6 +164,24 @@ private:
         chaikin_smooth(river.points, config.river_smoothing_iterations);
         graph.rivers.push_back(std::move(river));
         return true;
+    }
+
+    /**
+     * @brief Whether a corner is in, or on the shore of, a body of water.
+     *
+     * `water` covers a corner with a lake or ocean cell around it; `coast` covers
+     * the shoreline, which `PassCoast` deliberately excludes from `water` so the
+     * two can be told apart. A river mouth is one or the other, and the union is
+     * what "ends in a water body" means -- a sea mouth is a `coast` corner, a
+     * lake mouth a `water` one.
+     *
+     * Stopping on the union rather than on `coast` alone is also what keeps a
+     * river off a lake's surface. Lake corners sit below their shore, so a walk
+     * that only stopped at the sea ran on down the lake bed to its lowest corner
+     * and drew a channel across the water.
+     */
+    static bool reaches_water_(const MapCorner& corner) {
+        return corner.water || corner.coast;
     }
 
     /**

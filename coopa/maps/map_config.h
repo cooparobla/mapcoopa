@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstddef>
 
 #include <glm/glm.hpp>
@@ -181,6 +182,71 @@ inline CompositeShading composite_shading_from_name(std::string_view name) {
     if (name == "hillshade") return CompositeShading::Hillshade;
     return CompositeShading::Elevation;
 }
+
+/**
+ * @enum MapShape
+ * @brief The outline the landmass is confined to; everything outside it is sea.
+ */
+enum class MapShape {
+    Rectangle, /**< @brief Axis-aligned, `width_m` by `height_m`. */
+    Circle,    /**< @brief `diameter_m` across. */
+    Triangle   /**< @brief Equilateral, `edge_length_m` a side, turned by `rotation`. */
+};
+
+/** @brief Number of distinct `MapShape` values. */
+inline constexpr std::size_t k_map_shape_count = 3;
+
+/**
+ * @brief Maps a landmass shape to its serialisation name.
+ * @param shape The shape to name.
+ * @return A `snake_case` identifier, e.g. `"circle"`.
+ */
+inline std::string_view map_shape_name(MapShape shape) {
+    switch (shape) {
+        case MapShape::Rectangle: return "rectangle";
+        case MapShape::Circle:    return "circle";
+        case MapShape::Triangle:  return "triangle";
+    }
+    return "rectangle";
+}
+
+/**
+ * @brief Resolves a serialisation name back to a shape.
+ * @param name A name previously produced by `map_shape_name()`; `"rect"` is accepted too.
+ * @return The matching shape, or `MapShape::Rectangle` if the name is unknown.
+ */
+inline MapShape map_shape_from_name(std::string_view name) {
+    if (name == "circle")   return MapShape::Circle;
+    if (name == "triangle") return MapShape::Triangle;
+    return MapShape::Rectangle;
+}
+
+/**
+ * @struct ShapeConfig
+ * @brief The outline land is allowed to occupy, centred on the canvas.
+ *
+ * The canvas itself stays `grid_size` square whatever this says -- the shape is
+ * inscribed in it, and the margin left over becomes open sea. So a smaller shape
+ * is a smaller world on the same size of map, not a smaller image.
+ *
+ * **Every dimension defaults to zero, meaning "fill the canvas".** That makes the
+ * default a rectangle the size of the whole grid, which is exactly what the
+ * generator did before shapes existed, down to the byte.
+ */
+struct ShapeConfig {
+    /** @brief Which outline to use. */
+    MapShape shape = MapShape::Rectangle;
+    /** @brief Rectangle width in metres; 0 spans the canvas. */
+    double width_m = 0.0;
+    /** @brief Rectangle height in metres; 0 spans the canvas. */
+    double height_m = 0.0;
+    /** @brief Circle diameter in metres; 0 spans the canvas. */
+    double diameter_m = 0.0;
+    /** @brief Equilateral triangle side in metres; 0 spans the canvas. */
+    double edge_length_m = 0.0;
+    /** @brief Rotation in radians, applied about the centre. Triangle only. */
+    double rotation = 0.0;
+};
 
 /**
  * @struct TownConfig
@@ -444,14 +510,35 @@ struct MapConfig {
      */
     double meters_per_grid_unit = 60.0;
 
+    /**
+     * @brief Metres of height the normalised `[0, 1]` elevation field spans.
+     *
+     * The vertical scale, and the world had none: `meters_per_grid_unit` fixed
+     * how far a grid unit reaches *across* the ground while height stayed a bare
+     * fraction, so "a river one metre deep" had nowhere to land. With this, the
+     * sea floor is at 0 m, the waterline at `sea_level * elevation_range_m`, and
+     * the highest peak at the full range.
+     *
+     * 600 m over a 4.8 km world puts the steepest ground at roughly a 1-in-8
+     * grade, which is hilly without being alpine.
+     */
+    double elevation_range_m = 600.0;
+
     // --- Rendering ---
 
     /**
      * @brief Ground covered by one rendered pixel, in metres.
      *
-     * At the default of 1.0 a PNG is a literal one-pixel-per-metre map, so a
-     * pixel count read off a render *is* a measurement: a 6 m road is 6 px wide.
-     * Raising it renders the same world smaller and faster.
+     * **Always 1.0 by default**, and deliberately so: a PNG is then a literal
+     * one-pixel-per-metre map, and a pixel count read off a render *is* a
+     * measurement -- a 6 m road is 6 px wide because it is 6 m wide. Every
+     * physical size in this struct is denominated in metres on that
+     * understanding, so 1.0 is the setting under which a render can be measured
+     * rather than merely looked at.
+     *
+     * Raising it renders the same world smaller and faster. Setting
+     * `image_size` instead back-computes this, which is the same knob from the
+     * other end -- see `image_size` for which wins.
      */
     double meters_per_pixel = 1.0;
 
@@ -479,12 +566,23 @@ struct MapConfig {
     /**
      * @brief Side length in pixels of the square PNG renders.
      *
-     * Derived, not chosen -- `derive_image_size()` sets it from the world extent
-     * and `meters_per_pixel`, and the generator calls that at startup. Left
-     * writable because every renderer reads it, and because a caller wanting a
-     * particular resolution can set it and back-compute the scale instead.
+     * This and `meters_per_pixel` are the two ends of one knob, and they must
+     * never disagree: every feature is stroked in *metres* and converted through
+     * the scale, so a stale pairing would draw a "10 m highway" at whatever width
+     * the wrong scale implied. The invariant is
+     * `image_size * meters_per_pixel == grid_size * meters_per_grid_unit`.
+     *
+     * Either end may be the one you set. Naming a resolution is the more concrete
+     * statement of intent, so `image_size` wins where both are given and
+     * `meters_per_pixel` is back-computed from it -- `apply_config_node()` does
+     * that on load and `--image-size` does it on the command line. Say nothing
+     * and `derive_image_size()` fills this in from the scale.
+     *
+     * The default is `derive_image_size()` of the other defaults rather than a
+     * round number, so a default-constructed config already satisfies the
+     * invariant instead of starting out contradicting itself.
      */
-    int image_size = 1024;
+    int image_size = 3000;
     /** @brief Tint cells by the region that claims them, so borders are visible. */
     bool show_regions = true;
     /** @brief How strongly the region tint is mixed over the biome colour, in `[0, 1]`. */
@@ -496,6 +594,58 @@ struct MapConfig {
     NoiseConfig noise_island;
     /** @brief The variation field that keeps isotherms from running straight. */
     NoiseConfig noise_temperature{1733, 0.035};
+    /**
+     * @brief The large-scale field that decides where the high ground goes.
+     *
+     * Low frequency, because this shapes massifs rather than texture: a feature
+     * spans many cells. Compare `noise_terrain`, which is deliberately finer
+     * than a single cell.
+     */
+    NoiseConfig noise_relief{7717, 0.055};
+    /**
+     * @brief How much fractal relief reshapes the coast-distance height field, 0 to 1.
+     *
+     * Height is breadth-first *distance from the coast*, which is what keeps
+     * coastlines at sea level and puts mountains inland -- but taken alone it
+     * makes the high ground the literal medial axis of the landmass, so peaks
+     * trace thin winding ridges equidistant from the bays either side. Real
+     * terrain does not do that.
+     *
+     * This multiplies the distance field by a noise factor before the heights are
+     * rank-remapped, which reorders them: some of the skeleton drops into
+     * valleys, some of the flanks rise, and what comes out reads as massifs and
+     * basins. It is applied to *land* corners only, so the ordering of water
+     * against land is untouched and rivers still run downhill to a coast that is
+     * still the lowest ground there is.
+     *
+     * Defaults to 0.65, where the skeleton is gone but the coast-distance trend
+     * still reads -- land still broadly rises inland. Zero restores the pure
+     * distance field, which is what Amit Patel's original generator produced and
+     * what this looked like before.
+     */
+    double terrain_relief = 0.65;
+    /**
+     * @brief The detail field displacing the sampled ground surface.
+     *
+     * A higher frequency than the island or temperature fields on purpose: this
+     * is texture within a cell, not a landform. Cells are 60 m across at the
+     * default scale, so the detail has to be finer than that to show at all.
+     */
+    NoiseConfig noise_terrain{4919, 0.35};
+    /**
+     * @brief How strongly the detail field displaces the sampled surface, 0 to 1.
+     *
+     * Zero -- the default -- leaves the surface exactly as the passes computed
+     * it. Raising it adds jaggedness *without* touching the cell and corner
+     * heights, so biomes, rivers and roads are classified on the same smooth
+     * control field either way and only the sampled surface roughens. The
+     * displacement is scaled by the local height, so coastlines stay at sea level
+     * however high this goes.
+     *
+     * Pair it with `elevation_smoothing_iterations`: that controls how smooth the
+     * underlying landform is, this controls how rough the skin over it is.
+     */
+    double terrain_roughness = 0.0;
     /**
      * @brief How much a full unit of elevation cools the air.
      *
@@ -524,6 +674,23 @@ struct MapConfig {
     int elevation_smoothing_iterations = 6;
     /** @brief How far toward the neighbour mean each smoothing pass moves a corner. */
     double elevation_smoothing_strength = 0.5;
+    /**
+     * @brief The waterline, in the normalised `[0, 1]` height field.
+     *
+     * A real height, not a convention. The sea bed occupies everything below it
+     * and land everything above, so "the ground here is under water" is an
+     * honest comparison rather than a vacuous one -- which it was when the whole
+     * field started at zero and the sea was pinned to the bottom of it.
+     *
+     * Two consequences worth knowing. The elevation layer now carries genuine
+     * bathymetry, dark where the sea is deep. And the sea's surface is a visible
+     * mid-grey on the same scale as everything else, rather than the black that
+     * made it indistinguishable from dry land.
+     *
+     * Land therefore spans `[sea_level, 1]`, so anything comparing against a
+     * *land* height must go through `land_height()` first.
+     */
+    double sea_level = 0.25;
     /** @brief Noise value above which a corner is water. */
     double threshold_water = 0.3;
     /** @brief A cell becomes water once more than this many of its corners are. */
@@ -560,8 +727,27 @@ struct MapConfig {
      * out of the channel.
      */
     double river_width_base_m = 5.0;
-    /** @brief Additional width per unit of river volume, in grid units. */
+    /** @brief Additional width per unit of river volume, in metres. */
     double river_width_per_volume_m = 2.0;
+    /**
+     * @brief How far a river's surface sits above the ground it runs over, in metres.
+     *
+     * A river is not a line painted on the terrain, it is water standing in a
+     * channel -- so its surface has to be *above* the ground, or a mesh built
+     * from the two fights with itself along every watercourse. Deepens with
+     * volume: a stream is ankle-deep and a trunk river is not.
+     */
+    double river_depth_m = 1.0;
+    /** @brief Additional depth per unit of river volume, in metres. */
+    double river_depth_per_volume_m = 0.35;
+    /**
+     * @brief How far every water surface is extended past its own edge, in metres.
+     *
+     * So the water clips *into* the terrain rather than meeting it exactly. Two
+     * surfaces that share an edge exactly will show a seam wherever the meshes
+     * disagree by a rounding error, and along a coastline they always do.
+     */
+    double water_edge_overlap_m = 1.0;
     /**
      * @brief Carriageway width of a `RoadClass::Trail`, in metres.
      *
@@ -577,6 +763,8 @@ struct MapConfig {
     double road_width_m = 6.0;
     /** @brief Carriageway width of a `RoadClass::Highway`, in metres. */
     double highway_width_m = 10.0;
+    /** @brief The outline land is confined to. */
+    ShapeConfig shape;
     /** @brief Settlement placement parameters. */
     TownConfig towns;
     /** @brief Road network parameters. */
@@ -611,6 +799,127 @@ struct MapConfig {
      */
     bool subdivide_noisy_edges = true;
 };
+
+/**
+ * @brief How far inside the landmass shape a point lies, in grid units.
+ *
+ * The one predicate the shape of the world comes from. `border_check_()` flags
+ * any corner whose inset falls below `border_length`; the water pass forces those
+ * cells to sea, and the elevation pass measures height as distance from them -- so
+ * changing this function changes the coastline, the mountains, the regions and
+ * the roads, all without any of them knowing shapes exist.
+ *
+ * A zero dimension spans the canvas, which is what makes the default rectangle
+ * reproduce the pre-shape map exactly.
+ *
+ * @param config Supplies the shape, the grid size and the world scale.
+ * @param x Horizontal grid position.
+ * @param y Vertical grid position.
+ * @return Positive inside the shape, negative outside, zero on its boundary.
+ */
+inline double shape_inset(const MapConfig& config, double x, double y) {
+    const double grid = static_cast<double>(config.grid_size);
+    const double centre = grid * 0.5;
+    const double dx = x - centre;
+    const double dy = y - centre;
+
+    // A dimension of 0 means "as big as the canvas allows".
+    const auto extent = [&config, grid](double meters) {
+        return meters > 0.0 ? meters / config.meters_per_grid_unit : grid;
+    };
+
+    switch (config.shape.shape) {
+        case MapShape::Circle: {
+            const double radius = extent(config.shape.diameter_m) * 0.5;
+            return radius - std::sqrt(dx * dx + dy * dy);
+        }
+        case MapShape::Triangle: {
+            // Rotate into the triangle's own frame, then measure. Rotating the
+            // query rather than the triangle keeps the shape description to one
+            // number.
+            const double c = std::cos(-config.shape.rotation);
+            const double sn = std::sin(-config.shape.rotation);
+            const double lx = dx * c - dy * sn;
+            const double ly = dx * sn + dy * c;
+
+            // Signed distance to an equilateral triangle centred on its
+            // centroid, with `half_side` as the base half-width and k = sqrt(3).
+            const double k = 1.7320508075688772;
+            const double half_side = extent(config.shape.edge_length_m) * 0.5;
+            if (half_side <= 0.0) {
+                return -1.0;
+            }
+            // The formula is written for maths axes, where y climbs; image rows
+            // descend. Flipping here is what puts the apex at the top of the
+            // picture rather than the bottom.
+            double px = std::abs(lx) - half_side;
+            double py = -ly + half_side / k;
+            if (px + k * py > 0.0) {
+                const double folded_x = (px - k * py) * 0.5;
+                const double folded_y = (-k * px - py) * 0.5;
+                px = folded_x;
+                py = folded_y;
+            }
+            px -= std::clamp(px, -2.0 * half_side, 0.0);
+            // Distance, signed by which side of the folded edge the point landed
+            // on. Positive inside, to match the other two shapes.
+            return std::sqrt(px * px + py * py) * (py > 0.0 ? 1.0 : -1.0);
+        }
+        case MapShape::Rectangle:
+            break;
+    }
+
+    const double half_width = extent(config.shape.width_m) * 0.5;
+    const double half_height = extent(config.shape.height_m) * 0.5;
+    return std::min(half_width - std::abs(dx), half_height - std::abs(dy));
+}
+
+/**
+ * @brief Converts a height in metres into the normalised elevation field.
+ *
+ * The vertical counterpart of `meters_to_grid()`. Heights are stored as a
+ * fraction of `elevation_range_m`, so anything physical -- how deep a river is,
+ * how far water overhangs its bank -- crosses here.
+ *
+ * @param config Supplies the vertical scale.
+ * @param meters The height in metres.
+ * @return The same height as a fraction of the elevation range.
+ */
+inline double meters_to_height(const MapConfig& config, double meters) {
+    return config.elevation_range_m > 0.0 ? meters / config.elevation_range_m : 0.0;
+}
+
+/**
+ * @brief Converts a normalised height into metres.
+ * @param config Supplies the vertical scale.
+ * @param height A height from the `[0, 1]` field.
+ * @return The same height in metres above the sea floor.
+ */
+inline double height_to_meters(const MapConfig& config, double height) {
+    return height * config.elevation_range_m;
+}
+
+/**
+ * @brief Re-expresses a height as a fraction of the land above the waterline.
+ *
+ * Land occupies `[sea_level, 1]` of the height field, so a threshold that
+ * describes *land* -- where a peak begins, where a town is too high to reach,
+ * which row of the Whittaker diagram a cell falls in -- cannot be compared
+ * against a raw elevation without first taking the sea out of the range. Every
+ * such threshold is phrased against this, which is what kept them meaning the
+ * same thing when the waterline moved off zero.
+ *
+ * @param config Supplies the waterline.
+ * @param elevation A raw height from the `[0, 1]` field.
+ * @return 0 at the shoreline, 1 at the highest ground; 0 for anything submerged.
+ */
+inline double land_height(const MapConfig& config, double elevation) {
+    const double span = 1.0 - config.sea_level;
+    if (span <= 0.0) {
+        return 0.0;
+    }
+    return std::clamp((elevation - config.sea_level) / span, 0.0, 1.0);
+}
 
 /**
  * @brief Converts a length in metres to grid units.
@@ -729,7 +1038,7 @@ struct BiomePalette {
         glm::vec3(94, 182, 223),   // Ocean
         glm::vec3(94, 182, 223),   // Lake
         glm::vec3(33, 94, 33),     // Marsh
-        glm::vec3(210, 255, 252),  // Ice
+        glm::vec3(146, 206, 231),  // Ice
         glm::vec3(245, 222, 179),  // Beach
         glm::vec3(255, 250, 250),  // Snow
         glm::vec3(169, 169, 169),  // Tundra

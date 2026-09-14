@@ -32,9 +32,9 @@ over ground the earlier ones already claimed. Every pass that draws randomness s
 
 | # | File | Writes | Reads |
 |---|------|--------|-------|
-| 1 | [`pass_water.h`](./pass_water.h) | `water`, `ocean` on corners and cells | the island noise field |
+| 1 | [`pass_water.h`](./pass_water.h) | `water`, `ocean` on corners and cells | the island noise field, the `border` flag |
 | 2 | [`pass_coast.h`](./pass_coast.h) | `coast`; refines corner `ocean`/`water` | pass 1 |
-| 3 | [`pass_elevation.h`](./pass_elevation.h) | `elevation`, `downslope` | pass 2 |
+| 3 | [`pass_elevation.h`](./pass_elevation.h) | `elevation`, `downslope`, `water_level` | pass 2 |
 | 4 | [`pass_temperature.h`](./pass_temperature.h) | `temperature` | pass 3 |
 | 5 | [`pass_rivers.h`](./pass_rivers.h) | `river` on corners and edges; `MapGraph::rivers` | pass 3 |
 | 6 | [`pass_moisture.h`](./pass_moisture.h) | `moisture` | pass 5 |
@@ -50,6 +50,11 @@ over ground the earlier ones already claimed. Every pass that draws randomness s
 ## Notes Per Pass
 
 ### 1. Water ([`pass_water.h`](./pass_water.h))
+The `border` flag it reads comes from `MapGenerator::border_check_()`, which is now driven
+by `MapConfig::shape` — a canvas-spanning rectangle by default, or a circle or triangle
+inscribed in the canvas. That one predicate is where the shape of the world comes from;
+nothing in here knows shapes exist.
+
 Threshold the island noise field per corner, promote cells whose corner count crosses
 `threshold_water_count`, then flood-fill from the border to mark `ocean`. That last step
 is the only thing separating the sea from an inland lake — both are `water`, only the sea
@@ -66,6 +71,50 @@ landmass. Crossing between two land corners costs a full unit, every other step 
 an inland sea does not raise the terrain around it. Heights are then rank-remapped through
 `sqrt(k) - sqrt(k(1-y))` so a continent reads as broad plains with a few peaks.
 
+Between those two steps it blends in fractal relief (`terrain_relief`, default 0.65). The
+distance field models *how high* land gets well and *where* badly — the maximum of a
+distance field is its medial axis, so untouched it puts every summit on a thin ridge
+equidistant between the bays either side, which renders as foam. Mixing toward noise
+replaces that ordering; scaling by noise cannot, because distances span tens of units while
+a noise factor spans one. A coastal mask keeps the shore the lowest land, and land is lifted
+clear of water so drainage still runs seaward. Zero restores the pure distance field.
+
+The rank remap is **split**: the sea takes `[0, sea_level)` and everything else
+`[sea_level, 1]`. Ranked together — which they were — the two interleave, because a corner
+far out to sea accumulates enough hundredths of a step to outrank a coastal one. The sea had
+no consistent depth, the shoreline no consistent height, and `elevation` under water meant
+nothing at all. Split, depth becomes real bathymetry and the waterline becomes a definite
+height. Lakes rank with the *land*: a tarn sits at altitude, and the only thing below sea
+level is the sea. Smoothing is likewise confined to each side of the waterline, since
+relaxing across it drags the sea onto the shore and the shore under it.
+
+Then it **fills the pits**, which is what makes the drainage a drainage. The distance field
+is monotone, but nothing after it is: relief noise, the rank remap and both smoothing passes
+move corners independently of their neighbours, and any of them can leave a corner lower
+than everything around it. A downhill walk that reaches one stops on dry land — 80 of 11 438
+land corners were such pits, and 23 of 55 rivers used to end in the middle of a field. The
+fix is the priority-flood fill (Barnes, Lehman & Mulla 2014), what DEM processing uses for
+exactly this: seed a min-heap with every corner already at or in water, then pop the lowest
+and raise each dry neighbour to just above it. That walks outward from the sea in ascending
+order of the height water would need to reach a corner, so every corner is resolved *from* a
+strictly lower one and inherits its descending path to water. Lake corners seed the heap
+alongside the sea, so an inflow that reaches a lake has arrived and no lake bed is filled in
+to force the water over its rim — which is what keeps an endorheic basin a lake. The epsilon
+is 1e-7 and chains run to 39 corners, so the worst-case rise is 4e-6 of the range: about two
+millimetres at the default 600 m, and not a visible change to the terrain.
+
+`assign_downslopes_` compares strictly (`<`). An equal-height neighbour is not downhill, and
+accepting one let two corners at the same elevation name each other as their downslope — a
+two-cycle a flow walk follows until its step guard. Strictness is also what makes "points at
+itself" mean "has nowhere lower to go" rather than "happened to be scanned last".
+
+Finally it levels the water. `elevation` is the height of the *ground*, which under a water
+cell is the bed; `MapCenter::water_level` states the surface, which unlike a bed is flat.
+`sea_level` across the whole sea, and one height per lake, found by flooding the
+`water && !ocean` cells and taking the highest bed in each body so no basin pokes through
+its own surface. It has to happen here rather than in the water pass, which is where sea and
+lake are told apart but which runs first and has no heights to level against.
+
 ### 4. Temperature ([`pass_temperature.h`](./pass_temperature.h))
 Latitude band, minus an altitude lapse rate, plus a noise field. Without it biomes are
 classified on elevation and moisture alone, which leaves a third of the table unreachable
@@ -74,8 +123,18 @@ slice of a globe.
 
 ### 5. Rivers ([`pass_rivers.h`](./pass_rivers.h))
 Sample sources uniformly, reject any outside the source elevation band, and walk
-`downslope` to the coast. The attempt count is bounded: the original retried by
+`downslope` until the water. The attempt count is bounded: the original retried by
 decrementing its loop counter, which hangs outright on a map with no qualifying land.
+
+**Every river ends in a water body**, and that is a guarantee rather than a tendency. The
+walk stops on `water || coast` — the union, not `coast` alone, because `PassCoast`
+deliberately excludes the shoreline from `water` so the two can be told apart: a sea mouth
+is a `coast` corner and a lake mouth a `water` one. Stopping on `coast` alone also ran a
+river on down a lake *bed* to its lowest corner, drawing a channel across the surface,
+since lake corners sit below their shore. A walk that somehow still ends dry has its river
+discarded and logged. With the pits filled that rejection never fires, and it stays anyway:
+"always ends in water" is a property callers rely on, and one enforced only by an invariant
+two passes away is one a future change to elevation can quietly break.
 
 The walk gathers the corner chain *before* raising any volume, and only commits a
 watercourse at least `river_min_length` corners long. Raising volumes as it walked — which
@@ -100,6 +159,28 @@ then rank-normalise so every map spans the full range.
 Delegates to `classify_biome()` in [`../biome.h`](../biome.h), which branches on
 temperature first, then elevation, then moisture — about 33 biomes rather than the
 original 18.
+
+**A water cell always gets a water biome** — `Ocean`, `Lake` or `Ice`, and nothing else.
+This is not cosmetic. The biome and composite layers are coloured by *biome*, not by
+`MapCenter::water`, so the two disagreeing is a defect the reader sees however sound the
+data underneath is: `classify_biome()` used to hand a shallow lake `Marsh` (33, 94, 33 —
+a dark green) and 18% of rivers ended in what looks exactly like forest. A lake you cannot
+see is indistinguishable from no lake, and rivers must visibly end in water.
+
+`Marsh`, `Swamp` and `BorealWetland` are land biomes now, which is what the words mean:
+waterlogged basin floor beside the water rather than the water itself. Moisture is seeded
+from lakes and rivers, so they land where they belong.
+
+Freezing is on temperature alone. The elevation test that used to also freeze a high lake
+double-counted altitude, because `PassTemperature` already applies an altitude lapse rate —
+a high lake was frozen twice over and a cold low one not at all.
+
+The thresholds are fractions of the **land** range, because the pass passes
+`land_height()`. That rescale is what broke the marsh rule in the first place: `0.1` meant
+"below 0.1 absolute" when the waterline sat at 0, and became "the bottom tenth of the land"
+once it moved to `sea_level` — which is where lakes sit, since a lake is a basin. A table
+test on `classify_biome()` stayed green throughout, because the arguments changed and not
+the function.
 
 ### 8. Roads ([`pass_roads.h`](./pass_roads.h))
 Roads are *routed*, not drawn. Every Delaunay edge gets a travel cost from the ground

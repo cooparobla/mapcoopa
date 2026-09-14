@@ -313,23 +313,35 @@ private:
      * guarantees a map is an island rather than a landmass sliced off by the
      * frame. Unlike the original this marks every offending corner of a cell,
      * not just the first one found.
+     *
+     * The frame is `MapConfig::shape` -- a rectangle spanning the canvas by
+     * default, which is what it always was, or a circle or triangle inscribed in
+     * it. See `shape_inset()`.
      */
     void border_check_() {
         const double border = config_.border_length;
-        const double grid_size = static_cast<double>(config_.grid_size);
 
         for (MapCenter& center : graph_.centers) {
+            // The cell's own site, first, and not only for tidiness. The boundary
+            // ring emits each outer corner point more than once -- once from the
+            // x loop, once from the y loop, once explicitly -- and Delaunator
+            // collapses the duplicates into cells with no corners, no edges and no
+            // neighbours at all. A loop over `corners` never executes for those,
+            // so they came out flagged neither border nor water: dry land sitting
+            // outside the map with no geometry. Harmless only by luck, since their
+            // default `Ocean` biome scores zero habitability and kept the town and
+            // road passes from ever choosing one.
+            if (shape_inset(config_, center.point.x, center.point.y) <= border) {
+                center.border = true;
+            }
+
             for (const CornerId corner_id : center.corners) {
                 MapCorner& corner = graph_.corners[static_cast<std::size_t>(corner_id)];
-                const double x = corner.point.x;
-                const double y = corner.point.y;
-
-                const bool outside = x < -border || x > grid_size + border
-                                  || y < -border || y > grid_size + border;
-                const double distance_to_frame =
-                    std::min(std::min(x, grid_size - x), std::min(y, grid_size - y));
-
-                if (outside || distance_to_frame <= border) {
+                // One call decides the shape of the world. Everything downstream
+                // reads this flag and nothing downstream knows what shape it is:
+                // the water pass floods it, the elevation pass measures height
+                // outward from it, and coastlines, regions and roads follow.
+                if (shape_inset(config_, corner.point.x, corner.point.y) <= border) {
                     corner.border = true;
                     center.border = true;
                 }

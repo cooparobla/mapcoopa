@@ -75,7 +75,7 @@ public:
             if (center.water || center.ocean || center.border) {
                 continue;
             }
-            const double score = score_site_(graph, center, towns, mean_area) + jitter(rng);
+            const double score = score_site_(graph, center, config, mean_area) + jitter(rng);
             if (score <= 0.0) {
                 continue;
             }
@@ -130,8 +130,9 @@ private:
     static constexpr unsigned int k_seed_offset = 7919u;
 
     /** @brief Scores one cell on biome, elevation and its access to water and roads. */
-    double score_site_(const MapGraph& graph, const MapCenter& center, const TownConfig& towns,
+    double score_site_(const MapGraph& graph, const MapCenter& center, const MapConfig& config,
                        double mean_area) const {
+        const TownConfig& towns = config.towns;
         double score = biome_habitability(center.biome);
         if (score <= 0.0) {
             return 0.0;
@@ -151,8 +152,11 @@ private:
         if (has_river) score += towns.river_bonus;
         if (has_road) score += towns.road_bonus;
 
-        if (center.elevation > towns.elevation_penalty_start) {
-            score -= (center.elevation - towns.elevation_penalty_start) * towns.elevation_penalty_scale;
+        // Land-relative: "too high to reach easily" is a statement about how far up
+        // the hills a site is, not about its height above the sea floor.
+        const double height = land_height(config, center.elevation);
+        if (height > towns.elevation_penalty_start) {
+            score -= (height - towns.elevation_penalty_start) * towns.elevation_penalty_scale;
         }
 
         // Room to grow. A settlement can hold no more buildings than its cell

@@ -63,8 +63,8 @@ public:
             }
         }
 
-        find_natural_(graph, settings, taken, rng);
-        find_abandoned_(graph, settings, taken, rng);
+        find_natural_(graph, config, taken, rng);
+        find_abandoned_(graph, config, taken, rng);
         find_wonders_(graph, taken, rng);
 
         logger.info("map pass: landmarks placed " + std::to_string(graph.landmarks.size()));
@@ -82,8 +82,9 @@ private:
      * gorges and a handful of summits; first-come-first-served spends the whole
      * budget on gorges and silently drops every peak.
      */
-    void find_natural_(MapGraph& graph, const LandmarkConfig& settings, std::vector<bool>& taken,
+    void find_natural_(MapGraph& graph, const MapConfig& config, std::vector<bool>& taken,
                        std::mt19937& rng) const {
+        const LandmarkConfig& settings = config.landmarks;
         struct Candidate {
             CenterId center;
             LandmarkKind kind;
@@ -96,7 +97,7 @@ private:
             if (taken[static_cast<std::size_t>(center.index)] || center.border) {
                 continue;
             }
-            const LandmarkKind kind = natural_kind_(graph, center, settings);
+            const LandmarkKind kind = natural_kind_(graph, center, config);
             if (kind == k_no_kind || !landmark_suits_biome(kind, center.biome)) {
                 continue;
             }
@@ -169,7 +170,8 @@ private:
      * reported as a volcano rather than merely a peak.
      */
     LandmarkKind natural_kind_(const MapGraph& graph, const MapCenter& center,
-                               const LandmarkConfig& settings) const {
+                               const MapConfig& config) const {
+        const LandmarkConfig& settings = config.landmarks;
         if (center.water && !center.ocean) {
             return lake_cluster_size_(graph, center) >= settings.great_lake_cells
                        ? LandmarkKind::GreatLake
@@ -180,7 +182,10 @@ private:
         }
 
         // A summit: strictly higher than every neighbour, and high in absolute terms.
-        bool is_summit = center.elevation >= settings.peak_elevation;
+        // Land-relative against the threshold; the neighbour comparisons below stay
+        // raw, because a monotonic rescale cannot change which of two cells is
+        // higher.
+        bool is_summit = land_height(config, center.elevation) >= settings.peak_elevation;
         for (const CenterId neighbor_id : center.neighbors) {
             if (graph.centers[static_cast<std::size_t>(neighbor_id)].elevation >= center.elevation) {
                 is_summit = false;
@@ -207,7 +212,7 @@ private:
                 break;
             }
         }
-        if (is_basin && center.elevation >= settings.canyon_elevation) {
+        if (is_basin && land_height(config, center.elevation) >= settings.canyon_elevation) {
             return LandmarkKind::Crater;
         }
 
@@ -259,7 +264,7 @@ private:
         }
 
         if (landmark_suits_biome(LandmarkKind::Canyon, center.biome)
-            && center.elevation > settings.canyon_elevation) {
+            && land_height(config, center.elevation) > settings.canyon_elevation) {
             return LandmarkKind::Canyon;
         }
         return k_no_kind;
@@ -293,8 +298,9 @@ private:
      * Sited away from living towns, so the world reads as having been more
      * populated once than it is now.
      */
-    void find_abandoned_(MapGraph& graph, const LandmarkConfig& settings, std::vector<bool>& taken,
+    void find_abandoned_(MapGraph& graph, const MapConfig& config, std::vector<bool>& taken,
                          std::mt19937& rng) const {
+        const LandmarkConfig& settings = config.landmarks;
         std::vector<CenterId> candidates;
         for (const MapCenter& center : graph.centers) {
             if (center.water || center.ocean || center.border
