@@ -36,6 +36,7 @@
 #include <coopa/maps/passes/pass_regions.h>
 #include <coopa/maps/passes/pass_roads.h>
 #include <coopa/maps/passes/pass_towns.h>
+#include <coopa/maps/passes/pass_valleys.h>
 #include <coopa/maps/map_task.h>
 #include <coopa/maps/passes/pass_water.h>
 
@@ -315,11 +316,16 @@ private:
      * not just the first one found.
      *
      * The frame is `MapConfig::shape` -- a rectangle spanning the canvas by
-     * default, which is what it always was, or a circle or triangle inscribed in
-     * it. See `shape_inset()`.
+     * default, which is what it always was, or any other outline inscribed in it.
+     * See `ShapeField`.
      */
     void border_check_() {
         const double border = config_.border_length;
+        // One field for the whole sweep. The organic shapes resolve a landmass
+        // layout and a noise generator at construction, and this runs once per
+        // cell and again per corner -- rebuilding that per query, which is what
+        // the free `shape_inset()` does, would dominate generation.
+        const ShapeField shape(config_);
 
         for (MapCenter& center : graph_.centers) {
             // The cell's own site, first, and not only for tidiness. The boundary
@@ -331,7 +337,7 @@ private:
             // outside the map with no geometry. Harmless only by luck, since their
             // default `Ocean` biome scores zero habitability and kept the town and
             // road passes from ever choosing one.
-            if (shape_inset(config_, center.point.x, center.point.y) <= border) {
+            if (shape.inset(center.point.x, center.point.y) <= border) {
                 center.border = true;
             }
 
@@ -341,7 +347,7 @@ private:
                 // reads this flag and nothing downstream knows what shape it is:
                 // the water pass floods it, the elevation pass measures height
                 // outward from it, and coastlines, regions and roads follow.
-                if (shape_inset(config_, corner.point.x, corner.point.y) <= border) {
+                if (shape.inset(corner.point.x, corner.point.y) <= border) {
                     corner.border = true;
                     center.border = true;
                 }
@@ -383,8 +389,8 @@ private:
                      + " corners, " + std::to_string(graph_.edges.size()) + " edges)");
     }
 
-    /** @brief Steps `generate_()` reports: the geometry build plus the twelve passes. */
-    static constexpr int k_generation_steps = 13;
+    /** @brief Steps `generate_()` reports: the geometry build plus the thirteen passes. */
+    static constexpr int k_generation_steps = 14;
 
     /**
      * @brief Runs one pass, counting it and checking for cancellation first.
@@ -417,8 +423,11 @@ private:
     /**
      * @brief Runs every pass in order, stopping early if cancelled.
      *
-     * The order is a dependency chain, not a preference -- moisture needs rivers,
-     * biomes need moisture, towns need regions. Chained with `&&` so that a
+     * The order is a dependency chain, not a preference -- valleys need rivers,
+     * moisture needs rivers, biomes need moisture, towns need regions. Valleys
+     * runs early, before moisture rather than last, so that everything reading
+     * the height field afterwards reads the carved one: roads route down the
+     * valleys, towns settle in them, and biomes classify the floors. Chained with `&&` so that a
      * cancellation short-circuits the rest without an early-return ladder.
      *
      * @param state Optional progress counter.
@@ -432,6 +441,7 @@ private:
             && stage_<PassElevation>(config_.enable_elevation, state, ctx)
             && stage_<PassTemperature>(config_.enable_temperature, state, ctx)
             && stage_<PassRivers>(config_.enable_rivers, state, ctx)
+            && stage_<PassValleys>(config_.enable_valleys, state, ctx)
             && stage_<PassMoisture>(config_.enable_moisture, state, ctx)
             && stage_<PassBiomes>(config_.enable_biomes, state, ctx)
             && stage_<PassRoads>(config_.enable_roads, state, ctx)

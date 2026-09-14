@@ -11,6 +11,9 @@
 #include <array>
 #include <cmath>
 #include <cstddef>
+#include <limits>
+#include <random>
+#include <vector>
 
 #include <glm/glm.hpp>
 #include <noise/FastNoiseLite.h>
@@ -47,6 +50,28 @@ struct NoiseConfig {
     /** @brief How strongly an octave's amplitude is weighted by the previous one. */
     double weighted_strength = 0.45;
 };
+
+/**
+ * @brief Applies a noise configuration to a FastNoiseLite generator.
+ *
+ * The eight setters live here rather than in `Noise`'s constructor because two
+ * different objects need them -- the `Noise` wrapper and `ShapeField`, which
+ * warps the landmass outline. Duplicating the block is how a field ends up
+ * configured in one place and silently ignored in the other.
+ *
+ * @param generator The generator to configure.
+ * @param config The field parameters to apply.
+ */
+inline void configure_noise(FastNoiseLite& generator, const NoiseConfig& config) {
+    generator.SetSeed(config.seed);
+    generator.SetFrequency(static_cast<float>(config.frequency));
+    generator.SetNoiseType(config.type);
+    generator.SetFractalType(config.fractal_type);
+    generator.SetFractalOctaves(config.octaves);
+    generator.SetFractalLacunarity(static_cast<float>(config.lacunarity));
+    generator.SetFractalGain(static_cast<float>(config.gain));
+    generator.SetFractalWeightedStrength(static_cast<float>(config.weighted_strength));
+}
 
 /**
  * @enum TownTier
@@ -188,13 +213,15 @@ inline CompositeShading composite_shading_from_name(std::string_view name) {
  * @brief The outline the landmass is confined to; everything outside it is sea.
  */
 enum class MapShape {
-    Rectangle, /**< @brief Axis-aligned, `width_m` by `height_m`. */
-    Circle,    /**< @brief `diameter_m` across. */
-    Triangle   /**< @brief Equilateral, `edge_length_m` a side, turned by `rotation`. */
+    Rectangle,   /**< @brief Axis-aligned, `width_m` by `height_m`. */
+    Circle,      /**< @brief `diameter_m` across. */
+    Triangle,    /**< @brief Equilateral, `edge_length_m` a side, turned by `rotation`. */
+    Continent,   /**< @brief One irregular landmass, `diameter_m` across on average. */
+    Archipelago  /**< @brief `continent_count` irregular landmasses of varying size. */
 };
 
 /** @brief Number of distinct `MapShape` values. */
-inline constexpr std::size_t k_map_shape_count = 3;
+inline constexpr std::size_t k_map_shape_count = 5;
 
 /**
  * @brief Maps a landmass shape to its serialisation name.
@@ -203,9 +230,11 @@ inline constexpr std::size_t k_map_shape_count = 3;
  */
 inline std::string_view map_shape_name(MapShape shape) {
     switch (shape) {
-        case MapShape::Rectangle: return "rectangle";
-        case MapShape::Circle:    return "circle";
-        case MapShape::Triangle:  return "triangle";
+        case MapShape::Rectangle:   return "rectangle";
+        case MapShape::Circle:      return "circle";
+        case MapShape::Triangle:    return "triangle";
+        case MapShape::Continent:   return "continent";
+        case MapShape::Archipelago: return "archipelago";
     }
     return "rectangle";
 }
@@ -216,8 +245,10 @@ inline std::string_view map_shape_name(MapShape shape) {
  * @return The matching shape, or `MapShape::Rectangle` if the name is unknown.
  */
 inline MapShape map_shape_from_name(std::string_view name) {
-    if (name == "circle")   return MapShape::Circle;
-    if (name == "triangle") return MapShape::Triangle;
+    if (name == "circle")      return MapShape::Circle;
+    if (name == "triangle")    return MapShape::Triangle;
+    if (name == "continent")   return MapShape::Continent;
+    if (name == "archipelago") return MapShape::Archipelago;
     return MapShape::Rectangle;
 }
 
@@ -246,6 +277,54 @@ struct ShapeConfig {
     double edge_length_m = 0.0;
     /** @brief Rotation in radians, applied about the centre. Triangle only. */
     double rotation = 0.0;
+    /**
+     * @brief Mean diameter of one landmass in metres; 0 sizes it to the canvas.
+     *
+     * Its own dimension rather than a reuse of `diameter_m`, because the two are
+     * not the same measurement: a circle's diameter is the whole world, while
+     * this is the *average* of several landmasses that then vary about it. Wiring
+     * them together would make an archipelago inherit whatever the circle happened
+     * to be set to and fuse into one lumpy continent.
+     *
+     * `Continent` and `Archipelago` only. 0 means "sized to the canvas", which for
+     * one continent is as wide as will fit and for an archipelago is landmasses
+     * covering `k_archipelago_fill` of it between them.
+     */
+    double continent_size_m = 0.0;
+    /**
+     * @brief How many landmasses `Archipelago` attempts, at least 1.
+     *
+     * An upper bound, not a promise. Two landmasses placed close enough fuse
+     * into one larger continent, which is what stops an archipelago reading as
+     * a row of evenly spaced blobs.
+     */
+    int continent_count = 4;
+    /**
+     * @brief How far the outline of a landmass wanders from a circle, 0 to 0.6.
+     *
+     * Clamped to that range, so the radius never falls below 40% of the mean and
+     * a landmass can never pinch itself in two. Zero gives a plain disc.
+     * `Continent` and `Archipelago` only.
+     */
+    double irregularity = 0.35;
+    /**
+     * @brief Spread of landmass sizes about the mean in `Archipelago`, 0 to 0.9.
+     *
+     * At the default a continent is between 65% and 135% of `diameter_m`, so an
+     * archipelago comes out as a couple of large landmasses and a scatter of
+     * smaller ones rather than clones.
+     */
+    double size_variance = 0.35;
+    /**
+     * @brief Amplitude of the coastal warp, as a fraction of the mean radius.
+     *
+     * The radial outline alone is star-convex -- every ray from the centre
+     * crosses the coast exactly once, so there are no fjords and no headland
+     * that folds back on itself. Displacing the whole boundary by a noise field
+     * breaks that, and is what produces peninsulas, inlets and the occasional
+     * island lying off the coast. `Continent` and `Archipelago` only.
+     */
+    double coast_detail = 0.12;
 };
 
 /**
@@ -603,6 +682,15 @@ struct MapConfig {
      */
     NoiseConfig noise_relief{7717, 0.055};
     /**
+     * @brief The field that warps the coastline of the organic landmass shapes.
+     *
+     * Only read by `MapShape::Continent` and `MapShape::Archipelago`. Low
+     * frequency on purpose: this bends the *outline* of a continent, so a
+     * feature is a bay or a headland spanning many cells. The island field
+     * carves the detail inside whatever silhouette this leaves.
+     */
+    NoiseConfig noise_shape{5233, 0.03};
+    /**
      * @brief How much fractal relief reshapes the coast-distance height field, 0 to 1.
      *
      * Height is breadth-first *distance from the coast*, which is what keeps
@@ -736,10 +824,99 @@ struct MapConfig {
      * channel -- so its surface has to be *above* the ground, or a mesh built
      * from the two fights with itself along every watercourse. Deepens with
      * volume: a stream is ankle-deep and a trunk river is not.
+     *
+     * Above the ground **as the elevation layer draws it** -- `river_surface_at()`
+     * measures from `MapGraph::elevation_at()`, not from `MapCorner::elevation`.
+     * The two are different surfaces, by some 22 m at a river corner, and while
+     * this was measured from the corner heights the sheet was drawn below the
+     * terrain along nearly half of every watercourse.
+     *
+     * Complementary to `river_incision_m` and `river_channel_depth_m`, not a
+     * duplicate of either: incision cuts the valley, the channel depth cuts the
+     * bed within it, and this floats the sheet of water above that bed. A metre
+     * of freeboard, twenty of channel and sixty of valley are all true of the
+     * same river.
      */
     double river_depth_m = 1.0;
     /** @brief Additional depth per unit of river volume, in metres. */
     double river_depth_per_volume_m = 0.35;
+    /**
+     * @brief How deep the channel is cut into the sampled ground, in metres.
+     *
+     * The third and last of the river depths, and the only one that puts a
+     * watercourse in the *picture* of the terrain. Worth stating what each does,
+     * because three depths on one river invites the wrong guess:
+     *
+     * - `river_incision_m` carves the **valley** into the control mesh -- corner
+     *   and cell heights. A landform, hundreds of metres across.
+     * - This cuts the **channel** into the surface sampled *between* those
+     *   heights. A few metres across, and the only one fine enough to read as a
+     *   river rather than as a dip in the ground.
+     * - `river_depth_m` floats the **water sheet** above the control mesh, which
+     *   is what stops a mesh built from ground and water fighting itself.
+     *
+     * It has to live at sample time rather than in the control mesh because the
+     * mesh cannot hold it: `elevation_at()` interpolates between cell sites some
+     * 60 m apart, and a river is 5 to 20 m wide. Carved into cell heights the
+     * best achievable was a 500 m depression with no edge -- measurably deep,
+     * invisible to look at. Same reason `terrain_roughness` lives here.
+     *
+     * Zero leaves the sampled surface exactly as the control mesh describes it.
+     */
+    double river_channel_depth_m = 18.0;
+    /**
+     * @brief Additional channel depth per unit of river volume, in metres.
+     *
+     * The channel widens with volume through `river_width()` whether this is set
+     * or not; this is what also makes it deepen, so a trunk river reads as a
+     * trench and a headwater stream as a scratch.
+     */
+    double river_channel_depth_per_volume_m = 4.0;
+    /**
+     * @brief How deep a river cuts the valley it runs in, in metres.
+     *
+     * Rivers erode. Without this the elevation field has no idea a river pass
+     * ever ran -- elevation is computed before rivers are routed, so the height
+     * field came out of the generator with a drainage network drawn on a surface
+     * that has nowhere for the water to go, and the elevation layer showed no
+     * trace of the rivers the water layer is full of.
+     *
+     * This is a *valley*, not a channel, and the difference is forced by the
+     * geometry. The rendered surface interpolates cell-site heights over Delaunay
+     * triangles, while rivers run along Voronoi edges -- cell *boundaries*. So the
+     * narrowest thing the surface can express is about a cell across, 60 m at the
+     * default scale, against a river 5 to 20 m wide. Which is the right answer
+     * anyway: a river sits in a valley far wider than itself.
+     *
+     * Zero restores the uncarved height field exactly, which is what the
+     * generator produced before valleys existed.
+     */
+    double river_incision_m = 60.0;
+    /**
+     * @brief Additional valley depth per unit of river volume, in metres.
+     *
+     * A trunk river has had far longer to cut than the stream feeding it, so the
+     * valley deepens downstream on its own rather than needing to be authored.
+     */
+    double river_incision_per_volume_m = 12.0;
+    /**
+     * @brief How many corners out from the watercourse the valley opens.
+     *
+     * Rings of `MapCorner::adjacent`, so 1 is a trench with the river at the
+     * bottom of it and nothing either side, and 2 gives it banks. Raising it
+     * widens and gentles the valley rather than deepening it.
+     */
+    int river_valley_width = 2;
+    /**
+     * @brief Depth multiplier per ring outward from the watercourse, 0 to 1.
+     *
+     * What turns a step into a slope. At the default each ring is carved half as
+     * deeply as the one inside it, so the valley wall grades away instead of
+     * dropping vertically -- which matters for more than looks, since a cliff at
+     * every watercourse would push the mean elevation step between neighbouring
+     * cells past what `elevation_smoothing_iterations` is there to hold down.
+     */
+    double river_valley_falloff = 0.5;
     /**
      * @brief How far every water surface is extended past its own edge, in metres.
      *
@@ -781,6 +958,7 @@ struct MapConfig {
     bool enable_elevation = true;   /**< @brief Run the elevation pass. */
     bool enable_temperature = true; /**< @brief Run the temperature pass. */
     bool enable_rivers = true;      /**< @brief Run the river pass. */
+    bool enable_valleys = true;     /**< @brief Run the valley pass, which cuts rivers into the terrain. */
     bool enable_moisture = true;    /**< @brief Run the moisture pass. */
     bool enable_biomes = true;      /**< @brief Run the biome pass. */
     bool enable_roads = true;       /**< @brief Run the road pass. */
@@ -800,17 +978,413 @@ struct MapConfig {
     bool subdivide_noisy_edges = true;
 };
 
+/** @brief How many angular harmonics wander the outline of one landmass. */
+inline constexpr std::size_t k_shape_harmonics = 4;
+
+/**
+ * @brief The angular frequencies summed into a landmass outline.
+ *
+ * Whole numbers, so the outline closes on itself with no seam at `theta = pi`,
+ * and pairwise coprime, so the sum has no shorter period than a full turn --
+ * a set like {2, 4, 6} would come out twofold symmetric and read as a manufactured
+ * shape rather than a coastline.
+ */
+inline constexpr std::array<double, k_shape_harmonics> k_shape_modes{2.0, 3.0, 5.0, 7.0};
+
+/** @brief Amplitude multiplier between successive outline harmonics. */
+inline constexpr double k_shape_harmonic_gain = 0.55;
+
+/** @brief Seed offset for landmass placement; distinct from every pass's own. */
+inline constexpr unsigned int k_shape_seed_offset = 6291469u;
+
+/**
+ * @brief How much of the canvas an `Archipelago` fills when `diameter_m` is 0.
+ *
+ * The fraction of the largest disc that fits the canvas which the landmasses,
+ * counting the full reach of their outlines, cover between them. Well under 1,
+ * and that is the point: the slack is the room they have to scatter into. Size
+ * them to fill the canvas and every centre gets pinned near the middle, and the
+ * archipelago fuses into one continent with a lumpy edge.
+ */
+inline constexpr double k_archipelago_fill = 0.55;
+
+/** @brief Candidate positions considered per landmass when placing an archipelago. */
+inline constexpr int k_shape_placement_darts = 32;
+
+/**
+ * @brief How far out of the middle candidate landmass positions are pushed, 0 to 1.
+ *
+ * A landmass is large next to the disc its centre is allowed to fall in, so a
+ * centre sampled near the middle of that disc overlaps everything else there is
+ * -- area-uniform sampling puts a landmass in the one place it cannot help but
+ * fuse. Holding the candidates out to an annulus instead keeps roughly one more
+ * landmass distinct at the same size and the same coverage, and it is what puts
+ * open sea *between* the landmasses rather than only around the outside of them.
+ */
+inline constexpr double k_shape_placement_bias = 0.55;
+
+/**
+ * @brief Grid size the coastal warp frequency is quoted against.
+ *
+ * `noise_shape.frequency` is in grid units, so holding it fixed while raising
+ * `grid_size` would not resolve the coast more finely -- it would crumble a
+ * continent into a hundred little wobbles. Scaling by this keeps the silhouette
+ * of a map the same shape at every resolution, which is what `--grid-size` is
+ * supposed to control. The island field is scaled the same way, for the same
+ * reason.
+ */
+inline constexpr double k_shape_reference_grid = 40.0;
+
+/**
+ * @struct ShapeBlob
+ * @brief One landmass: where it sits, how big it is, and how its outline wanders.
+ */
+struct ShapeBlob {
+    /** @brief Centre, in grid units. */
+    double centre_x = 0.0;
+    /** @brief Centre, in grid units. */
+    double centre_y = 0.0;
+    /** @brief Mean radius in grid units; the outline varies about it. */
+    double radius = 0.0;
+    /** @brief Phase of each outline harmonic, in radians. */
+    std::array<double, k_shape_harmonics> phase{};
+};
+
+/**
+ * @class ShapeField
+ * @brief The outline the landmass is confined to, resolved once and sampled cheaply.
+ *
+ * The shape of the world comes from one predicate: `inset()` returns how far
+ * inside the outline a point lies. `border_check_()` flags any corner whose inset
+ * falls below `border_length`; the water pass forces those cells to sea, and the
+ * elevation pass measures height as distance from them -- so this class decides
+ * the coastline, the mountains, the regions and the roads, all without any of
+ * them knowing shapes exist.
+ *
+ * It is an object rather than a free function because the organic shapes carry
+ * state: a landmass layout drawn from the seed, and a noise generator that warps
+ * the coast. Rebuilding those per sample is the exact mistake `Noise` was
+ * introduced to undo -- `inset()` is called once per cell *and* once per corner,
+ * so it runs on the order of a hundred thousand times per map. Build one field
+ * and reuse it; `shape_inset()` is the convenience path for one-off queries.
+ *
+ * `Rectangle`, `Circle` and `Triangle` are pure geometry and touch neither the
+ * layout nor the generator, so constructing a field for them costs nothing.
+ *
+ * ### Sizing
+ *
+ * Every dimension treats 0 as "as big as the canvas allows", which is what makes
+ * the default rectangle span the grid. `continent_size_m` is the *mean* diameter
+ * of a single landmass, so 0 has to mean something per-shape there: a `Continent`
+ * grows until its widest lobe just fits the canvas, and an `Archipelago` sizes its
+ * landmasses so they cover `k_archipelago_fill` of it between them.
+ */
+class ShapeField {
+public:
+    /**
+     * @brief Resolves the outline described by a configuration.
+     * @param config Supplies the shape, its dimensions, the grid size, the world
+     *        scale, the master seed and the coastal warp field.
+     */
+    explicit ShapeField(const MapConfig& config)
+        : shape_(config.shape.shape),
+          grid_(static_cast<double>(config.grid_size)),
+          centre_(static_cast<double>(config.grid_size) * 0.5),
+          rotation_(config.shape.rotation) {
+        // A dimension of 0 means "as big as the canvas allows".
+        const auto extent = [&config, this](double meters) {
+            return meters > 0.0 ? meters / config.meters_per_grid_unit : grid_;
+        };
+
+        switch (shape_) {
+            case MapShape::Circle:
+                radius_ = extent(config.shape.diameter_m) * 0.5;
+                return;
+            case MapShape::Triangle:
+                half_side_ = extent(config.shape.edge_length_m) * 0.5;
+                return;
+            case MapShape::Continent:
+            case MapShape::Archipelago:
+                build_landmasses_(config);
+                return;
+            case MapShape::Rectangle:
+                break;
+        }
+        half_width_ = extent(config.shape.width_m) * 0.5;
+        half_height_ = extent(config.shape.height_m) * 0.5;
+    }
+
+    /**
+     * @brief How far inside the outline a point lies, in grid units.
+     *
+     * Positive inside, negative outside, zero on the boundary. The three
+     * geometric shapes return an exact signed distance; the organic ones return a
+     * signed pseudo-distance, whose sign is exact and whose magnitude near the
+     * boundary is unit-scaled -- which is all `border_length` compares against.
+     *
+     * @param x Horizontal grid position.
+     * @param y Vertical grid position.
+     * @return Positive inside the shape, negative outside, zero on its boundary.
+     */
+    double inset(double x, double y) const {
+        const double dx = x - centre_;
+        const double dy = y - centre_;
+
+        switch (shape_) {
+            case MapShape::Circle:
+                return radius_ - std::sqrt(dx * dx + dy * dy);
+            case MapShape::Triangle: {
+                // Rotate into the triangle's own frame, then measure. Rotating the
+                // query rather than the triangle keeps the shape description to one
+                // number.
+                const double c = std::cos(-rotation_);
+                const double sn = std::sin(-rotation_);
+                const double lx = dx * c - dy * sn;
+                const double ly = dx * sn + dy * c;
+
+                // Signed distance to an equilateral triangle centred on its
+                // centroid, with `half_side_` as the base half-width and k = sqrt(3).
+                const double k = 1.7320508075688772;
+                if (half_side_ <= 0.0) {
+                    return -1.0;
+                }
+                // The formula is written for maths axes, where y climbs; image rows
+                // descend. Flipping here is what puts the apex at the top of the
+                // picture rather than the bottom.
+                double px = std::abs(lx) - half_side_;
+                double py = -ly + half_side_ / k;
+                if (px + k * py > 0.0) {
+                    const double folded_x = (px - k * py) * 0.5;
+                    const double folded_y = (-k * px - py) * 0.5;
+                    px = folded_x;
+                    py = folded_y;
+                }
+                px -= std::clamp(px, -2.0 * half_side_, 0.0);
+                // Distance, signed by which side of the folded edge the point landed
+                // on. Positive inside, to match the other two shapes.
+                return std::sqrt(px * px + py * py) * (py > 0.0 ? 1.0 : -1.0);
+            }
+            case MapShape::Continent:
+            case MapShape::Archipelago: {
+                // Union of the landmasses: a point is inside the shape if it is
+                // inside any one of them, so two that overlap fuse into a single
+                // larger continent instead of drawing a coast through each other.
+                double best = blob_inset_(blobs_.front(), x, y);
+                for (std::size_t i = 1; i < blobs_.size(); ++i) {
+                    best = std::max(best, blob_inset_(blobs_[i], x, y));
+                }
+                // Warping after the union rather than per landmass keeps the coastal
+                // texture continuous across a fused pair, and is what lets a coast
+                // fold back on itself -- the radial outline alone cannot, so without
+                // this there are no fjords and no offshore islands.
+                return best + warp_amplitude_ *
+                                  static_cast<double>(warp_.GetNoise(static_cast<float>(x),
+                                                                    static_cast<float>(y)));
+            }
+            case MapShape::Rectangle:
+                break;
+        }
+
+        return std::min(half_width_ - std::abs(dx), half_height_ - std::abs(dy));
+    }
+
+    /**
+     * @brief The landmasses the organic shapes resolved to.
+     * @return One entry per landmass; empty for the geometric shapes.
+     */
+    const std::vector<ShapeBlob>& landmasses() const { return blobs_; }
+
+private:
+    /**
+     * @brief Draws the landmass layout from the master seed.
+     *
+     * Sizes come first, because a landmass has to know how far it reaches before
+     * anywhere is a legal place to put it: the centre is confined to a disc small
+     * enough that the widest lobe plus the coastal warp still clears the canvas
+     * edge by `margin_`. Without that the ocean flood fill can find a landmass
+     * touching the border and mistake the sea for a lake.
+     *
+     * @param config Supplies the seed, the world scale and the shape parameters.
+     */
+    void build_landmasses_(const MapConfig& config) {
+        irregularity_ = std::clamp(config.shape.irregularity, 0.0, 0.6);
+        const double detail = std::max(config.shape.coast_detail, 0.0);
+        const double variance = std::clamp(config.shape.size_variance, 0.0, 0.9);
+        const int count = shape_ == MapShape::Archipelago
+                              ? std::max(1, config.shape.continent_count)
+                              : 1;
+        margin_ = std::max(1.0, grid_ * 0.03);
+
+        // How much wider than its mean radius a landmass can get: the tallest
+        // outline lobe, plus the coastal warp on top of it.
+        const double reach = 1.0 + irregularity_ + detail;
+        const double fitting_radius = std::max(0.0, (grid_ * 0.5 - margin_) / reach);
+
+        double base_radius =
+            config.shape.continent_size_m > 0.0
+                ? config.shape.continent_size_m / config.meters_per_grid_unit * 0.5
+                : 0.0;
+        if (base_radius <= 0.0) {
+            // Pack `count` landmasses into the canvas disc at `k_archipelago_fill`
+            // coverage: N * (R * reach)^2 = fill * (grid/2 - margin)^2. A lone
+            // continent skips the packing and simply grows until it fits.
+            base_radius = shape_ == MapShape::Archipelago
+                              ? fitting_radius * std::sqrt(k_archipelago_fill /
+                                                           static_cast<double>(count))
+                              : fitting_radius;
+        }
+        base_radius = std::min(base_radius, fitting_radius);
+        warp_amplitude_ = detail * base_radius;
+
+        configure_noise(warp_, config.noise_shape);
+        warp_.SetFrequency(static_cast<float>(config.noise_shape.frequency *
+                                              (k_shape_reference_grid / grid_)));
+
+        std::mt19937 rng(static_cast<std::mt19937::result_type>(config.seed) + k_shape_seed_offset);
+        std::uniform_real_distribution<double> unit(0.0, 1.0);
+        std::uniform_real_distribution<double> turn(0.0, 2.0 * 3.14159265358979323846);
+
+        blobs_.reserve(static_cast<std::size_t>(count));
+        for (int i = 0; i < count; ++i) {
+            ShapeBlob blob;
+            blob.radius =
+                count > 1 ? base_radius * (1.0 + variance * (unit(rng) * 2.0 - 1.0)) : base_radius;
+            blob.radius = std::min(blob.radius, fitting_radius);
+            for (std::size_t k = 0; k < k_shape_harmonics; ++k) {
+                blob.phase[k] = turn(rng);
+            }
+
+            const double limit =
+                std::max(0.0, grid_ * 0.5 - margin_ - blob.radius * (1.0 + irregularity_) -
+                                  warp_amplitude_);
+            place_(blob, limit, rng, unit, turn);
+            blobs_.push_back(blob);
+        }
+    }
+
+    /**
+     * @brief Picks a centre for one landmass by Mitchell's best-candidate sampling.
+     *
+     * Throws `k_shape_placement_darts` positions into the legal disc and keeps the
+     * one furthest from every landmass already placed. Rejection sampling against a
+     * minimum separation would spread them more evenly but can run out of room and
+     * fail to place the last landmass at all; this always places one, and still
+     * lets two land close enough to fuse -- which is what stops an archipelago
+     * reading as a row of evenly spaced blobs.
+     *
+     * @param blob The landmass to position; its radius must already be set.
+     * @param limit Radius of the disc the centre may fall in, in grid units.
+     * @param rng The layout random stream.
+     * @param unit A `[0, 1)` distribution over `rng`.
+     * @param turn A `[0, 2*pi)` distribution over `rng`.
+     */
+    void place_(ShapeBlob& blob, double limit, std::mt19937& rng,
+                std::uniform_real_distribution<double>& unit,
+                std::uniform_real_distribution<double>& turn) const {
+        if (limit <= 0.0 || blobs_.empty()) {
+            // Nowhere to go, or nothing to stay away from: sample once so the
+            // stream advances identically either way.
+            const double angle = turn(rng);
+            const double distance = sample_distance_(limit, unit(rng));
+            blob.centre_x = centre_ + std::cos(angle) * distance;
+            blob.centre_y = centre_ + std::sin(angle) * distance;
+            return;
+        }
+
+        double best_x = centre_;
+        double best_y = centre_;
+        double best_clearance = -1.0;
+        for (int dart = 0; dart < k_shape_placement_darts; ++dart) {
+            const double angle = turn(rng);
+            const double distance = sample_distance_(limit, unit(rng));
+            const double x = centre_ + std::cos(angle) * distance;
+            const double y = centre_ + std::sin(angle) * distance;
+
+            double clearance = std::numeric_limits<double>::max();
+            for (const ShapeBlob& placed : blobs_) {
+                const double dx = x - placed.centre_x;
+                const double dy = y - placed.centre_y;
+                // Measured between the rims, not the centres, so a large landmass
+                // pushes its neighbours further away than a small one does.
+                clearance = std::min(clearance,
+                                     std::sqrt(dx * dx + dy * dy) - placed.radius - blob.radius);
+            }
+            if (clearance > best_clearance) {
+                best_clearance = clearance;
+                best_x = x;
+                best_y = y;
+            }
+        }
+        blob.centre_x = best_x;
+        blob.centre_y = best_y;
+    }
+
+    /**
+     * @brief Turns a uniform sample into a distance from the canvas centre.
+     *
+     * The square root is what makes the draw area-uniform over a disc rather than
+     * bunched at the middle, since a ring has more area the further out it sits.
+     * `k_shape_placement_bias` then lifts the floor off the centre entirely.
+     *
+     * @param limit Radius of the disc the centre may fall in, in grid units.
+     * @param sample A uniform draw in `[0, 1)`.
+     * @return A distance in `[bias * limit, limit]`.
+     */
+    static double sample_distance_(double limit, double sample) {
+        return limit * (k_shape_placement_bias +
+                        (1.0 - k_shape_placement_bias) * std::sqrt(sample));
+    }
+
+    /**
+     * @brief Inset relative to a single landmass, before the coastal warp.
+     * @param blob The landmass to measure against.
+     * @param x Horizontal grid position.
+     * @param y Vertical grid position.
+     * @return Positive inside that landmass, negative outside.
+     */
+    double blob_inset_(const ShapeBlob& blob, double x, double y) const {
+        const double dx = x - blob.centre_x;
+        const double dy = y - blob.centre_y;
+        const double distance = std::sqrt(dx * dx + dy * dy);
+        const double theta = std::atan2(dy, dx) - rotation_;
+
+        // A fractal sum in the angle: each harmonic turns faster and counts for
+        // less, which is the one-dimensional equivalent of the fbm that gives the
+        // terrain its shape. Normalised by the total weight so `irregularity_`
+        // means the same thing however many harmonics there are.
+        double wobble = 0.0;
+        double weight = 0.0;
+        double gain = 1.0;
+        for (std::size_t k = 0; k < k_shape_harmonics; ++k) {
+            wobble += gain * std::sin(k_shape_modes[k] * theta + blob.phase[k]);
+            weight += gain;
+            gain *= k_shape_harmonic_gain;
+        }
+        return blob.radius * (1.0 + irregularity_ * (wobble / weight)) - distance;
+    }
+
+    MapShape shape_;              /**< @brief Which outline this field describes. */
+    double grid_;                 /**< @brief Canvas size in grid units. */
+    double centre_;               /**< @brief Canvas centre in grid units, both axes. */
+    double rotation_;             /**< @brief Rotation about the centre, in radians. */
+    double radius_ = 0.0;         /**< @brief Circle radius, in grid units. */
+    double half_side_ = 0.0;      /**< @brief Triangle base half-width, in grid units. */
+    double half_width_ = 0.0;     /**< @brief Rectangle half-width, in grid units. */
+    double half_height_ = 0.0;    /**< @brief Rectangle half-height, in grid units. */
+    double irregularity_ = 0.0;   /**< @brief Clamped outline wander, 0 to 0.6. */
+    double margin_ = 0.0;         /**< @brief Open sea kept clear round the canvas edge. */
+    double warp_amplitude_ = 0.0; /**< @brief Coastal warp amplitude, in grid units. */
+    std::vector<ShapeBlob> blobs_; /**< @brief The landmasses; empty unless organic. */
+    FastNoiseLite warp_;           /**< @brief The coastal warp field; unused unless organic. */
+};
+
 /**
  * @brief How far inside the landmass shape a point lies, in grid units.
  *
- * The one predicate the shape of the world comes from. `border_check_()` flags
- * any corner whose inset falls below `border_length`; the water pass forces those
- * cells to sea, and the elevation pass measures height as distance from them -- so
- * changing this function changes the coastline, the mountains, the regions and
- * the roads, all without any of them knowing shapes exist.
- *
- * A zero dimension spans the canvas, which is what makes the default rectangle
- * reproduce the pre-shape map exactly.
+ * A one-off query against a freshly resolved `ShapeField`. Convenient, but it
+ * rebuilds the field every call -- anything sampling the shape more than a
+ * handful of times should hold a `ShapeField` and call `ShapeField::inset()`,
+ * which is what `border_check_()` does.
  *
  * @param config Supplies the shape, the grid size and the world scale.
  * @param x Horizontal grid position.
@@ -818,60 +1392,7 @@ struct MapConfig {
  * @return Positive inside the shape, negative outside, zero on its boundary.
  */
 inline double shape_inset(const MapConfig& config, double x, double y) {
-    const double grid = static_cast<double>(config.grid_size);
-    const double centre = grid * 0.5;
-    const double dx = x - centre;
-    const double dy = y - centre;
-
-    // A dimension of 0 means "as big as the canvas allows".
-    const auto extent = [&config, grid](double meters) {
-        return meters > 0.0 ? meters / config.meters_per_grid_unit : grid;
-    };
-
-    switch (config.shape.shape) {
-        case MapShape::Circle: {
-            const double radius = extent(config.shape.diameter_m) * 0.5;
-            return radius - std::sqrt(dx * dx + dy * dy);
-        }
-        case MapShape::Triangle: {
-            // Rotate into the triangle's own frame, then measure. Rotating the
-            // query rather than the triangle keeps the shape description to one
-            // number.
-            const double c = std::cos(-config.shape.rotation);
-            const double sn = std::sin(-config.shape.rotation);
-            const double lx = dx * c - dy * sn;
-            const double ly = dx * sn + dy * c;
-
-            // Signed distance to an equilateral triangle centred on its
-            // centroid, with `half_side` as the base half-width and k = sqrt(3).
-            const double k = 1.7320508075688772;
-            const double half_side = extent(config.shape.edge_length_m) * 0.5;
-            if (half_side <= 0.0) {
-                return -1.0;
-            }
-            // The formula is written for maths axes, where y climbs; image rows
-            // descend. Flipping here is what puts the apex at the top of the
-            // picture rather than the bottom.
-            double px = std::abs(lx) - half_side;
-            double py = -ly + half_side / k;
-            if (px + k * py > 0.0) {
-                const double folded_x = (px - k * py) * 0.5;
-                const double folded_y = (-k * px - py) * 0.5;
-                px = folded_x;
-                py = folded_y;
-            }
-            px -= std::clamp(px, -2.0 * half_side, 0.0);
-            // Distance, signed by which side of the folded edge the point landed
-            // on. Positive inside, to match the other two shapes.
-            return std::sqrt(px * px + py * py) * (py > 0.0 ? 1.0 : -1.0);
-        }
-        case MapShape::Rectangle:
-            break;
-    }
-
-    const double half_width = extent(config.shape.width_m) * 0.5;
-    const double half_height = extent(config.shape.height_m) * 0.5;
-    return std::min(half_width - std::abs(dx), half_height - std::abs(dy));
+    return ShapeField(config).inset(x, y);
 }
 
 /**

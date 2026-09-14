@@ -647,15 +647,19 @@ static void test_renderers_produce_a_full_image() {
 }
 
 /**
- * @brief Rivers belong to the water layer, and to no other.
+ * @brief Rivers reach the height field by carving it, and only by carving it.
  *
- * The elevation layer used to have its river network dimmed into it. That made
- * it a picture of the terrain rather than the terrain itself -- a consumer
- * flooding a mesh to those values would find channels already cut. Splitting the
- * layers means the height field is now height and nothing else, and this is the
- * check that the split actually happened rather than being merely intended.
+ * The elevation layer used to have its river network *dimmed* into it, which was
+ * wrong twice over: it made the layer a picture of the terrain rather than the
+ * terrain itself, and a consumer flooding a mesh to those values found channels
+ * already cut. That painting is gone and is not coming back.
+ *
+ * What replaced it is the valley pass, which lowers the ground. So the layer must
+ * now differ when rivers run -- otherwise the carve never reached the pixels --
+ * and must be *bit-identical* once the incision is set to zero, which is the
+ * guarantee that the only thing moving the image is the terrain itself.
  */
-static void test_rivers_live_on_the_water_layer_only() {
+static void test_rivers_cut_valleys_into_the_height_field() {
     MapConfig with_rivers_config = small_config();
     with_rivers_config.subdivide_noisy_edges = false;
 
@@ -668,17 +672,38 @@ static void test_rivers_live_on_the_water_layer_only() {
     without_rivers.generate();
     ASSERT_TRUE(!with_rivers.graph().rivers.empty());
 
-    // The height field does not notice whether the river pass ran.
+    // The height field notices, because the ground under a river is lower.
     const Image drawn = MapLayers::elevation(with_rivers.graph(), with_rivers_config);
     const Image base = MapLayers::elevation(without_rivers.graph(), without_rivers_config);
     ASSERT_EQ(drawn.pixels.size(), base.pixels.size());
-    ASSERT_TRUE(drawn.pixels == base.pixels);
+    ASSERT_TRUE(drawn.pixels != base.pixels);
 
-    // The water layer very much does.
+    // The water layer very much does too.
     const Image wet = MapLayers::water(with_rivers.graph(), with_rivers_config);
     const Image dry = MapLayers::water(without_rivers.graph(), without_rivers_config);
     ASSERT_EQ(wet.pixels.size(), dry.pixels.size());
     ASSERT_TRUE(wet.pixels != dry.pixels);
+
+    // With nothing carved -- neither the valley in the mesh nor the channel in
+    // the surface -- the two are the same image again, so the difference above is
+    // the carving and not some other thing the river pass touched.
+    MapConfig uncarved_config = with_rivers_config;
+    uncarved_config.river_incision_m = 0.0;
+    uncarved_config.river_incision_per_volume_m = 0.0;
+    uncarved_config.river_channel_depth_m = 0.0;
+    uncarved_config.river_channel_depth_per_volume_m = 0.0;
+    MapConfig uncarved_without_config = uncarved_config;
+    uncarved_without_config.enable_rivers = false;
+
+    MapGenerator uncarved(uncarved_config, maps_logger());
+    MapGenerator uncarved_without(uncarved_without_config, maps_logger());
+    uncarved.generate();
+    uncarved_without.generate();
+
+    const Image flat = MapLayers::elevation(uncarved.graph(), uncarved_config);
+    const Image flat_base =
+        MapLayers::elevation(uncarved_without.graph(), uncarved_without_config);
+    ASSERT_TRUE(flat.pixels == flat_base.pixels);
 }
 
 // Regions, names and landmarks need more land than a 16-cell map offers.
@@ -1552,6 +1577,12 @@ static MapConfig perturbed_config() {
     config.elevation_range_m = 777.0;
     config.river_depth_m = 2.5;
     config.river_depth_per_volume_m = 0.6;
+    config.river_channel_depth_m = 23.0;
+    config.river_channel_depth_per_volume_m = 7.0;
+    config.river_incision_m = 88.0;
+    config.river_incision_per_volume_m = 17.0;
+    config.river_valley_width = 4;
+    config.river_valley_falloff = 0.33;
     config.water_edge_overlap_m = 3.0;
     config.terrain_relief = 0.31;
     config.terrain_roughness = 0.44;
@@ -1559,7 +1590,10 @@ static MapConfig perturbed_config() {
                            FastNoiseLite::FractalType_FBm, 3, 2.1, 0.55, 0.4};
     config.noise_terrain = {33, 0.77, FastNoiseLite::NoiseType_Value,
                             FastNoiseLite::FractalType_FBm, 4, 1.9, 0.45, 0.3};
-    config.shape = {MapShape::Triangle, 111.0, 222.0, 333.0, 444.0, 0.55};
+    config.shape = {MapShape::Triangle, 111.0, 222.0, 333.0, 444.0, 0.55,
+                    555.0, 6, 0.41, 0.22, 0.19};
+    config.noise_shape = {66, 0.22, FastNoiseLite::NoiseType_Perlin,
+                          FastNoiseLite::FractalType_FBm, 2, 2.3, 0.35, 0.25};
     config.show_regions = false;
     config.composite_shading = CompositeShading::Hillshade;
     config.region_tint = 0.42f;
@@ -1594,6 +1628,7 @@ static MapConfig perturbed_config() {
     config.enable_elevation = false;
     config.enable_temperature = false;
     config.enable_rivers = false;
+    config.enable_valleys = false;
     config.enable_moisture = false;
     config.enable_biomes = false;
     config.enable_roads = false;
@@ -1678,6 +1713,14 @@ static void test_config_round_trips_every_field() {
     ASSERT_TRUE(std::abs(loaded.river_depth_m - original.river_depth_m) < 1e-9);
     ASSERT_TRUE(std::abs(loaded.river_depth_per_volume_m
                          - original.river_depth_per_volume_m) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.river_channel_depth_m - original.river_channel_depth_m) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.river_channel_depth_per_volume_m
+                         - original.river_channel_depth_per_volume_m) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.river_incision_m - original.river_incision_m) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.river_incision_per_volume_m
+                         - original.river_incision_per_volume_m) < 1e-9);
+    ASSERT_TRUE(loaded.river_valley_width == original.river_valley_width);
+    ASSERT_TRUE(std::abs(loaded.river_valley_falloff - original.river_valley_falloff) < 1e-9);
     ASSERT_TRUE(std::abs(loaded.water_edge_overlap_m - original.water_edge_overlap_m) < 1e-9);
     ASSERT_TRUE(std::abs(loaded.terrain_relief - original.terrain_relief) < 1e-9);
     ASSERT_TRUE(std::abs(loaded.terrain_roughness - original.terrain_roughness) < 1e-9);
@@ -1687,6 +1730,14 @@ static void test_config_round_trips_every_field() {
     ASSERT_TRUE(std::abs(loaded.shape.diameter_m - original.shape.diameter_m) < 1e-9);
     ASSERT_TRUE(std::abs(loaded.shape.edge_length_m - original.shape.edge_length_m) < 1e-9);
     ASSERT_TRUE(std::abs(loaded.shape.rotation - original.shape.rotation) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.shape.continent_size_m - original.shape.continent_size_m) < 1e-9);
+    ASSERT_TRUE(loaded.shape.continent_count == original.shape.continent_count);
+    ASSERT_TRUE(std::abs(loaded.shape.irregularity - original.shape.irregularity) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.shape.size_variance - original.shape.size_variance) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.shape.coast_detail - original.shape.coast_detail) < 1e-9);
+    ASSERT_TRUE(loaded.noise_shape.seed == original.noise_shape.seed);
+    ASSERT_TRUE(std::abs(loaded.noise_shape.frequency - original.noise_shape.frequency) < 1e-9);
+    ASSERT_TRUE(loaded.noise_shape.type == original.noise_shape.type);
     ASSERT_TRUE(loaded.show_regions == original.show_regions);
     ASSERT_TRUE(loaded.composite_shading == original.composite_shading);
     ASSERT_TRUE(std::abs(loaded.region_tint - original.region_tint) < 1e-6f);
@@ -1774,6 +1825,7 @@ static void test_config_round_trips_every_field() {
     ASSERT_TRUE(loaded.enable_elevation == original.enable_elevation);
     ASSERT_TRUE(loaded.enable_temperature == original.enable_temperature);
     ASSERT_TRUE(loaded.enable_rivers == original.enable_rivers);
+    ASSERT_TRUE(loaded.enable_valleys == original.enable_valleys);
     ASSERT_TRUE(loaded.enable_moisture == original.enable_moisture);
     ASSERT_TRUE(loaded.enable_biomes == original.enable_biomes);
     ASSERT_TRUE(loaded.enable_roads == original.enable_roads);
@@ -1838,6 +1890,7 @@ static void test_shipped_config_matches_the_documented_defaults() {
     // feature, and the symptom would look like a bug in the pass.
     ASSERT_TRUE(config.enable_water && config.enable_coast && config.enable_elevation);
     ASSERT_TRUE(config.enable_temperature && config.enable_rivers && config.enable_moisture);
+    ASSERT_TRUE(config.enable_valleys);
     ASSERT_TRUE(config.enable_biomes && config.enable_roads && config.enable_regions);
     ASSERT_TRUE(config.enable_towns && config.enable_landmarks && config.enable_noisy_edges);
 }
@@ -2087,6 +2140,21 @@ static void test_rivers_are_long_and_smooth() {
         const MapCorner& source = graph.corners[static_cast<std::size_t>(river.corners.front())];
         const MapCorner& mouth = graph.corners[static_cast<std::size_t>(river.corners.back())];
         ASSERT_TRUE(source.elevation >= mouth.elevation);
+    }
+
+    // Sources are drawn from high ground -- but that is a statement about the
+    // terrain the river pass *chose* from, and the valley pass has since cut the
+    // ground away beneath them. Checking it against the carved field would be
+    // asserting that rivers do not erode their own headwaters. So it is checked
+    // on the uncarved run, which is the surface the threshold was applied to.
+    MapConfig uncarved = config;
+    uncarved.enable_valleys = false;
+    MapGenerator before(uncarved, maps_logger());
+    before.generate();
+    const MapGraph& unworn = before.graph();
+    ASSERT_TRUE(!unworn.rivers.empty());
+    for (const MapRiver& river : unworn.rivers) {
+        const MapCorner& source = unworn.corners[static_cast<std::size_t>(river.corners.front())];
         ASSERT_TRUE(source.elevation >= config.river_source_min_elevation - 1e-9);
     }
 }
@@ -2805,6 +2873,8 @@ static void test_shape_names_round_trip() {
         ASSERT_TRUE(map_shape_from_name(map_shape_name(shape)) == shape);
     }
     ASSERT_TRUE(map_shape_from_name("rect") == MapShape::Rectangle);
+    ASSERT_TRUE(map_shape_from_name("continent") == MapShape::Continent);
+    ASSERT_TRUE(map_shape_from_name("archipelago") == MapShape::Archipelago);
     ASSERT_TRUE(map_shape_from_name("hexagon") == MapShape::Rectangle);
 }
 
@@ -2821,6 +2891,8 @@ static void test_shapes_confine_the_landmass() {
         {MapShape::Rectangle, 1200.0, 0.0},
         {MapShape::Circle, 1400.0, 0.0},
         {MapShape::Triangle, 1600.0, 0.5},
+        {MapShape::Continent, 1400.0, 0.0},
+        {MapShape::Archipelago, 700.0, 0.0},
     };
 
     for (const Case& test_case : cases) {
@@ -2830,6 +2902,7 @@ static void test_shapes_confine_the_landmass() {
         config.shape.height_m = test_case.size_m;
         config.shape.diameter_m = test_case.size_m;
         config.shape.edge_length_m = test_case.size_m;
+        config.shape.continent_size_m = test_case.size_m;
         config.shape.rotation = test_case.rotation;
 
         MapGenerator generator(config, maps_logger());
@@ -2855,6 +2928,189 @@ static void test_shapes_confine_the_landmass() {
     }
 }
 
+
+/**
+ * @brief A one-off `shape_inset()` agrees with a field held across a sweep.
+ *
+ * `border_check_()` builds one `ShapeField` and reuses it, while the tests and any
+ * caller outside the library go through `shape_inset()`, which resolves a fresh one
+ * per call. For the organic shapes that means a landmass layout redrawn from the
+ * seed every time -- if the RNG stream ever depended on anything but the seed, the
+ * two paths would disagree and every assertion made against `shape_inset()` would
+ * be testing a different world from the one that was generated.
+ */
+static void test_shape_field_matches_shape_inset() {
+    for (std::size_t i = 0; i < k_map_shape_count; ++i) {
+        MapConfig config = world_config(77);
+        config.shape.shape = static_cast<MapShape>(i);
+        config.shape.rotation = 0.4;
+        const double grid = static_cast<double>(config.grid_size);
+
+        const ShapeField field(config);
+        for (double y = -2.0; y <= grid + 2.0; y += 1.7) {
+            for (double x = -2.0; x <= grid + 2.0; x += 1.7) {
+                ASSERT_TRUE(std::abs(field.inset(x, y) - shape_inset(config, x, y)) < 1e-12);
+            }
+        }
+    }
+}
+
+/**
+ * @brief The organic shapes leave open sea all the way round the canvas.
+ *
+ * Not cosmetic. The water pass marks the ocean by flooding inward from the border
+ * cells, and a landmass that reaches the frame would be sliced off by it -- and
+ * worse, could wall the fill out of a bay and leave the sea classified as a lake.
+ * The placement maths exists to make this true for every seed, so it is checked
+ * across a spread of them rather than one.
+ */
+static void test_organic_shapes_stay_off_the_canvas_edge() {
+    const MapShape shapes[] = {MapShape::Continent, MapShape::Archipelago};
+    for (const MapShape shape : shapes) {
+        for (int seed = 1; seed <= 12; ++seed) {
+            MapConfig config = world_config(seed * 131);
+            config.shape.shape = shape;
+            const double grid = static_cast<double>(config.grid_size);
+            const ShapeField field(config);
+
+            for (double t = 0.0; t <= grid; t += 0.5) {
+                ASSERT_TRUE(field.inset(t, 0.0) < 0.0);
+                ASSERT_TRUE(field.inset(t, grid) < 0.0);
+                ASSERT_TRUE(field.inset(0.0, t) < 0.0);
+                ASSERT_TRUE(field.inset(grid, t) < 0.0);
+            }
+        }
+    }
+}
+
+/**
+ * @brief The outline is drawn from the seed, and from nothing else.
+ *
+ * Two fields built from one config have to be identical or a map would not
+ * reproduce from its seed; two built from different seeds have to differ, or the
+ * shape is a fixed silhouette wearing a random-looking coat.
+ */
+static void test_organic_shapes_are_deterministic() {
+    MapConfig config = world_config(404);
+    config.shape.shape = MapShape::Archipelago;
+    const double grid = static_cast<double>(config.grid_size);
+
+    const ShapeField first(config);
+    const ShapeField again(config);
+    MapConfig other = config;
+    other.seed = 405;
+    const ShapeField elsewhere(other);
+
+    bool differs = false;
+    for (double y = 0.0; y <= grid; y += 0.9) {
+        for (double x = 0.0; x <= grid; x += 0.9) {
+            ASSERT_TRUE(first.inset(x, y) == again.inset(x, y));
+            if (std::abs(first.inset(x, y) - elsewhere.inset(x, y)) > 1e-6) {
+                differs = true;
+            }
+        }
+    }
+    ASSERT_TRUE(differs);
+}
+
+/**
+ * @brief Counts the connected groups of dry cells in a generated map.
+ *
+ * Land neighbouring land across a cell edge is the same landmass. Used to tell a
+ * continent from an archipelago the way a reader would -- by looking at the map,
+ * not at the configuration that asked for it.
+ *
+ * @param graph The generated graph to walk.
+ * @param out_total Receives the number of dry cells found.
+ * @return The size of each landmass, largest first.
+ */
+static std::vector<std::size_t> landmass_sizes(const MapGraph& graph, std::size_t& out_total) {
+    std::vector<bool> seen(graph.centers.size(), false);
+    std::vector<std::size_t> sizes;
+    out_total = 0;
+
+    for (const MapCenter& start : graph.centers) {
+        const std::size_t start_index = static_cast<std::size_t>(start.index);
+        if (start.water || seen[start_index]) {
+            continue;
+        }
+        std::size_t size = 0;
+        std::vector<CenterId> pending{start.index};
+        seen[start_index] = true;
+        while (!pending.empty()) {
+            const MapCenter& current = graph.centers[static_cast<std::size_t>(pending.back())];
+            pending.pop_back();
+            ++size;
+            for (const CenterId neighbor_id : current.neighbors) {
+                const std::size_t index = static_cast<std::size_t>(neighbor_id);
+                if (!graph.centers[index].water && !seen[index]) {
+                    seen[index] = true;
+                    pending.push_back(neighbor_id);
+                }
+            }
+        }
+        sizes.push_back(size);
+        out_total += size;
+    }
+
+    std::sort(sizes.begin(), sizes.end(), std::greater<std::size_t>());
+    return sizes;
+}
+
+/**
+ * @brief A continent comes out as one landmass, not a scatter of islands.
+ *
+ * The island noise still carves lakes and bays out of the interior and can strand
+ * a cell or two offshore, so this asks for a dominant landmass rather than a sole
+ * one: most of the dry ground has to belong to a single connected mass.
+ */
+static void test_continent_is_one_landmass() {
+    for (int seed = 1; seed <= 5; ++seed) {
+        MapConfig config = world_config(seed * 97);
+        config.shape.shape = MapShape::Continent;
+
+        MapGenerator generator(config, maps_logger());
+        generator.generate();
+
+        std::size_t total = 0;
+        const std::vector<std::size_t> sizes = landmass_sizes(generator.graph(), total);
+        ASSERT_TRUE(total > 0);
+        ASSERT_TRUE(!sizes.empty());
+        ASSERT_TRUE(static_cast<double>(sizes.front()) > 0.85 * static_cast<double>(total));
+    }
+}
+
+/**
+ * @brief An archipelago comes out as several landmasses, none of them the whole map.
+ *
+ * Deliberately loose on the count: landmasses are allowed to fuse, which is the
+ * point, so what is asserted is that asking for several got several, and that no
+ * one of them swallowed the map -- the failure mode when they are sized too large
+ * for the canvas to scatter them across.
+ */
+static void test_archipelago_makes_several_landmasses() {
+    for (int seed = 1; seed <= 5; ++seed) {
+        MapConfig config = world_config(seed * 89);
+        config.shape.shape = MapShape::Archipelago;
+        config.shape.continent_count = 4;
+
+        MapGenerator generator(config, maps_logger());
+        generator.generate();
+
+        std::size_t total = 0;
+        const std::vector<std::size_t> sizes = landmass_sizes(generator.graph(), total);
+        ASSERT_TRUE(total > 0);
+        // Slivers of a cell or two are island noise, not a continent.
+        std::size_t substantial = 0;
+        for (const std::size_t size : sizes) {
+            if (static_cast<double>(size) > 0.05 * static_cast<double>(total)) {
+                ++substantial;
+            }
+        }
+        ASSERT_TRUE(substantial >= 2);
+        ASSERT_TRUE(static_cast<double>(sizes.front()) < 0.85 * static_cast<double>(total));
+    }
+}
 
 /**
  * @brief Relief reshapes where the high ground is without breaking what depends on it.
@@ -2925,7 +3181,7 @@ static void test_terrain_relief_reshapes_without_breaking_drainage() {
  * reaches one stops in the middle of a field. It was not a rare accident: 80 of
  * 11 438 land corners were pits, and 23 of 55 rivers ended dry.
  *
- * `PassElevation::fill_depressions_` removes them, so the assertion here is on
+ * `fill_depressions()` removes them, so the assertion here is on
  * the terrain and not on the rivers: *every* dry corner must have a strictly
  * lower neighbour, which by induction gives it a descending path to water. That
  * is a much stronger statement than "the 55 rivers this seed happened to place
@@ -3082,11 +3338,358 @@ static void test_waterline_separates_sea_from_land() {
 }
 
 /**
- * @brief A river's surface stands above the ground it runs over, and only falls.
+ * @brief The channel cut is strictly local -- away from a river it changes nothing.
  *
- * A river is water in a channel, not a line painted on the terrain. Drawn at
- * exactly ground height -- which it was -- a mesh built from the ground and the
- * water fights itself along every watercourse.
+ * The cut lives in the sampling path, not the control mesh, so the guarantee that
+ * matters is that it is *only* a channel: anywhere further than a river's own
+ * width from a centreline the surface must be the one the detail overload
+ * already produced, bit for bit.
+ */
+static void test_river_channels_are_zero_away_from_water() {
+    MapConfig config = world_config(67);
+    MapGenerator generator(config, maps_logger());
+    generator.generate();
+    const MapGraph& graph = generator.graph();
+
+    const Noise terrain(config.noise_terrain);
+    const TerrainDetail detail = make_terrain_detail(config, terrain);
+    const RiverChannels channels = make_river_channels(graph, config);
+    ASSERT_TRUE(!channels.empty());
+
+    std::size_t checked = 0;
+    for (const MapCenter& center : graph.centers) {
+        // A cell site is over half a cell from its own boundary, and rivers run
+        // along boundaries -- so no site is ever inside a channel.
+        const double x = center.point.x;
+        const double y = center.point.y;
+        ASSERT_TRUE(graph.elevation_at(center, x, y, detail, channels)
+                    == graph.elevation_at(center, x, y, detail));
+        ++checked;
+    }
+    ASSERT_TRUE(checked > 0);
+}
+
+/** @brief Zero depth leaves the sampled surface exactly as the control mesh describes it. */
+static void test_river_channel_zero_depth_is_the_uncut_surface() {
+    MapConfig config = world_config(67);
+    MapGenerator generator(config, maps_logger());
+    generator.generate();
+    const MapGraph& graph = generator.graph();
+
+    MapConfig flat = config;
+    flat.river_channel_depth_m = 0.0;
+    flat.river_channel_depth_per_volume_m = 0.0;
+
+    const Noise terrain(config.noise_terrain);
+    const TerrainDetail detail = make_terrain_detail(config, terrain);
+    const RiverChannels none = make_river_channels(graph, flat);
+    ASSERT_TRUE(none.empty());
+
+    for (const MapRiver& river : graph.rivers) {
+        const std::size_t spans = river.points.size() - 1;
+        for (std::size_t i = 0; i < river.points.size(); ++i) {
+            const MapCorner& corner = graph.corners[static_cast<std::size_t>(
+                river.corners[std::min(river.corners.size() - 1,
+                                       i * river.corners.size() / std::max<std::size_t>(1, spans))])];
+            if (corner.touches.empty()) {
+                continue;
+            }
+            const MapCenter& center =
+                graph.centers[static_cast<std::size_t>(corner.touches.front())];
+            const MapPoint& point = river.points[i];
+            ASSERT_TRUE(graph.elevation_at(center, point.x, point.y, detail, none)
+                        == graph.elevation_at(center, point.x, point.y, detail));
+        }
+    }
+}
+
+/**
+ * @brief The cut surface joins across a cell boundary, where it is deepest.
+ *
+ * The counterpart of the seam check in `test_elevation_interpolates_and_joins`,
+ * run on the channel path. A river runs *along* a boundary, so the two cells
+ * either side sample the deepest part of the cut from opposite directions -- and
+ * if they disagreed about which segments exist, every watercourse would be
+ * hemmed by a visible seam. They agree because a segment is filed under every
+ * cell its corner touches, which is both of them.
+ */
+static void test_river_channels_join_across_cells() {
+    MapConfig config = world_config(67);
+    MapGenerator generator(config, maps_logger());
+    generator.generate();
+    const MapGraph& graph = generator.graph();
+
+    const Noise terrain(config.noise_terrain);
+    const TerrainDetail detail = make_terrain_detail(config, terrain);
+    const RiverChannels channels = make_river_channels(graph, config);
+
+    std::size_t checked = 0;
+    for (const MapEdge& edge : graph.edges) {
+        if (edge.river <= 0 || edge.d0 == k_invalid_id || edge.d1 == k_invalid_id
+            || edge.v0 == k_invalid_id || edge.v1 == k_invalid_id) {
+            continue;
+        }
+        const MapCenter& a = graph.centers[static_cast<std::size_t>(edge.d0)];
+        const MapCenter& b = graph.centers[static_cast<std::size_t>(edge.d1)];
+        const MapPoint& v0 = graph.corners[static_cast<std::size_t>(edge.v0)].point;
+        const MapPoint& v1 = graph.corners[static_cast<std::size_t>(edge.v1)].point;
+
+        // Sampled along the shared edge rather than only at its midpoint, since a
+        // mismatch could sit anywhere the two cells' segment groups differ.
+        for (double t = 0.1; t <= 0.9; t += 0.2) {
+            const double x = v0.x + (v1.x - v0.x) * t;
+            const double y = v0.y + (v1.y - v0.y) * t;
+            const double from_a = graph.elevation_at(a, x, y, detail, channels);
+            const double from_b = graph.elevation_at(b, x, y, detail, channels);
+            ASSERT_TRUE(std::abs(from_a - from_b) < 1e-6);
+            ++checked;
+        }
+    }
+    ASSERT_TRUE(checked > 0);
+}
+
+/**
+ * @brief A river reads as a river in the height field, not as a dip in the ground.
+ *
+ * The test the previous attempt at this needed and did not have. Carving cell
+ * heights produced a measurably deep valley that was invisible to look at,
+ * because it compared the ground against *itself uncarved* -- a comparison a
+ * 500 m-wide depression passes just as happily as a channel does.
+ *
+ * What the eye actually needs is local contrast, so that is what is asserted
+ * here: the ground at the centreline against the ground a short way to either
+ * side of it, at the same moment, on the same surface. A uniform depression
+ * scores zero on this no matter how deep it is.
+ */
+static void test_river_channels_are_visible_in_the_height_field() {
+    MapConfig config = world_config(67);
+    MapGenerator generator(config, maps_logger());
+    generator.generate();
+    const MapGraph& graph = generator.graph();
+    ASSERT_TRUE(!graph.rivers.empty());
+
+    const Noise terrain(config.noise_terrain);
+    const TerrainDetail detail = make_terrain_detail(config, terrain);
+    const RiverChannels channels = make_river_channels(graph, config);
+
+    // Half a cell out: far outside the channel itself, which is a river's width
+    // across, so this measures the bank against the bed rather than one part of
+    // the bed against another.
+    const double offset = 0.5;
+    double total = 0.0;
+    std::size_t sampled = 0;
+    for (const MapRiver& river : graph.rivers) {
+        const std::size_t spans = river.points.size() - 1;
+        for (std::size_t i = 2; i + 2 < river.points.size(); ++i) {
+            // The same proportional step `make_river_channels()` files segments
+            // by, so the cell asked for is one that actually carries this stretch
+            // of the river. Any other cell reports no channel at all, which is
+            // correct of it and useless here.
+            const MapCorner& corner = graph.corners[static_cast<std::size_t>(
+                river.corners[std::min(river.corners.size() - 1, i * river.corners.size()
+                                                                     / spans)])];
+            if (corner.touches.empty()) {
+                continue;
+            }
+            const MapCenter& center =
+                graph.centers[static_cast<std::size_t>(corner.touches.front())];
+            const double dx = river.points[i + 2].x - river.points[i - 2].x;
+            const double dy = river.points[i + 2].y - river.points[i - 2].y;
+            const double length = std::hypot(dx, dy);
+            if (length < 1e-9) {
+                continue;
+            }
+            const double nx = -dy / length;
+            const double ny = dx / length;
+            const MapPoint& point = river.points[i];
+            const double bed = graph.elevation_at(center, point.x, point.y, detail, channels);
+            const double left = graph.elevation_at(center, point.x + nx * offset,
+                                                   point.y + ny * offset, detail, channels);
+            const double right = graph.elevation_at(center, point.x - nx * offset,
+                                                    point.y - ny * offset, detail, channels);
+            if (bed <= config.sea_level || left <= config.sea_level
+                || right <= config.sea_level) {
+                continue;
+            }
+            total += (left + right) * 0.5 - bed;
+            ++sampled;
+        }
+    }
+    ASSERT_TRUE(sampled > 0);
+
+    // Ten metres is the bar: below about eight the channel is fewer than four
+    // grey levels at the default vertical scale, which is where it stops being
+    // something a reader can pick out of the relief.
+    ASSERT_TRUE(height_to_meters(config, total / static_cast<double>(sampled)) > 10.0);
+}
+
+/**
+ * @brief A watercourse lies below the ground either side of it.
+ *
+ * The point of the whole pass. Checked on the corner field, which is where the
+ * incision is measured, against the corners one edge away that carry no river --
+ * the bank. Trunk rivers only: a volume-one trickle is still inside the headwater
+ * taper and is not meant to have opened a valley yet.
+ */
+static void test_river_corners_sit_below_their_banks() {
+    MapConfig config = world_config(67);
+    MapGenerator generator(config, maps_logger());
+    generator.generate();
+    const MapGraph& graph = generator.graph();
+    ASSERT_TRUE(!graph.rivers.empty());
+
+    std::size_t checked = 0;
+    for (const MapCorner& corner : graph.corners) {
+        if (corner.river < 2 || corner.water || corner.coast || corner.border) {
+            continue;
+        }
+        // A mouth is pinned at the waterline and cannot be cut below it, so a
+        // corner already at sea level proves nothing either way.
+        if (corner.elevation <= config.sea_level + 1e-9) {
+            continue;
+        }
+        double bank = 0.0;
+        std::size_t counted = 0;
+        for (const CornerId neighbor_id : corner.adjacent) {
+            const MapCorner& neighbor = graph.corners[static_cast<std::size_t>(neighbor_id)];
+            if (neighbor.river > 0 || neighbor.water) {
+                continue;
+            }
+            bank += neighbor.elevation;
+            ++counted;
+        }
+        if (counted == 0) {
+            continue;
+        }
+        ASSERT_TRUE(corner.elevation < bank / static_cast<double>(counted));
+        ++checked;
+    }
+    ASSERT_TRUE(checked > 0);
+}
+
+/**
+ * @brief The valley still runs downhill after it has been widened.
+ *
+ * Widening does not know which corner is upstream of which, so where a larger
+ * river passes close by, one of its rings can land on an upstream corner and cut
+ * it below its own downstream neighbour -- water running uphill in the middle of
+ * a river. `PassValleys` clamps along each course afterwards; this is the check
+ * that it does.
+ */
+static void test_valleys_run_downhill() {
+    MapConfig config = world_config(67);
+    MapGenerator generator(config, maps_logger());
+    generator.generate();
+    const MapGraph& graph = generator.graph();
+    ASSERT_TRUE(!graph.rivers.empty());
+
+    for (const MapRiver& river : graph.rivers) {
+        for (std::size_t i = 1; i < river.corners.size(); ++i) {
+            const MapCorner& upstream =
+                graph.corners[static_cast<std::size_t>(river.corners[i - 1])];
+            const MapCorner& corner = graph.corners[static_cast<std::size_t>(river.corners[i])];
+            ASSERT_TRUE(corner.elevation <= upstream.elevation + 1e-12);
+        }
+    }
+}
+
+/**
+ * @brief Cutting a valley never digs dry ground below the waterline.
+ *
+ * A river mouth already sits at sea level, so the clamp in `lower_corners_()`
+ * binds on every watercourse on the map rather than in some corner case. Without
+ * it, land would come out submerged and every pass that reads the height field to
+ * decide what is wet would disagree with the one that decides what is land.
+ */
+static void test_incision_never_breaches_sea_level() {
+    for (int seed = 1; seed <= 4; ++seed) {
+        MapConfig config = world_config(seed * 53);
+        // Far deeper than the default, so the clamp is doing the work rather
+        // than the incision happening to be too shallow to reach.
+        config.river_incision_m = 240.0;
+        config.river_incision_per_volume_m = 48.0;
+        MapGenerator generator(config, maps_logger());
+        generator.generate();
+        const MapGraph& graph = generator.graph();
+
+        for (const MapCorner& corner : graph.corners) {
+            if (!corner.ocean) {
+                ASSERT_TRUE(corner.elevation >= config.sea_level);
+            }
+        }
+        for (const MapCenter& center : graph.centers) {
+            if (!center.water) {
+                ASSERT_TRUE(center.elevation >= config.sea_level);
+            }
+        }
+    }
+}
+
+/**
+ * @brief The valley survives the whole path from corner depth to sampled pixel.
+ *
+ * This is the one that tests what was actually asked for. The incision is
+ * measured on corners, averaged down to cells, and only then interpolated
+ * barycentrically over Delaunay triangles of cell *sites* -- and rivers run along
+ * cell *boundaries*, as far from a site as the geometry allows. Plenty of ways for
+ * a carve to be real in the data and invisible in the render, so this samples
+ * `elevation_at()` itself, the same call the elevation layer makes per pixel.
+ */
+static void test_valleys_are_visible_in_the_height_field() {
+    MapConfig config = world_config(67);
+    MapGenerator carved_run(config, maps_logger());
+    carved_run.generate();
+
+    MapConfig uncarved_config = config;
+    uncarved_config.enable_valleys = false;
+    MapGenerator uncarved_run(uncarved_config, maps_logger());
+    uncarved_run.generate();
+
+    const MapGraph& carved = carved_run.graph();
+    const MapGraph& uncarved = uncarved_run.graph();
+    ASSERT_TRUE(!carved.rivers.empty());
+
+    double total_drop = 0.0;
+    std::size_t sampled = 0;
+    for (const MapRiver& river : carved.rivers) {
+        for (const CornerId corner_id : river.corners) {
+            const MapCorner& corner = carved.corners[static_cast<std::size_t>(corner_id)];
+            if (corner.river < 2 || corner.water || corner.touches.empty()) {
+                continue;
+            }
+            const std::size_t cell = static_cast<std::size_t>(corner.touches.front());
+            const double after =
+                carved.elevation_at(carved.centers[cell], corner.point.x, corner.point.y);
+            const double before =
+                uncarved.elevation_at(uncarved.centers[cell], corner.point.x, corner.point.y);
+            total_drop += before - after;
+            ++sampled;
+        }
+    }
+    ASSERT_TRUE(sampled > 0);
+
+    // Both runs share a seed, so the geometry and every pass up to the carve are
+    // identical and the difference is the valleys alone. A tenth of a grey level
+    // would satisfy "lower"; ten metres is the bar for "visible".
+    const double mean_drop = total_drop / static_cast<double>(sampled);
+    ASSERT_TRUE(height_to_meters(config, mean_drop) > 10.0);
+}
+
+/**
+ * @brief A river's water surface stands above the terrain the elevation layer draws.
+ *
+ * The invariant a consumer meshing the two layers together depends on, and it was
+ * broken for a long time without this test noticing -- because the test used to
+ * compute the surface *itself*, from `corner.elevation`, and then assert it was
+ * above `corner.elevation`. Trivially true, and about the wrong surface: the
+ * elevation layer draws `elevation_at()`, the blend of cell heights, which sits
+ * some 22 m higher at a river corner. Nearly half of every watercourse was drawn
+ * beneath the ground while this passed.
+ *
+ * So it asks `river_surface_at()` -- the one definition, the same call the renderer
+ * makes -- and compares it against the ground the elevation layer actually draws,
+ * cut channel and all, sampled across the whole width of the stroke rather than on
+ * the centreline. Anything else measures a surface nobody draws.
  */
 static void test_river_surface_sits_above_the_ground() {
     MapConfig config = world_config(67);
@@ -3095,23 +3698,130 @@ static void test_river_surface_sits_above_the_ground() {
     const MapGraph& graph = generator.graph();
     ASSERT_TRUE(!graph.rivers.empty());
 
-    for (const MapRiver& river : graph.rivers) {
-        for (std::size_t i = 0; i < river.corners.size(); ++i) {
-            const MapCorner& corner =
-                graph.corners[static_cast<std::size_t>(river.corners[i])];
-            const double depth = config.river_depth_m
-                               + config.river_depth_per_volume_m
-                                     * static_cast<double>(corner.river);
-            ASSERT_TRUE(depth > 0.0);
-            const double surface = corner.elevation + meters_to_height(config, depth);
-            ASSERT_TRUE(surface > corner.elevation);
+    const Noise terrain(config.noise_terrain);
+    const TerrainDetail detail = make_terrain_detail(config, terrain);
+    const RiverChannels channels = make_river_channels(graph, config);
 
-            if (i + 1 < river.corners.size()) {
-                const MapCorner& next =
-                    graph.corners[static_cast<std::size_t>(river.corners[i + 1])];
-                ASSERT_TRUE(next.elevation <= corner.elevation);
+    std::size_t checked = 0;
+    for (const MapRiver& river : graph.rivers) {
+        const std::size_t spans = river.points.size() - 1;
+        for (std::size_t i = 0; i < spans; ++i) {
+            const std::size_t slot =
+                std::min(river.corners.size() - 1, i * river.corners.size() / spans);
+            const MapCorner& corner =
+                graph.corners[static_cast<std::size_t>(river.corners[slot])];
+            if (corner.touches.empty()) {
+                continue;
+            }
+            const MapCenter& center =
+                graph.centers[static_cast<std::size_t>(corner.touches.front())];
+            const double surface = river_surface_at(graph, river, i, config, detail);
+
+            const MapPoint& from = river.points[i];
+            const MapPoint& to = river.points[i + 1];
+            const double reach =
+                (river_width(config, corner.river)
+                 + meters_to_grid(config, config.water_edge_overlap_m) * 2.0) * 0.5;
+            const double dx = to.x - from.x;
+            const double dy = to.y - from.y;
+            const double length = std::hypot(dx, dy);
+            const double nx = length > 0.0 ? -dy / length * reach : 0.0;
+            const double ny = length > 0.0 ? dx / length * reach : 0.0;
+
+            for (double along = 0.0; along <= 1.0; along += 0.5) {
+                for (double across = -1.0; across <= 1.0; across += 1.0) {
+                    const double x = from.x + dx * along + nx * across;
+                    const double y = from.y + dy * along + ny * across;
+                    const double ground =
+                        graph.elevation_at(center, x, y, detail, channels);
+                    // A tenth of a metre of slack: the surface is piecewise linear,
+                    // so a triangle vertex inside the stroke can poke a hair above
+                    // every point the probe grid samples. Far below the 2.35 m a
+                    // single grey level covers, so it can never reach a pixel.
+                    ASSERT_TRUE(ground <= surface + meters_to_height(config, 0.5));
+                    ++checked;
+                }
             }
         }
+    }
+    ASSERT_TRUE(checked > 0);
+
+    // And the course still only falls, source to mouth -- a property of the
+    // routing rather than of the surface, and still worth pinning here.
+    for (const MapRiver& river : graph.rivers) {
+        for (std::size_t i = 1; i < river.corners.size(); ++i) {
+            const MapCorner& previous =
+                graph.corners[static_cast<std::size_t>(river.corners[i - 1])];
+            const MapCorner& corner =
+                graph.corners[static_cast<std::size_t>(river.corners[i])];
+            ASSERT_TRUE(corner.elevation <= previous.elevation);
+        }
+    }
+}
+
+/**
+ * @brief Inside a body of water, the drawn ground never rises through the surface.
+ *
+ * The companion to the river invariant, and it holds exactly, but only where it
+ * can. The boundary is sharper than "away from the shore", and worth stating
+ * precisely because a consumer meshing the two layers has to know where the
+ * guarantee stops.
+ *
+ * `MapCenter::elevation` under water is the *bed*, and for a coastal water cell it
+ * is not below the water: cell heights are the mean of their corners, and a cell
+ * the sea reaches into has corners up on the land. About one water cell in ten
+ * carries a "bed" above its own surface for that reason. The ground is drawn by
+ * interpolating between cell heights, so those cells pull the surface up through
+ * the water inside themselves *and* one ring further in.
+ *
+ * So the invariant is over cells that, together with every neighbour, have a bed at
+ * or below their surface -- there every vertex of every triangle the sampler can
+ * reach is under water, and a barycentric blend of values under water is under
+ * water. Measured across five maps, that is zero violations out of ~2 400 samples
+ * each; anywhere else is the consumer's to clip.
+ */
+static void test_water_bodies_cover_their_interiors() {
+    for (int seed : {67, 31, 251}) {
+        MapConfig config = world_config(seed);
+        MapGenerator generator(config, maps_logger());
+        generator.generate();
+        const MapGraph& graph = generator.graph();
+
+        const Noise terrain(config.noise_terrain);
+        const TerrainDetail detail = make_terrain_detail(config, terrain);
+        const RiverChannels channels = make_river_channels(graph, config);
+
+        const auto submerged = [](const MapCenter& cell) {
+            return cell.water && cell.elevation <= cell.water_level;
+        };
+
+        std::size_t sampled = 0;
+        for (const MapCenter& center : graph.centers) {
+            if (center.corners.empty() || !submerged(center)) {
+                continue;
+            }
+            bool interior = true;
+            for (const CenterId neighbor_id : center.neighbors) {
+                if (!submerged(graph.centers[static_cast<std::size_t>(neighbor_id)])) {
+                    interior = false;
+                }
+            }
+            if (!interior) {
+                continue;
+            }
+            for (const CornerId corner_id : center.corners) {
+                const MapPoint& corner =
+                    graph.corners[static_cast<std::size_t>(corner_id)].point;
+                // Pulled well in from the corner, so this measures the interior and
+                // not the blend across the cell's own boundary.
+                const double x = corner.x + (center.point.x - corner.x) * 0.7;
+                const double y = corner.y + (center.point.y - corner.y) * 0.7;
+                ASSERT_TRUE(graph.elevation_at(center, x, y, detail, channels)
+                            <= center.water_level);
+                ++sampled;
+            }
+        }
+        ASSERT_TRUE(sampled > 0);
     }
 }
 
@@ -3207,7 +3917,7 @@ int main() {
     RUN_TEST(maps_test::test_landmarks_respect_their_biome);
     RUN_TEST(maps_test::test_cell_outline_is_closed_and_ordered);
     RUN_TEST(maps_test::test_renderers_produce_a_full_image);
-    RUN_TEST(maps_test::test_rivers_live_on_the_water_layer_only);
+    RUN_TEST(maps_test::test_rivers_cut_valleys_into_the_height_field);
     RUN_TEST(maps_test::test_yaml_round_trip_preserves_the_graph);
     RUN_TEST(maps_test::test_yaml_round_trip_renders_every_layer);
     RUN_TEST(maps_test::test_disabled_passes_leave_the_graph_untouched);
@@ -3248,9 +3958,23 @@ int main() {
     RUN_TEST(maps_test::test_default_shape_matches_the_square_frame);
     RUN_TEST(maps_test::test_shape_names_round_trip);
     RUN_TEST(maps_test::test_shapes_confine_the_landmass);
+    RUN_TEST(maps_test::test_shape_field_matches_shape_inset);
+    RUN_TEST(maps_test::test_organic_shapes_stay_off_the_canvas_edge);
+    RUN_TEST(maps_test::test_organic_shapes_are_deterministic);
+    RUN_TEST(maps_test::test_continent_is_one_landmass);
+    RUN_TEST(maps_test::test_archipelago_makes_several_landmasses);
     RUN_TEST(maps_test::test_terrain_relief_reshapes_without_breaking_drainage);
     RUN_TEST(maps_test::test_waterline_separates_sea_from_land);
+    RUN_TEST(maps_test::test_river_channels_are_zero_away_from_water);
+    RUN_TEST(maps_test::test_river_channel_zero_depth_is_the_uncut_surface);
+    RUN_TEST(maps_test::test_river_channels_join_across_cells);
+    RUN_TEST(maps_test::test_river_channels_are_visible_in_the_height_field);
+    RUN_TEST(maps_test::test_river_corners_sit_below_their_banks);
+    RUN_TEST(maps_test::test_valleys_run_downhill);
+    RUN_TEST(maps_test::test_incision_never_breaches_sea_level);
+    RUN_TEST(maps_test::test_valleys_are_visible_in_the_height_field);
     RUN_TEST(maps_test::test_river_surface_sits_above_the_ground);
+    RUN_TEST(maps_test::test_water_bodies_cover_their_interiors);
     RUN_TEST(maps_test::test_water_bodies_win_inside_and_overhang_their_edge);
 
     std::cout << "===========================================" << std::endl;

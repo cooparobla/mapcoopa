@@ -8,8 +8,8 @@ void execute(MapGraph& graph, const MapConfig& config, coopa::debug::Logger& log
 ```
 
 `MapGenerator::execute_passes_()` runs them in the fixed order below, each gated by its
-`MapConfig::enable_*` toggle. The order is a dependency chain, not a preference — moisture
-needs rivers, biomes need moisture and temperature, regions need biomes, towns need regions
+`MapConfig::enable_*` toggle. The order is a dependency chain, not a preference — valleys and moisture
+need rivers, biomes need moisture and temperature, regions need biomes, towns need regions
 to be named in the right dialect, and landmarks need towns to know which land is already
 settled. Turning a pass off leaves the fields it would have written at their defaults
 rather than reordering anything.
@@ -18,7 +18,7 @@ The graph's geometry is built before any pass runs and none of them change it; a
 annotates cells, corners and edges.
 
 That single fixed signature is also why `generate_async()` checks for cancellation
-*between* passes rather than inside one: threading a token through twelve `execute()`
+*between* passes rather than inside one: threading a token through thirteen `execute()`
 methods would change the contract every pass is written to, to shave at most one pass off
 the latency — and the longest pass is roughly 50 ms. Nothing in here runs in parallel
 either. Generation is about 140 ms against some 10 s of export, so there is nothing to win,
@@ -37,13 +37,14 @@ over ground the earlier ones already claimed. Every pass that draws randomness s
 | 3 | [`pass_elevation.h`](./pass_elevation.h) | `elevation`, `downslope`, `water_level` | pass 2 |
 | 4 | [`pass_temperature.h`](./pass_temperature.h) | `temperature` | pass 3 |
 | 5 | [`pass_rivers.h`](./pass_rivers.h) | `river` on corners and edges; `MapGraph::rivers` | pass 3 |
-| 6 | [`pass_moisture.h`](./pass_moisture.h) | `moisture` | pass 5 |
-| 7 | [`pass_biomes.h`](./pass_biomes.h) | `MapCenter::biome` | passes 3, 4 and 6 |
-| 8 | [`pass_roads.h`](./pass_roads.h) | `MapEdge::road`, `road_class`, `traffic`, `bridge`; `MapGraph::roads` | passes 3, 5 and 7 |
-| 9 | [`pass_regions.h`](./pass_regions.h) | `MapGraph::regions`, `countries`; cell `region`/`country` | passes 3 and 7 |
-| 10 | [`pass_towns.h`](./pass_towns.h) | `MapGraph::towns` | passes 7, 8 and 9 |
-| 11 | [`pass_landmarks.h`](./pass_landmarks.h) | `MapGraph::landmarks` | passes 7, 9 and 10 |
-| 12 | [`pass_noisy_edges.h`](./pass_noisy_edges.h) | `noisy_points0`, `noisy_points1` | pass 7 |
+| 6 | [`pass_valleys.h`](./pass_valleys.h) | rewrites `elevation` and `downslope` | pass 5 |
+| 7 | [`pass_moisture.h`](./pass_moisture.h) | `moisture` | pass 5 |
+| 8 | [`pass_biomes.h`](./pass_biomes.h) | `MapCenter::biome` | passes 4, 6 and 7 |
+| 9 | [`pass_roads.h`](./pass_roads.h) | `MapEdge::road`, `road_class`, `traffic`, `bridge`; `MapGraph::roads` | passes 5, 6 and 8 |
+| 10 | [`pass_regions.h`](./pass_regions.h) | `MapGraph::regions`, `countries`; cell `region`/`country` | passes 6 and 8 |
+| 11 | [`pass_towns.h`](./pass_towns.h) | `MapGraph::towns` | passes 8, 9 and 10 |
+| 12 | [`pass_landmarks.h`](./pass_landmarks.h) | `MapGraph::landmarks` | passes 8, 10 and 11 |
+| 13 | [`pass_noisy_edges.h`](./pass_noisy_edges.h) | `noisy_points0`, `noisy_points1` | pass 8 |
 
 ---
 
@@ -51,9 +52,9 @@ over ground the earlier ones already claimed. Every pass that draws randomness s
 
 ### 1. Water ([`pass_water.h`](./pass_water.h))
 The `border` flag it reads comes from `MapGenerator::border_check_()`, which is now driven
-by `MapConfig::shape` — a canvas-spanning rectangle by default, or a circle or triangle
-inscribed in the canvas. That one predicate is where the shape of the world comes from;
-nothing in here knows shapes exist.
+by `MapConfig::shape` — a canvas-spanning rectangle by default, or a circle, triangle,
+continent or archipelago inscribed in the canvas. That one predicate (`ShapeField::inset()`)
+is where the shape of the world comes from; nothing in here knows shapes exist.
 
 Threshold the island noise field per corner, promote cells whose corner count crosses
 `threshold_water_count`, then flood-fill from the border to mark `ocean`. That last step
@@ -103,7 +104,7 @@ to force the water over its rim — which is what keeps an endorheic basin a lak
 is 1e-7 and chains run to 39 corners, so the worst-case rise is 4e-6 of the range: about two
 millimetres at the default 600 m, and not a visible change to the terrain.
 
-`assign_downslopes_` compares strictly (`<`). An equal-height neighbour is not downhill, and
+`assign_downslopes()` compares strictly (`<`). An equal-height neighbour is not downhill, and
 accepting one let two corners at the same elevation name each other as their downslope — a
 two-cycle a flow walk follows until its step guard. Strictness is also what makes "points at
 itself" mean "has nowhere lower to go" rather than "happened to be scanned last".
@@ -150,12 +151,41 @@ which is the one shape moving water never has; corner-cutting rounds the joints 
 straightening the course, because it never moves a point more than a quarter of a segment.
 The meander is the downslope chain itself and survives intact.
 
-### 6. Moisture ([`pass_moisture.h`](./pass_moisture.h))
+### 6. Valleys ([`pass_valleys.h`](./pass_valleys.h))
+The only pass that rewrites `elevation` after pass 3, and it has to be: rivers erode, but
+elevation is computed *before* rivers are routed — it has to be, the routing follows
+`downslope` — so without this the height field has no idea a river pass ever ran. The
+elevation layer showed no trace of the rivers the water layer is full of.
+
+It cuts a **valley, not a channel**, and the geometry forces that. `elevation_at()`
+interpolates *cell-site* heights over Delaunay triangles while rivers run along Voronoi
+edges — cell *boundaries* — so lowering corner heights alone would change nothing anyone
+can see. The cells have to move, and the narrowest thing they can express is about a cell
+across. Which is the right answer anyway: a river sits in a valley far wider than itself,
+and the channel within it is what the water layer draws.
+
+Depth per corner from `river_incision_m` plus `river_incision_per_volume_m` × volume,
+tapered over the first few corners so a river does not begin with its valley already cut.
+Graded outward over `river_valley_width` rings of `adjacent` at `river_valley_falloff`
+each — `max`, not `+`, so a confluence is one valley rather than two stacked. Corners are
+then lowered, clamped at the waterline, and the descent along each course is restored;
+cells take the *mean* of their corners' depths, which applies the valley on top of
+`smooth_center_elevations_()` instead of throwing that relaxation away.
+
+It finishes by calling `restore_drainage()` ([`drainage.h`](./drainage.h), shared with
+pass 3). Moving the ground owes the map its drainage back: carving digs pits where a
+valley wall grades into ground with no outlet, the waterline clamp flattens river mouths
+into ties, and `downslope` was read off a field that no longer exists.
+
+Setting `river_incision_m` to 0 reproduces the uncarved height field byte for byte, which
+is what the layer test asserts.
+
+### 7. Moisture ([`pass_moisture.h`](./pass_moisture.h))
 Lakes and rivers seed the field; the ocean deliberately does not, so a desert can sit
 behind a coastal range. Diffuse outward losing a tenth per hop, pin ocean and coast wet,
 then rank-normalise so every map spans the full range.
 
-### 7. Biomes ([`pass_biomes.h`](./pass_biomes.h))
+### 8. Biomes ([`pass_biomes.h`](./pass_biomes.h))
 Delegates to `classify_biome()` in [`../biome.h`](../biome.h), which branches on
 temperature first, then elevation, then moisture — about 33 biomes rather than the
 original 18.
@@ -182,7 +212,7 @@ once it moved to `sea_level` — which is where lakes sit, since a lake is a bas
 test on `classify_biome()` stayed green throughout, because the arguments changed and not
 the function.
 
-### 8. Roads ([`pass_roads.h`](./pass_roads.h))
+### 9. Roads ([`pass_roads.h`](./pass_roads.h))
 Roads are *routed*, not drawn. Every Delaunay edge gets a travel cost from the ground
 either side of it — distance scaled by slope, height and how rough the biome is, plus a
 volume-scaled charge to ford or bridge a river and a high but finite one to step into
@@ -226,14 +256,14 @@ rivers, and the settlements placed two passes later land on the network because 
 passes read the same ground. The pass draws no randomness at all — terrain decides
 everything, so there is no stream to seed.
 
-### 9. Regions ([`pass_regions.h`](./pass_regions.h))
+### 10. Regions ([`pass_regions.h`](./pass_regions.h))
 Scatter country seeds across the land, then claim territory by multi-source Dijkstra where
 climbing is expensive and crossing water more so — which is why the borders that emerge
 follow ridgelines and coasts instead of cutting across them. Each country is subdivided the
 same way, and any land the fill could not reach is adopted by its nearest claimant so no
 cell is left stateless. Countries draw a synthetic language; regions get a dialect of it.
 
-### 10. Towns ([`pass_towns.h`](./pass_towns.h))
+### 11. Towns ([`pass_towns.h`](./pass_towns.h))
 Score land cells on biome habitability (`biome_habitability()` in
 [`../biome.h`](../biome.h), the same table the road pass ranks hubs with), low ground, and
 access to sea, river or road;
@@ -273,7 +303,7 @@ This pass was a stub in the original — it logged its own name and returned, wi
 commented-out sketch of the packing step referencing types that never existed. The scoring,
 placement and layout are new; the containment test follows that sketch's ray-cast approach.
 
-### 11. Landmarks ([`pass_landmarks.h`](./pass_landmarks.h))
+### 12. Landmarks ([`pass_landmarks.h`](./pass_landmarks.h))
 Natural features are *read off* the terrain rather than sprinkled onto it — a peak is a cell
 higher than all its neighbours, a waterfall a river edge with a real drop across it — so they
 always agree with the map they sit on. Ruins go where people could live but do not, giving
@@ -281,7 +311,7 @@ the world a past. Every kind is checked against `landmark_suits_biome()`, and no
 may take more than a fifth of the budget: ranking alone lets whichever signature happens to
 be commonest swallow every slot, and the result is forty hot springs and no coastline.
 
-### 12. Noisy Edges ([`pass_noisy_edges.h`](./pass_noisy_edges.h))
+### 13. Noisy Edges ([`pass_noisy_edges.h`](./pass_noisy_edges.h))
 Redraw each cell boundary as a path that wanders inside the quadrilateral formed by the
 Voronoi edge and the two cell sites, recursively, to a depth of three. Both neighbouring
 cells read the same edge, so they can never disagree about where their shared border runs.

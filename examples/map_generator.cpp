@@ -74,11 +74,18 @@ void print_usage() {
         << "  --shading=MODE   composite lighting: elevation (default) | hillshade\n"
         << "  --threads=N      worker threads; 0 = all cores (default), 1 = serial\n"
         << "  --png-level=N    PNG deflate effort 1-9; lower is faster and larger\n"
-        << "  --shape=S        landmass outline: rect (default) | circle | triangle\n"
-        << "  --shape-size=M   width / diameter / edge length in metres; 0 fills the canvas\n"
+        << "  --shape=S        landmass outline: rect (default) | circle | triangle |\n"
+        << "                   continent | archipelago -- the last two wander the coast\n"
+        << "  --shape-size=M   width / diameter / edge / mean continent in metres;\n"
+        << "                   0 fills the canvas\n"
         << "  --shape-height=M rectangle height in metres; defaults to --shape-size\n"
         << "  --shape-rot=DEG  rotation of the shape in degrees (triangle)\n"
+        << "  --shape-count=N  landmasses to attempt (archipelago); a close pair fuses\n"
+        << "  --shape-wobble=F how far the coast wanders from a circle, 0 to 0.6\n"
         << "  --relief=F       fractal reshaping of the height field, 0 to 1\n"
+        << "  --incision=M     how deep rivers cut their valleys, in metres; 0 for none\n"
+        << "  --channel=M      how deep the river channel itself is cut; 0 for none\n"
+        << "  --no-valleys     leave the height field uncarved by the rivers\n"
         << "  --roughness=F    terrain detail amplitude, 0 (default) to 1\n"
         << "  --help           show this message\n"
         << "\n"
@@ -191,6 +198,8 @@ int main(int argc, char** argv) {
             config.enable_landmarks = false;
         } else if (argument == "--no-roads") {
             config.enable_roads = false;
+        } else if (argument == "--no-valleys") {
+            config.enable_valleys = false;
         } else if (match_option(argument, "seed", value)) {
             config.seed = std::atoi(std::string(value).c_str());
             seed_given = true;
@@ -225,8 +234,9 @@ int main(int argc, char** argv) {
         } else if (match_option(argument, "shape", value)) {
             const std::string name(value);
             if (name != "rect" && name != "rectangle" && name != "circle"
-                && name != "triangle") {
-                std::cerr << "coopa_mapgen: --shape must be rect, circle or triangle\n";
+                && name != "triangle" && name != "continent" && name != "archipelago") {
+                std::cerr << "coopa_mapgen: --shape must be rect, circle, triangle, "
+                             "continent or archipelago\n";
                 return 1;
             }
             config.shape.shape = coopa::maps::map_shape_from_name(name);
@@ -236,6 +246,38 @@ int main(int argc, char** argv) {
             shape_height_m = std::atof(std::string(value).c_str());
         } else if (match_option(argument, "shape-rot", value)) {
             config.shape.rotation = std::atof(std::string(value).c_str()) * k_degrees_to_radians;
+        } else if (match_option(argument, "shape-count", value)) {
+            config.shape.continent_count = std::atoi(std::string(value).c_str());
+            if (config.shape.continent_count < 1) {
+                std::cerr << "coopa_mapgen: --shape-count must be at least 1\n";
+                return 1;
+            }
+        } else if (match_option(argument, "shape-wobble", value)) {
+            config.shape.irregularity = std::atof(std::string(value).c_str());
+            if (config.shape.irregularity < 0.0 || config.shape.irregularity > 0.6) {
+                std::cerr << "coopa_mapgen: --shape-wobble must be between 0 and 0.6\n";
+                return 1;
+            }
+        } else if (match_option(argument, "channel", value)) {
+            config.river_channel_depth_m = std::atof(std::string(value).c_str());
+            if (config.river_channel_depth_m < 0.0) {
+                std::cerr << "coopa_mapgen: --channel must not be negative\n";
+                return 1;
+            }
+            // Scaled with the base for the same reason --incision is: one flag
+            // should deepen the whole network, not flatten a trunk river toward
+            // the stream feeding it.
+            config.river_channel_depth_per_volume_m = config.river_channel_depth_m * 0.22;
+        } else if (match_option(argument, "incision", value)) {
+            config.river_incision_m = std::atof(std::string(value).c_str());
+            if (config.river_incision_m < 0.0) {
+                std::cerr << "coopa_mapgen: --incision must not be negative\n";
+                return 1;
+            }
+            // The per-volume term scales with the base, so one flag deepens the
+            // whole network rather than flattening the difference between a
+            // stream and the trunk river it feeds.
+            config.river_incision_per_volume_m = config.river_incision_m * 0.2;
         } else if (match_option(argument, "relief", value)) {
             config.terrain_relief = std::atof(std::string(value).c_str());
             if (config.terrain_relief < 0.0 || config.terrain_relief > 1.0) {
@@ -287,6 +329,12 @@ int main(int argc, char** argv) {
                 break;
             case coopa::maps::MapShape::Triangle:
                 config.shape.edge_length_m = shape_size_m;
+                break;
+            case coopa::maps::MapShape::Continent:
+            case coopa::maps::MapShape::Archipelago:
+                // The MEAN diameter of one landmass, not the whole world: an
+                // archipelago varies its continents about this and scatters them.
+                config.shape.continent_size_m = shape_size_m;
                 break;
             case coopa::maps::MapShape::Rectangle:
                 config.shape.width_m = shape_size_m;

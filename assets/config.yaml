@@ -137,6 +137,19 @@ noise_terrain:            # the detail field terrain_roughness displaces the sur
   gain: 0.5
   weighted_strength: 0.45
 
+noise_shape:              # warps the coastline of the continent / archipelago shapes
+  seed: 5233
+  frequency: 0.03         # low: this bends the OUTLINE of a continent, so a feature is a
+                          # bay or a headland spanning many cells. Quoted against a grid
+                          # of 40 and rescaled, so --grid-size resolves the coast rather
+                          # than crumbling the continent.
+  type: 0
+  fractal_type: 1
+  octaves: 5
+  lacunarity: 2.0
+  gain: 0.5
+  weighted_strength: 0.45
+
 noise_temperature:        # the variation that keeps isotherms from running straight
   # seed: NOT settable. Always derived from the master seed (master + 1).
   frequency: 0.035
@@ -156,21 +169,39 @@ noise_temperature:        # the variation that keeps isotherms from running stra
 # Every dimension defaults to 0, meaning "fill the canvas" — which makes the default a
 # canvas-spanning rectangle, exactly what the generator did before shapes existed.
 # --shape, --shape-size, --shape-height and --shape-rot override for one run.
+#
+# rectangle, circle and triangle are exact geometry, and it shows: however organic the
+# island noise makes the interior, the silhouette is a hard edge. continent and
+# archipelago instead wander the outline — a fractal sum of harmonics around the centre,
+# warped by noise_shape — so coasts get bays, headlands and the odd offshore island.
+# archipelago scatters continent_count of them at varying sizes; two that land close
+# enough fuse, which is what stops it reading as a row of evenly spaced blobs.
 
 shape:
-  shape: rectangle        # rectangle | circle | triangle
+  shape: continent        # rectangle | circle | triangle | continent | archipelago
   width_m: 0              # rectangle
   height_m: 0
   diameter_m: 4600           # circle
   edge_length_m: 4500        # equilateral triangle, apex up before rotation
   rotation: 45.0           # radians about the centre; only the triangle is not symmetric
                           # enough for this to show
+  continent_size_m: 0        # continent | archipelago: MEAN diameter of one landmass.
+                             # 0 sizes it to the canvas — one continent as wide as fits,
+                             # or an archipelago's worth spread across it.
+  continent_count: 4         # archipelago: landmasses to attempt. An upper bound, not a
+                             # promise: a close pair fuses into one larger continent.
+  irregularity: 0.35         # how far the outline wanders from a circle, 0 to 0.6.
+                             # 0 is a plain disc; past 0.6 a landmass would pinch in two.
+  size_variance: 0.35        # archipelago: spread of sizes about the mean, 0 to 0.9
+  coast_detail: 0.12         # coastal warp amplitude, as a fraction of the mean radius.
+                             # The radial outline alone is star-convex — this is what
+                             # buys fjords, fold-back headlands and offshore islands.
 
 # --- Terrain ----------------------------------------------------------------
 
 threshold_water: 0.3          # noise value above which a corner is water
 threshold_water_count: 2      # a cell becomes water once more than this many corners are
-elevation_smoothing_iterations: 6   # Laplacian relaxation passes over the height field.
+elevation_smoothing_iterations: 3   # Laplacian relaxation passes over the height field.
                                     # Distance-from-coast elevation is terraced; without
                                     # these it reads as facets rather than terrain.
 elevation_smoothing_strength: 0.5   # how far toward the neighbour mean each pass moves
@@ -233,6 +264,40 @@ river_depth_m: 1.0            # how far a river's surface sits ABOVE the ground 
 river_depth_per_volume_m: 0.35 # A river is water standing in a channel, not a line painted
                               # on the terrain — without this a mesh built from the ground
                               # and the water fights itself along every watercourse.
+
+# Rivers erode. Elevation is computed BEFORE rivers are routed — it has to be, the routing
+# follows the downslope chain — so without this the height field has no idea a river pass
+# ever ran, and the elevation layer shows no trace of the rivers the water layer is full of.
+#
+# This cuts a VALLEY, not a channel, and the geometry forces that: the rendered surface
+# interpolates cell-site heights, while rivers run along cell boundaries, so the narrowest
+# thing it can express is about a cell across (60 m here) against a river 5–20 m wide. Which
+# is the right answer anyway — a river sits in a valley far wider than itself. The channel
+# within it is what river_width_base_m draws on the water layer.
+#
+# The three river depths are complementary, not duplicates. river_incision_m cuts the VALLEY
+# into the mesh (a landform, hundreds of metres across); river_channel_depth_m cuts the
+# CHANNEL into the surface sampled between the mesh vertices (metres across, and the one
+# that makes a river legible); river_depth_m floats the WATER SHEET above the mesh so a
+# mesh built from ground and water does not fight itself.
+river_channel_depth_m: 18     # how deep the CHANNEL is cut into the sampled ground, in
+river_channel_depth_per_volume_m: 4   # metres. The only one of the three river depths fine
+                              # enough to read as a river rather than as a dip in the ground:
+                              # the elevation layer interpolates between cell sites 60 m
+                              # apart, and a river is 5–20 m wide, so a channel cannot live
+                              # in the mesh — it is cut at sample time, like terrain
+                              # roughness. Width comes from river_width_base_m, so the
+                              # channel and the blue ribbon on the water layer register.
+                              # 0 leaves the sampled surface as the mesh describes it.
+river_incision_m: 60          # how deep a river cuts the VALLEY it runs in, in metres.
+                              # 0 restores the uncarved height field exactly.
+river_incision_per_volume_m: 12  # a trunk river has had far longer to cut than its streams
+river_valley_width: 2         # corners out from the watercourse the valley opens. 1 is a
+                              # trench with nothing either side; 2 gives it banks.
+river_valley_falloff: 0.5     # depth multiplier per ring outward — what turns a step into a
+                              # slope. Matters for more than looks: a cliff at every
+                              # watercourse would push the mean elevation step between
+                              # neighbouring cells past what the smoothing holds down.
 water_edge_overlap_m: 1.0     # how far every water surface is extended past its own edge,
                               # so it clips INTO the terrain rather than meeting it exactly.
                               # Two surfaces sharing an edge exactly show a seam wherever the
@@ -368,6 +433,7 @@ passes:
   enable_elevation: true
   enable_temperature: true
   enable_rivers: true
+  enable_valleys: true      # cut the rivers into the terrain
   enable_moisture: true
   enable_biomes: true
   enable_roads: true

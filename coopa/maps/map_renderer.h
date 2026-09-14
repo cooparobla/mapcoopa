@@ -315,9 +315,22 @@ public:
      * @brief Terrain height as greyscale, black at sea level and white at the summit.
      *
      * Shaded per pixel from the cell's corner heights rather than filled flat: a
-     * flat fill draws the Voronoi tessellation, not the terrain. Rivers are *not*
-     * dimmed into it any more -- water has its own layer, and a height field with
-     * channels cut into it has stopped being a height field.
+     * flat fill draws the Voronoi tessellation, not the terrain.
+     *
+     * Rivers do show here, and nothing about that is painted. The layer once had
+     * the river network *dimmed* into it, which was the wrong thing twice over --
+     * it made the layer a picture of the terrain rather than the terrain itself,
+     * and a consumer flooding a mesh to those values found channels already cut.
+     *
+     * What shows now is ground that really is lower, at two scales. `PassValleys`
+     * carves the valley into the control mesh, and `make_river_channels()` cuts
+     * the channel into the surface sampled between its vertices. The second is
+     * what makes a river legible: the mesh has 60 m between sites and a river is
+     * 5 to 20 m wide, so carved into cell heights alone the best achievable is a
+     * 500 m depression with no edge -- measurably deep and invisible to look at.
+     *
+     * Set `river_incision_m` and `river_channel_depth_m` to 0 and the network
+     * vanishes from here again, because then the ground really is flat under it.
      */
     static Image elevation(const MapGraph& graph, const MapConfig& config,
                            const BiomePalette& palette = BiomePalette{},
@@ -463,6 +476,9 @@ private:
         // FastNoiseLite and is not free to build.
         const Noise terrain(config.noise_terrain);
         const TerrainDetail detail = make_terrain_detail(config, terrain);
+        // Likewise one channel index for the whole layer. Walking the rivers per
+        // pixel would be absurd; per layer it is a few milliseconds.
+        const RiverChannels channels = make_river_channels(graph, config);
         Outlines outlines(graph, config, slice);
         for (const MapCenter& center : graph.centers) {
             const std::vector<MapPoint>& outline = outlines.of(center, slice);
@@ -470,9 +486,10 @@ private:
                 continue;
             }
             fill_polygon_shaded(image, outline,
-                [&graph, &center, &detail, inverse_scale](double px, double py) {
+                [&graph, &center, &detail, &channels, inverse_scale](double px, double py) {
                     const double height = graph.elevation_at(center, px * inverse_scale,
-                                                             py * inverse_scale, detail);
+                                                             py * inverse_scale, detail,
+                                                             channels);
                     const float grey = static_cast<float>(std::clamp(height, 0.0, 1.0) * 255.0);
                     return glm::vec3(grey, grey, grey);
                 }, slice.band);
@@ -486,9 +503,15 @@ private:
         const double scale = pixels_per_grid_unit_(config);
         const double overlap = meters_to_grid(config, config.water_edge_overlap_m);
 
+        // The same detail field the elevation layer uses. A river's surface is
+        // measured *from the ground the other layer draws*, so this layer has to
+        // sample the identical surface or the two disagree about where the bed is.
+        const Noise terrain(config.noise_terrain);
+        const TerrainDetail detail = make_terrain_detail(config, terrain);
+
         // Rivers first, so a body drawn over them keeps its flat surface.
         for (const MapRiver& river : graph.rivers) {
-            stroke_river_surface_(image, graph, river, config, overlap, slice.band);
+            stroke_river_surface_(image, graph, river, config, detail, overlap, slice.band);
         }
 
         Outlines outlines(graph, config, slice);
@@ -520,18 +543,23 @@ private:
     /**
      * @brief Strokes a river's water surface: the ground it runs over, plus a depth.
      *
-     * The height is interpolated along the centreline between the corner heights
-     * either end of each segment, rather than held constant across a whole
-     * segment. Corner-cutting multiplied the point count, so a per-corner step
-     * would put a visible terrace every few metres down a watercourse that in
-     * reality falls smoothly.
+     * The height comes from `river_surface_at()` and is not computed here. It used
+     * to be -- interpolated between the `MapCorner::elevation` values either end of
+     * a segment -- and that is exactly how the water layer and the elevation layer
+     * came to disagree: corner heights are the control mesh, while the elevation
+     * layer draws the Delaunay blend of *cell* heights, some 22 m higher at a river
+     * corner. Nearly half of every watercourse was drawn beneath the terrain. One
+     * definition, in one place, is the fix.
      *
-     * Depth rises with volume: a headwater stream is a trickle in a groove and a
-     * trunk river is neither.
+     * Width is still stepped along the corner chain here, since that is a property
+     * of the stroke rather than of the surface: depth and width both rise with
+     * volume, a headwater stream being a trickle in a groove and a trunk river
+     * neither.
      */
     static void stroke_river_surface_(Image& image, const MapGraph& graph,
                                       const MapRiver& river, const MapConfig& config,
-                                      double overlap, const RowBand& band) {
+                                      const TerrainDetail& detail, double overlap,
+                                      const RowBand& band) {
         if (river.points.size() < 2 || river.corners.empty()) {
             return;
         }
@@ -555,15 +583,11 @@ private:
 
             const MapCorner& from = corner_at(index);
             const MapCorner& to = corner_at(index + 1);
-            const double ground = from.elevation + (to.elevation - from.elevation) * fraction;
             const double volume = static_cast<double>(from.river)
                                 + (static_cast<double>(to.river)
                                    - static_cast<double>(from.river)) * fraction;
 
-            const double depth = config.river_depth_m
-                               + config.river_depth_per_volume_m * volume;
-            const double surface = std::clamp(ground + meters_to_height(config, depth),
-                                              0.0, 1.0);
+            const double surface = river_surface_at(graph, river, i, config, detail);
             const double width = river_width(config, static_cast<int>(volume)) + overlap * 2.0;
 
             draw_line(image, river.points[i].x * scale, river.points[i].y * scale,
@@ -632,6 +656,7 @@ private:
         const double inverse_scale = 1.0 / scale;
         const Noise terrain(config.noise_terrain);
         const TerrainDetail detail = make_terrain_detail(config, terrain);
+        const RiverChannels channels = make_river_channels(graph, config);
         Outlines outlines(graph, config, slice);
 
         // Only the slope mode needs the rasterised height field, and it is the
@@ -673,9 +698,10 @@ private:
                     }, slice.band);
             } else {
                 fill_polygon_shaded(image, outline,
-                    [&graph, &center, &detail, base, inverse_scale](double px, double py) {
+                    [&graph, &center, &detail, &channels, base, inverse_scale](double px,
+                                                                               double py) {
                         return base * elevation_shade_(graph, center, px * inverse_scale,
-                                                       py * inverse_scale, detail);
+                                                       py * inverse_scale, detail, channels);
                     }, slice.band);
             }
         }
@@ -878,12 +904,17 @@ private:
      * @param x Horizontal grid position.
      * @param y Vertical grid position.
      * @param detail The terrain detail field, so the shading matches the height layer.
+     * @param channels The river channels, for the same reason -- a composite whose
+     *        ground was not cut where the height layer's was would light the
+     *        watercourses as if they were not there.
      * @return A multiplier for the surface colour, in
      *         `[k_elevation_shade_min, k_elevation_shade_max]`.
      */
     static float elevation_shade_(const MapGraph& graph, const MapCenter& center, double x,
-                                  double y, const TerrainDetail& detail) {
-        const double height = std::clamp(graph.elevation_at(center, x, y, detail), 0.0, 1.0);
+                                  double y, const TerrainDetail& detail,
+                                  const RiverChannels& channels) {
+        const double height =
+            std::clamp(graph.elevation_at(center, x, y, detail, channels), 0.0, 1.0);
         return static_cast<float>(k_elevation_shade_min
                                   + (k_elevation_shade_max - k_elevation_shade_min) * height);
     }

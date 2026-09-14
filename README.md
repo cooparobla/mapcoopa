@@ -82,7 +82,7 @@ Every default above comes from `assets/config.yaml`, not from the binary — see
 
 [`assets/config.yaml`](./assets/config.yaml) holds every knob the generator has: the world
 scale, the sampling grid, both noise fields, the terrain and climate curves, rivers, the
-road network, settlements, political geography, landmarks, and the twelve pass toggles.
+road network, settlements, political geography, landmarks, and the thirteen pass toggles.
 
 ### Scale
 
@@ -179,8 +179,8 @@ terrain under it. All eight register pixel for pixel.
 
 | File | Format | Contents |
 |---|---|---|
-| `_elevation.png` | RGB | Ground height, sea bed included: black at the deepest water, `sea_level` at the shore, white at the summit. Height and nothing else — no rivers cut into it. |
-| `_water.png` | RGB | Water-surface height, **on the same scale as `_elevation.png`**. Flat per body: the sea at `sea_level`, each lake at one height across all its cells, rivers at the ground height plus a depth. Dry land is black. |
+| `_elevation.png` | RGB | Ground height, sea bed included: black at the deepest water, `sea_level` at the shore, white at the summit. Height and nothing else — nothing is *painted* here, but river valleys do show, because the ground under a river really is lower. See **River valleys**. |
+| `_water.png` | RGB | Water-surface height, **on the same scale as `_elevation.png`**. Flat per body: the sea at `sea_level`, each lake at one height across all its cells, rivers at the ground height plus a depth. Dry land is black. See **Meshing the two together** for exactly where the water is guaranteed to sit above the terrain. |
 | `_biomes.png` | RGB | Flat terrain colour, no overlays. |
 | `_roads.png` | RGBA | The road network by class, transparent elsewhere. |
 | `_structures.png` | RGBA | Building footprints as rotated quads, transparent elsewhere. |
@@ -338,7 +338,9 @@ the full range. Without it "a river one metre deep" had nowhere to land.
 - **`river_depth_m`** (+ `river_depth_per_volume_m`) lifts a river's surface *above* the
   ground it runs over, because a river is water standing in a channel rather than a line
   painted on the terrain. Interpolated along the smoothed centreline, so the fall
-  downstream is continuous instead of terracing at every corner.
+  downstream is continuous instead of terracing at every corner. Complementary to
+  `river_incision_m` below, not a duplicate of it: incision cuts the valley, depth floats
+  the sheet above the bed at the bottom of it.
 - **Bodies are drawn after rivers**, so a lake's flat surface wins inside its own
   outline. The other way round, a river stroked at ground height gouged a channel across
   every lake it flowed into.
@@ -346,6 +348,107 @@ the full range. Without it "a river one metre deep" had nowhere to land.
   edge so it clips *into* the terrain. Two surfaces sharing an edge exactly will show a
   seam wherever their meshes disagree by a rounding error, and along a coastline they
   always do.
+
+### Meshing the two together
+
+Build a terrain mesh from `_elevation.png` and a water mesh from `_water.png` at the same
+vertical scale, and this is what holds:
+
+- **Rivers: the water is above the terrain, everywhere, by construction.** The surface
+  comes from `river_surface_at()` ([`map_data.h`](./coopa/maps/map_data.h)), which measures
+  the ground with the *same* call the elevation layer draws with — `elevation_at()` — and
+  takes the highest point over the whole footprint of the stroke before adding
+  `river_depth_m`.
+
+  It did not always. The water layer used to compute the sheet from
+  `MapCorner::elevation` — the control mesh — while the elevation layer drew the Delaunay
+  blend of *cell* heights. Those differ by about **22 m at a river corner**, because each
+  cell averages in its non-river corners, against one or two metres of freeboard. The
+  result was that **47.7% of river samples had terrain standing above the water**. One
+  definition in one place is the fix, and the test now asserts against the drawn ground
+  rather than recomputing the surface it is checking.
+
+- **Bodies: guaranteed in the interior, not within one cell of a shore.** Under water,
+  `MapCenter::elevation` is the *bed* — except for a coastal cell, where it is not below
+  the water at all: cell heights are the mean of their corners, and a cell the sea reaches
+  into has corners up on the land. **About one water cell in ten carries a bed above its
+  own surface** for that reason, and because the ground is drawn by interpolating between
+  cell heights, those cells lift the surface through the water inside themselves *and* one
+  ring further in.
+
+  Precisely: where a cell **and every neighbour** have a bed at or below their surface,
+  every vertex the sampler can reach is under water and so is the blend — zero violations
+  measured across five maps. Elsewhere, **clip the water to where the terrain is below it**,
+  which is how water is normally drawn in any case.
+
+### River valleys
+
+Rivers erode, and for a long time nothing in the height field knew it. Elevation is
+computed **before** rivers are routed — it has to be, the routing walks `downslope` — so
+the generator produced a drainage network drawn across a surface with nowhere for the water
+to go. The elevation layer showed no trace of the rivers the water layer was full of, and a
+mesh built from the data had rivers running over flat ground.
+
+`PassValleys` ([`passes/pass_valleys.h`](./coopa/maps/passes/pass_valleys.h)) fixes that by
+lowering the ground, and the distinction matters: **nothing is painted**. The layer once
+had its river network *dimmed* into it, which was wrong twice over — it made the layer a
+picture of the terrain rather than the terrain itself, and a consumer flooding a mesh to
+those values found channels already cut. What shows now is real geometry.
+
+That happens at **two scales, and it needs both** — which took measuring to discover.
+
+**The valley** is carved into the control mesh by `PassValleys`: corner and cell heights,
+a landform hundreds of metres across.
+
+**The channel** is cut into the surface sampled *between* those heights, by
+`make_river_channels()` ([`map_data.h`](./coopa/maps/map_data.h)), at the river's true
+width.
+
+The second exists because the first cannot do the job alone, and the geometry says why.
+`elevation_at()` interpolates *cell-site* heights over Delaunay triangles, while rivers run
+along Voronoi edges — cell *boundaries*, as far from a site as the tessellation allows. So
+the surface cannot vary faster than one cell, 60 m at the default scale, against a river 5
+to 20 m wide. Measured on a real map, the best profile cell-height carving can produce
+gives **+2.3 grey levels of contrast within half a cell** — an 80 m depression 500 m wide,
+with no edge. Deep, and invisible. Cutting the channel at sample time instead measures
+**+12.3**.
+
+So the channel lives where `terrain_roughness` lives: applied by `elevation_at()`, never
+written back to cell or corner heights. Biomes, rivers and roads keep classifying on a mesh
+no surface feature has touched, while anyone sampling the *surface* — the renderer, a
+mesher — gets the channel. Its width comes from `river_width()`, the one definition of how
+wide a river is, so the cut and the blue ribbon on the water layer register meander for
+meander.
+
+| Knob | Default | Effect |
+|---|---|---|
+| `river_channel_depth_m` | **18** | Channel depth in metres — the one that makes a river legible. **0 leaves the sampled surface as the mesh describes it.** |
+| `river_channel_depth_per_volume_m` | **4** | Extra channel depth per unit of volume. |
+| `river_incision_m` | **60** | Valley depth in metres. **0 reproduces the uncarved mesh byte for byte.** |
+| `river_incision_per_volume_m` | **12** | Extra valley depth per unit of volume — a trunk river has had far longer to cut than its streams. |
+| `river_valley_width` | **2** | Rings of corners the valley opens over. 1 is a trench with nothing either side; 2 gives it banks. |
+| `river_valley_falloff` | **0.5** | Depth multiplier per ring outward — what turns a step into a slope. |
+
+```bash
+cplay --incision=0 --channel=0   # the uncarved field, exactly as before any of this
+cplay --channel=40               # gorges
+cplay --no-valleys               # landform only; the channel stays
+```
+
+The valley falloff earns its keep beyond looks: a cliff at every watercourse would push the
+mean elevation step between neighbouring cells past what `elevation_smoothing_iterations`
+is there to hold down. Graded, it measures 0.031 against a 0.05 ceiling.
+
+Channel sampling is guarded by a per-cell bounding box, so the overwhelming majority of the
+23 M pixels in a default render cost one comparison rather than a distance loop — rivers
+cover very little of a map.
+
+The pass finishes by calling `restore_drainage()`
+([`passes/drainage.h`](./coopa/maps/passes/drainage.h), shared with the elevation pass).
+Moving the ground owes the map its drainage back — carving digs pits where a valley wall
+grades into ground with no outlet, the waterline clamp flattens river mouths into ties, and
+`downslope` was read off a field that no longer exists. Without it, 42% of rivers would
+start ending in the middle of a field again.
 
 ## Landmass shape
 
@@ -359,6 +462,8 @@ of map, not a smaller image.
 | `rectangle` *(default)* | `width_m`, `height_m` | `--shape=rect --shape-size=M --shape-height=M` |
 | `circle` | `diameter_m` | `--shape=circle --shape-size=M` |
 | `triangle` | `edge_length_m`, equilateral and apex-up | `--shape=triangle --shape-size=M --shape-rot=DEG` |
+| `continent` | `continent_size_m`, one irregular landmass | `--shape=continent --shape-size=M --shape-wobble=F` |
+| `archipelago` | `continent_size_m` × `continent_count`, scattered | `--shape=archipelago --shape-size=M --shape-count=N` |
 
 **Every dimension defaults to 0, meaning "fill the canvas"**, which makes the default a
 canvas-spanning rectangle — byte for byte what the generator produced before shapes
@@ -366,17 +471,58 @@ existed. `rotation` turns the shape about the centre; only the triangle is asymm
 enough for it to show.
 
 ```bash
-cplay --shape=circle   --shape-size=3600
-cplay --shape=triangle --shape-size=4000 --shape-rot=30
-cplay --shape=rect     --shape-size=3000 --shape-height=1800
+cplay --shape=circle      --shape-size=3600
+cplay --shape=triangle    --shape-size=4000 --shape-rot=30
+cplay --shape=rect        --shape-size=3000 --shape-height=1800
+cplay --shape=continent
+cplay --shape=archipelago --shape-count=5
 ```
 
-It is one predicate: `shape_inset()` in
+It is one predicate: `ShapeField::inset()` in
 [`coopa/maps/map_config.h`](./coopa/maps/map_config.h) returns how far inside the shape a
 point lies, and `border_check_()` flags anything within `border_length` of the edge. The
 water pass floods those cells and the elevation pass measures height outward from them, so
 coastlines, mountains, regions and roads all follow the shape without any of them knowing
-shapes exist.
+shapes exist. It is a `ShapeField` object rather than the free `shape_inset()` because the
+organic shapes carry state — a landmass layout and a noise generator — and the predicate
+runs once per cell and again per corner. `shape_inset()` remains as the one-off path, and
+rebuilds the field on every call.
+
+### Organic shapes
+
+`rectangle`, `circle` and `triangle` are exact geometry, and it shows: however organic the
+island noise makes the interior, the *silhouette* is a hard edge. `continent` and
+`archipelago` wander the outline instead.
+
+A landmass is a radius that varies with the angle around its centre — a fractal sum of four
+sine harmonics at frequencies 2, 3, 5 and 7, each turning faster and counting for less.
+Whole numbers, so the outline closes with no seam; coprime, so it has no shorter period
+than a full turn and cannot come out symmetric. `irregularity` scales how far it wanders,
+clamped to 0.6 because past that a landmass pinches itself in two.
+
+That alone is *star-convex* — every ray from the centre crosses the coast exactly once, so
+there are no fjords and no headland that folds back. So the whole boundary is then
+displaced by `noise_shape`, at `coast_detail` × the mean radius. That is what buys inlets,
+fold-back peninsulas and the occasional island lying offshore.
+
+`archipelago` scatters `continent_count` of them, each a different size (`size_variance`)
+with its own outline, and takes the **union** — so two that land close enough fuse into one
+larger continent rather than drawing a coast through each other. The count is an upper
+bound, not a promise, and the fusion is the point: it is what stops an archipelago reading
+as a row of evenly spaced blobs. Positions come from best-candidate sampling, biased out of
+the middle of the canvas, since a landmass placed dead centre is large enough to overlap
+everything else there is.
+
+Both keep open sea all the way round the canvas by construction — a landmass reaching the
+frame would be sliced off by the border band, and could wall the ocean flood fill out of a
+bay and leave the sea classified as a lake.
+
+`continent_size_m` is the **mean diameter of one landmass**, not the size of the world, and
+its own field rather than a reuse of `diameter_m` — wiring them together would make an
+archipelago inherit whatever the circle was set to. At 0 they size themselves to the
+canvas: one continent as wide as fits, or an archipelago's worth spread across it. Raising
+it trades separation for scale — three large landmasses will fuse into a horseshoe
+continent around an inland sea, which is often what you want.
 
 ## Terrain
 

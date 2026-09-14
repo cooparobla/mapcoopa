@@ -29,16 +29,7 @@ public:
      * @brief Builds a sampler from a noise configuration.
      * @param config The field parameters to apply.
      */
-    explicit Noise(const NoiseConfig& config) {
-        generator_.SetSeed(config.seed);
-        generator_.SetFrequency(static_cast<float>(config.frequency));
-        generator_.SetNoiseType(config.type);
-        generator_.SetFractalType(config.fractal_type);
-        generator_.SetFractalOctaves(config.octaves);
-        generator_.SetFractalLacunarity(static_cast<float>(config.lacunarity));
-        generator_.SetFractalGain(static_cast<float>(config.gain));
-        generator_.SetFractalWeightedStrength(static_cast<float>(config.weighted_strength));
-    }
+    explicit Noise(const NoiseConfig& config) { configure_noise(generator_, config); }
 
     /**
      * @brief Samples the field.

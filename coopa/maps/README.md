@@ -169,9 +169,22 @@ site, and left 1.78% of drawn pixels outside every triangle because the fan cove
 straight corner polygon while the renderer draws the subdivided one. An overload
 takes a `TerrainDetail` — a borrowed `Noise` plus an amplitude, built by
 `make_terrain_detail()` — and displaces the result, tapered by the local height so a
-coastline stays at sea level. The detail deliberately lives in the sampler and not in the
-graph: cells and corners stay the smooth control field that biomes, rivers and roads are
-classified from.
+coastline stays at sea level. A further overload takes a `RiverChannels` from
+`make_river_channels()` and cuts the watercourses into the surface, at the width
+`river_width()` gives them, subtracted last so the roughness cannot fill the bed back in.
+
+Both deliberately live in the sampler and not in the graph: cells and corners stay the
+smooth control field that biomes, rivers and roads are classified from. For the channel
+that is not merely tidy, it is the only place it *can* live — sites are 60 m apart and a
+river is 5 to 20 m wide, so carved into the mesh the sharpest achievable river is a 500 m
+depression with no edge. Measured contrast half a cell from a centreline: **+2.3 grey
+levels** carved into the mesh, **+12.3** cut at sample time.
+
+`RiverChannels` stores its segments flat, grouped by cell, each group with a bounding box
+the sampler tests before it measures any distance. A segment is filed under every cell its
+corner *touches*, which is what keeps the surface continuous across a boundary a river runs
+along: three cells share a corner and two share an edge, so both sides see the same segments
+and compute the same cut.
 
 `MapCenter::water_level` is the *surface* of whatever water covers a cell, flat per body,
 as against `elevation` which is the height of the ground underneath. That distinction is

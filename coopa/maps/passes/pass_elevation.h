@@ -19,6 +19,7 @@
 #include <coopa/debug/logger.h>
 #include <coopa/maps/map_config.h>
 #include <coopa/maps/map_data.h>
+#include <coopa/maps/passes/drainage.h>
 #include <coopa/maps/noise.h>
 
 namespace coopa {
@@ -55,10 +56,10 @@ public:
         // Before downslopes, not after: the flow direction has to be derived from
         // the field rivers will actually run on, or they carve uphill.
         smooth_elevations_(graph, config);
-        // Strictly before downslopes: filling is what makes a downhill walk from
-        // any land corner actually arrive somewhere wet.
-        fill_depressions_(graph);
-        assign_downslopes_(graph);
+        // Filling is what makes a downhill walk from any land corner actually
+        // arrive somewhere wet; the downslopes are then read off the filled
+        // field, which is why `restore_drainage()` pairs the two.
+        restore_drainage(graph);
         assign_center_elevations_(graph);
         // Cells carry the mean of their corners, and a cell with few corners can
         // still sit well clear of its neighbours after the corner field is
@@ -72,14 +73,6 @@ public:
     }
 
 private:
-    /**
-     * @brief Height added per step when `fill_depressions_` raises a pit.
-     *
-     * Small enough to be invisible, large enough that `double` comparison sees
-     * it as a real difference over a chain of a few hundred corners.
-     */
-    static constexpr double k_fill_epsilon = 1e-7;
-
     /** @brief Cost of a step between two corners, before the land surcharge. */
     static constexpr double k_step_cost = 0.01;
     /** @brief Extra cost charged when both ends of a step are dry land. */
@@ -321,99 +314,6 @@ private:
                 const double mean = sum / static_cast<double>(counted);
                 const double own = previous[static_cast<std::size_t>(corner.index)];
                 corner.elevation = own + strength * (mean - own);
-            }
-        }
-    }
-
-    /**
-     * @brief Points each corner at its lowest neighbour, or at itself in a basin.
-     *
-     * The comparison is strictly `<`, not `<=`. An equal-height neighbour is not
-     * downhill, and accepting one lets two corners at exactly the same elevation
-     * name each other as their downslope -- a two-cycle that a flow walk follows
-     * until it hits its step guard. After `fill_depressions_` no such tie exists
-     * along a flow path anyway, but the strict test is what makes "points at
-     * itself" mean "has nowhere lower to go" rather than "happens to have been
-     * scanned last".
-     */
-    void assign_downslopes_(MapGraph& graph) const {
-        for (MapCorner& corner : graph.corners) {
-            CornerId lowest = corner.index;
-            double lowest_elevation = corner.elevation;
-            for (const CornerId neighbor_id : corner.adjacent) {
-                const MapCorner& neighbor = graph.corners[static_cast<std::size_t>(neighbor_id)];
-                if (neighbor.elevation < lowest_elevation) {
-                    lowest = neighbor.index;
-                    lowest_elevation = neighbor.elevation;
-                }
-            }
-            corner.downslope = lowest;
-        }
-    }
-
-    /**
-     * @brief Raises closed basins until every land corner drains to water.
-     *
-     * The distance-from-coast field is monotone, but nothing after it is: relief
-     * noise, the rank remap and the smoothing passes all move corners
-     * independently, and any of them can leave a corner lower than every
-     * neighbour. Such a corner is a pit, and a downhill walk that reaches one
-     * stops on dry land. On a default map 80 of 11 438 land corners were pits,
-     * which is why 23 of 55 rivers used to end in the middle of a field.
-     *
-     * This is the priority-flood fill (Barnes, Lehman & Mulla 2014), which is
-     * what DEM processing uses for the same problem. Every corner already at or
-     * on water seeds a min-heap; popping the lowest unresolved corner and
-     * raising each of its dry neighbours to just above it walks the terrain
-     * outward from the sea in ascending order of the height water would have to
-     * reach to get there. Each corner is therefore resolved *from* a strictly
-     * lower one, and following that chain backwards is a descending path to
-     * water. Since steepest descent from any corner also strictly descends, and
-     * only a seed can have no lower neighbour, every land corner now drains.
-     *
-     * The epsilon is what buys strictness rather than a flat spillway, and it is
-     * deliberately tiny: chains run a few hundred corners at most, so the total
-     * rise is on the order of 1e-4 of the height range -- well under a tenth of
-     * a millimetre at the default 600 m. Filling a pit is not a visible change
-     * to the terrain; it is the difference between a puddle and a river mouth.
-     *
-     * Lake corners seed the queue alongside the sea, so an inflow that reaches a
-     * lake has arrived and the lake bed is never filled in to force the water
-     * onward. That is also what keeps an endorheic basin a lake instead of a
-     * river running over its rim.
-     */
-    void fill_depressions_(MapGraph& graph) const {
-        if (graph.corners.empty()) {
-            return;
-        }
-
-        // (elevation, corner), so the heap orders on height and ties break on a
-        // stable index rather than on whatever the allocator handed back.
-        using Entry = std::pair<double, CornerId>;
-        std::priority_queue<Entry, std::vector<Entry>, std::greater<Entry>> pending;
-        std::vector<bool> resolved(graph.corners.size(), false);
-
-        for (const MapCorner& corner : graph.corners) {
-            if (!corner.water && !corner.coast) {
-                continue;
-            }
-            resolved[static_cast<std::size_t>(corner.index)] = true;
-            pending.emplace(corner.elevation, corner.index);
-        }
-
-        while (!pending.empty()) {
-            const Entry entry = pending.top();
-            pending.pop();
-            const MapCorner& corner = graph.corners[static_cast<std::size_t>(entry.second)];
-            for (const CornerId neighbor_id : corner.adjacent) {
-                const std::size_t index = static_cast<std::size_t>(neighbor_id);
-                if (resolved[index]) {
-                    continue;
-                }
-                MapCorner& neighbor = graph.corners[index];
-                neighbor.elevation = std::max(neighbor.elevation, entry.first + k_fill_epsilon);
-                resolved[index] = true;
-                pending.emplace(neighbor.elevation, neighbor.index);
             }
         }
     }

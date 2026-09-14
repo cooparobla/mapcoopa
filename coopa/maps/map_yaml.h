@@ -233,6 +233,7 @@ inline fkyaml::node config_to_node(const MapConfig& config) {
     passes["enable_elevation"] = config.enable_elevation;
     passes["enable_temperature"] = config.enable_temperature;
     passes["enable_rivers"] = config.enable_rivers;
+    passes["enable_valleys"] = config.enable_valleys;
     passes["enable_moisture"] = config.enable_moisture;
     passes["enable_biomes"] = config.enable_biomes;
     passes["enable_roads"] = config.enable_roads;
@@ -281,6 +282,12 @@ inline fkyaml::node config_to_node(const MapConfig& config) {
     node["river_width_per_volume_m"] = config.river_width_per_volume_m;
     node["river_depth_m"] = config.river_depth_m;
     node["river_depth_per_volume_m"] = config.river_depth_per_volume_m;
+    node["river_channel_depth_m"] = config.river_channel_depth_m;
+    node["river_channel_depth_per_volume_m"] = config.river_channel_depth_per_volume_m;
+    node["river_incision_m"] = config.river_incision_m;
+    node["river_incision_per_volume_m"] = config.river_incision_per_volume_m;
+    node["river_valley_width"] = config.river_valley_width;
+    node["river_valley_falloff"] = config.river_valley_falloff;
     node["water_edge_overlap_m"] = config.water_edge_overlap_m;
     node["trail_width_m"] = config.trail_width_m;
     node["road_width_m"] = config.road_width_m;
@@ -296,6 +303,7 @@ inline fkyaml::node config_to_node(const MapConfig& config) {
     node["noise_temperature"] = detail::noise_to_node(config.noise_temperature);
     node["noise_relief"] = detail::noise_to_node(config.noise_relief);
     node["noise_terrain"] = detail::noise_to_node(config.noise_terrain);
+    node["noise_shape"] = detail::noise_to_node(config.noise_shape);
     fkyaml::node shape = fkyaml::node::mapping();
     shape["shape"] = std::string(map_shape_name(config.shape.shape));
     shape["width_m"] = config.shape.width_m;
@@ -303,6 +311,11 @@ inline fkyaml::node config_to_node(const MapConfig& config) {
     shape["diameter_m"] = config.shape.diameter_m;
     shape["edge_length_m"] = config.shape.edge_length_m;
     shape["rotation"] = config.shape.rotation;
+    shape["continent_size_m"] = config.shape.continent_size_m;
+    shape["continent_count"] = config.shape.continent_count;
+    shape["irregularity"] = config.shape.irregularity;
+    shape["size_variance"] = config.shape.size_variance;
+    shape["coast_detail"] = config.shape.coast_detail;
 
     node["shape"] = std::move(shape);
     node["towns"] = std::move(towns);
@@ -368,6 +381,17 @@ inline void apply_config_node(const fkyaml::node& node, MapConfig& config) {
     config.river_depth_m = detail::read_or(node, "river_depth_m", config.river_depth_m);
     config.river_depth_per_volume_m =
         detail::read_or(node, "river_depth_per_volume_m", config.river_depth_per_volume_m);
+    config.river_channel_depth_m =
+        detail::read_or(node, "river_channel_depth_m", config.river_channel_depth_m);
+    config.river_channel_depth_per_volume_m = detail::read_or(
+        node, "river_channel_depth_per_volume_m", config.river_channel_depth_per_volume_m);
+    config.river_incision_m = detail::read_or(node, "river_incision_m", config.river_incision_m);
+    config.river_incision_per_volume_m =
+        detail::read_or(node, "river_incision_per_volume_m", config.river_incision_per_volume_m);
+    config.river_valley_width =
+        detail::read_or(node, "river_valley_width", config.river_valley_width);
+    config.river_valley_falloff =
+        detail::read_or(node, "river_valley_falloff", config.river_valley_falloff);
     config.water_edge_overlap_m =
         detail::read_or(node, "water_edge_overlap_m", config.water_edge_overlap_m);
     config.trail_width_m = detail::read_or(node, "trail_width_m", config.trail_width_m);
@@ -419,6 +443,7 @@ inline void apply_config_node(const fkyaml::node& node, MapConfig& config) {
     detail::noise_from_node(node, "noise_temperature", config.noise_temperature);
     detail::noise_from_node(node, "noise_relief", config.noise_relief);
     detail::noise_from_node(node, "noise_terrain", config.noise_terrain);
+    detail::noise_from_node(node, "noise_shape", config.noise_shape);
 
     if (node.contains("regions")) {
         const fkyaml::node& regions = node.at("regions");
@@ -463,6 +488,7 @@ inline void apply_config_node(const fkyaml::node& node, MapConfig& config) {
         config.enable_temperature =
             detail::read_or(passes, "enable_temperature", config.enable_temperature);
         config.enable_rivers = detail::read_or(passes, "enable_rivers", config.enable_rivers);
+        config.enable_valleys = detail::read_or(passes, "enable_valleys", config.enable_valleys);
         config.enable_moisture = detail::read_or(passes, "enable_moisture", config.enable_moisture);
         config.enable_biomes = detail::read_or(passes, "enable_biomes", config.enable_biomes);
         config.enable_roads = detail::read_or(passes, "enable_roads", config.enable_roads);
@@ -508,6 +534,12 @@ inline void apply_config_node(const fkyaml::node& node, MapConfig& config) {
         target.diameter_m = detail::read_or(shape, "diameter_m", target.diameter_m);
         target.edge_length_m = detail::read_or(shape, "edge_length_m", target.edge_length_m);
         target.rotation = detail::read_or(shape, "rotation", target.rotation);
+        target.continent_size_m =
+            detail::read_or(shape, "continent_size_m", target.continent_size_m);
+        target.continent_count = detail::read_or(shape, "continent_count", target.continent_count);
+        target.irregularity = detail::read_or(shape, "irregularity", target.irregularity);
+        target.size_variance = detail::read_or(shape, "size_variance", target.size_variance);
+        target.coast_detail = detail::read_or(shape, "coast_detail", target.coast_detail);
     }
 
     if (node.contains("towns")) {

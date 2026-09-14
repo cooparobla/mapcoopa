@@ -562,6 +562,76 @@ inline TerrainDetail make_terrain_detail(const MapConfig& config, const Noise& n
 }
 
 /**
+ * @struct ChannelSegment
+ * @brief One straight piece of a river centreline, and the cut it carries.
+ *
+ * Taken from `MapRiver::points` -- the *smoothed* centreline, the same polyline
+ * the water layer strokes -- so the channel in the height field and the ribbon
+ * drawn over it register instead of drifting apart at every bend.
+ */
+struct ChannelSegment {
+    MapPoint a;              /**< @brief One end, in grid units. */
+    MapPoint b;              /**< @brief The other end, in grid units. */
+    double half_width = 0.0; /**< @brief Half the river's width here, in grid units. */
+    double depth = 0.0;      /**< @brief Depth of the cut at the centreline, in height units. */
+};
+
+/**
+ * @struct RiverChannels
+ * @brief The river channels cut into the sampled surface, indexed by cell.
+ *
+ * The counterpart of `TerrainDetail`: both are surface features too fine for the
+ * control mesh to hold, applied by `MapGraph::elevation_at()` at sample time and
+ * never written back to cell or corner heights. Biomes, rivers and roads go on
+ * classifying on the mesh, while anyone sampling the *surface* gets the channel.
+ *
+ * Built once per render by `make_river_channels()`, never per pixel. Segments are
+ * stored flat and grouped by cell, and each cell carries a bounding box of its own
+ * group so the sampler can reject the overwhelming majority of pixels -- rivers
+ * cover very little of a map -- with one comparison instead of a distance loop.
+ */
+struct RiverChannels {
+    /** @brief One cell's slice of `segments`, and the box that bounds it. */
+    struct Cell {
+        std::size_t first = 0; /**< @brief Index of this cell's first segment. */
+        std::size_t count = 0; /**< @brief How many segments follow it. */
+        MapPoint min;          /**< @brief Low corner of the box, widened by `half_width`. */
+        MapPoint max;          /**< @brief High corner of the box, widened by `half_width`. */
+    };
+
+    std::vector<ChannelSegment> segments; /**< @brief Every segment, grouped by cell. */
+    std::vector<Cell> cells;              /**< @brief Indexed by `CenterId`. */
+
+    /** @brief Whether any channel is cut at all. */
+    bool empty() const { return segments.empty(); }
+};
+
+/**
+ * @brief Distance from a point to a line segment, in grid units.
+ *
+ * The inner loop of the channel cut, so it is written without a square root
+ * where one is avoidable and takes the endpoints by reference.
+ *
+ * @param x Horizontal grid position.
+ * @param y Vertical grid position.
+ * @param a One end of the segment.
+ * @param b The other end.
+ * @return The shortest distance from the point to the segment.
+ */
+inline double distance_to_segment(double x, double y, const MapPoint& a, const MapPoint& b) {
+    const double dx = b.x - a.x;
+    const double dy = b.y - a.y;
+    const double length_squared = dx * dx + dy * dy;
+    double t = 0.0;
+    if (length_squared > 0.0) {
+        t = std::clamp(((x - a.x) * dx + (y - a.y) * dy) / length_squared, 0.0, 1.0);
+    }
+    const double px = x - (a.x + t * dx);
+    const double py = y - (a.y + t * dy);
+    return std::sqrt(px * px + py * py);
+}
+
+/**
  * @class MapGraph
  * @brief Owns every cell, corner, edge, road run and settlement of one generated map.
  *
@@ -687,6 +757,83 @@ public:
         const double amplitude = detail.roughness * base;
         const double displaced = base + amplitude * static_cast<double>(detail.noise->sample(x, y));
         return std::clamp(displaced, 0.0, 1.0);
+    }
+
+    /**
+     * @brief Interpolates the ground height, with detail and river channels on top.
+     *
+     * The full surface: the control mesh gives the landform, the detail field
+     * gives it texture, and the channel cuts the watercourse into it. All three
+     * are separate on purpose -- only the first is written back to cell and corner
+     * heights, so biomes, rivers and roads keep classifying on a mesh that no
+     * surface feature has touched.
+     *
+     * The channel is subtracted **last**, after the detail displacement, so
+     * roughness cannot fill the bed back in. Without that ordering a rough map
+     * would show a channel full of rubble rather than a channel.
+     *
+     * @param center The cell to sample within.
+     * @param x Horizontal grid position.
+     * @param y Vertical grid position.
+     * @param detail The detail field and how strongly to apply it.
+     * @param channels The channels to cut, from `make_river_channels()`.
+     * @return The displaced and cut height, clamped to `[0, 1]`.
+     */
+    double elevation_at(const MapCenter& center, double x, double y, const TerrainDetail& detail,
+                        const RiverChannels& channels) const {
+        const double surface = elevation_at(center, x, y, detail);
+        const double cut = channel_cut_(center, x, y, channels);
+        return cut > 0.0 ? std::clamp(surface - cut, 0.0, 1.0) : surface;
+    }
+
+    /**
+     * @brief How deep the river channel runs beneath a point, in height units.
+     *
+     * Zero everywhere except within a river's own width of its centreline, which
+     * is a very small part of a map -- hence the bounding-box test before the
+     * distance loop. It runs once per pixel of the elevation layer, some 23
+     * million times at the default render size, and the box is what keeps that
+     * affordable.
+     *
+     * The profile is `depth * (1 - t*t)` against `t = distance / half_width`: a
+     * concave bed that reaches exactly zero at the rim, so the cut meets the
+     * surrounding ground without a step. The kink there is deliberate -- it is a
+     * cut bank, and an edge is the only thing that reads as a river rather than
+     * as a dip in the ground.
+     *
+     * Overlapping segments take the deepest rather than the sum, so a confluence
+     * is one channel and a bend is not gouged twice. `max` of continuous
+     * functions is continuous, so that costs nothing in smoothness.
+     *
+     * @param center The cell being sampled; selects the segment group.
+     * @param x Horizontal grid position.
+     * @param y Vertical grid position.
+     * @param channels The channel index.
+     * @return The depth to subtract, or 0 away from any watercourse.
+     */
+    double channel_cut_(const MapCenter& center, double x, double y,
+                        const RiverChannels& channels) const {
+        const std::size_t index = static_cast<std::size_t>(center.index);
+        if (index >= channels.cells.size()) {
+            return 0.0;
+        }
+        const RiverChannels::Cell& cell = channels.cells[index];
+        if (cell.count == 0 || x < cell.min.x || x > cell.max.x || y < cell.min.y
+            || y > cell.max.y) {
+            return 0.0;
+        }
+
+        double deepest = 0.0;
+        for (std::size_t i = cell.first; i < cell.first + cell.count; ++i) {
+            const ChannelSegment& segment = channels.segments[i];
+            const double distance = distance_to_segment(x, y, segment.a, segment.b);
+            if (distance >= segment.half_width) {
+                continue;
+            }
+            const double t = distance / segment.half_width;
+            deepest = std::max(deepest, segment.depth * (1.0 - t * t));
+        }
+        return deepest;
     }
 
     /**
@@ -915,6 +1062,210 @@ public:
         return k_invalid_id;
     }
 };
+
+/**
+ * @brief Builds the channel index `MapGraph::elevation_at()` cuts the rivers with.
+ *
+ * Walks each river's smoothed centreline, pairing every segment with the volume
+ * of the corner it came from -- both sequences run source to mouth, so a single
+ * proportional step through the corner chain keeps them aligned without a search.
+ * Width comes from `river_width()`, the one definition of how wide a river is,
+ * so the cut and the ribbon the water layer strokes are the same shape.
+ *
+ * A segment is filed under the cells its corner *touches*, and that is enough for
+ * the surface to stay continuous: a Voronoi corner is shared by three cells and a
+ * Voronoi edge by two, so every cell that can see a segment carries it, and both
+ * sides of any boundary compute the same cut. It works because the channel is far
+ * narrower than a cell -- half a river's width against the 60 m between sites --
+ * so nothing further than one cell away is ever within reach of the cut.
+ *
+ * Build once per render; the sampler takes it by reference and never copies it.
+ *
+ * @param graph The generated graph; reads `rivers`, `corners` and `centers`.
+ * @param config Supplies the channel depths, the river widths and the vertical scale.
+ * @return The index, empty when no channel is cut.
+ */
+inline RiverChannels make_river_channels(const MapGraph& graph, const MapConfig& config) {
+    RiverChannels channels;
+    if (config.river_channel_depth_m <= 0.0 && config.river_channel_depth_per_volume_m <= 0.0) {
+        return channels;
+    }
+    if (graph.rivers.empty() || graph.centers.empty()) {
+        return channels;
+    }
+
+    const double base = meters_to_height(config, config.river_channel_depth_m);
+    const double per_volume = meters_to_height(config, config.river_channel_depth_per_volume_m);
+
+    std::vector<std::vector<ChannelSegment>> grouped(graph.centers.size());
+    // One stamp per cell, so a segment filed under a cell by two of its three
+    // corners is stored once rather than three times. Duplicates would not change
+    // the depth -- the sampler takes a max -- but they would lengthen the inner
+    // loop for every pixel in the cell.
+    std::vector<std::size_t> stamp(graph.centers.size(), static_cast<std::size_t>(-1));
+    std::size_t serial = 0;
+
+    for (const MapRiver& river : graph.rivers) {
+        if (river.points.size() < 2 || river.corners.empty()) {
+            continue;
+        }
+        const std::size_t spans = river.points.size() - 1;
+        for (std::size_t i = 0; i < spans; ++i) {
+            const std::size_t slot =
+                std::min(river.corners.size() - 1, i * river.corners.size() / spans);
+            const MapCorner& corner =
+                graph.corners[static_cast<std::size_t>(river.corners[slot])];
+            const int volume = std::max(1, corner.river);
+
+            ChannelSegment segment;
+            segment.a = river.points[i];
+            segment.b = river.points[i + 1];
+            segment.half_width = river_width(config, volume) * 0.5;
+            segment.depth = base + per_volume * static_cast<double>(volume);
+            if (segment.half_width <= 0.0 || segment.depth <= 0.0) {
+                continue;
+            }
+
+            ++serial;
+            for (const CenterId center_id : corner.touches) {
+                const std::size_t index = static_cast<std::size_t>(center_id);
+                if (index >= grouped.size() || stamp[index] == serial) {
+                    continue;
+                }
+                stamp[index] = serial;
+                grouped[index].push_back(segment);
+            }
+        }
+    }
+
+    std::size_t total = 0;
+    for (const std::vector<ChannelSegment>& group : grouped) {
+        total += group.size();
+    }
+    channels.segments.reserve(total);
+    channels.cells.resize(graph.centers.size());
+
+    for (std::size_t i = 0; i < grouped.size(); ++i) {
+        RiverChannels::Cell& cell = channels.cells[i];
+        cell.first = channels.segments.size();
+        cell.count = grouped[i].size();
+        if (cell.count == 0) {
+            continue;
+        }
+        // The box is widened by each segment's own half-width, so a point the box
+        // rejects is genuinely outside every cut rather than merely outside the
+        // centrelines.
+        double min_x = grouped[i].front().a.x;
+        double min_y = grouped[i].front().a.y;
+        double max_x = min_x;
+        double max_y = min_y;
+        for (const ChannelSegment& segment : grouped[i]) {
+            const double reach = segment.half_width;
+            min_x = std::min({min_x, segment.a.x - reach, segment.b.x - reach});
+            min_y = std::min({min_y, segment.a.y - reach, segment.b.y - reach});
+            max_x = std::max({max_x, segment.a.x + reach, segment.b.x + reach});
+            max_y = std::max({max_y, segment.a.y + reach, segment.b.y + reach});
+            channels.segments.push_back(segment);
+        }
+        cell.min = MapPoint{min_x, min_y};
+        cell.max = MapPoint{max_x, max_y};
+    }
+    return channels;
+}
+
+/**
+ * @brief The height a river's water surface takes over one segment of its course.
+ *
+ * **The one definition of the ground under a river**, and it is a free function
+ * rather than a step inside the renderer because it used not to be. The water
+ * layer computed the sheet from `MapCorner::elevation` while the elevation layer
+ * drew `elevation_at()`, and the two are not the same surface -- at a river corner
+ * the blend of the surrounding cell sites sits some 22 m *above* that corner's own
+ * height, because each cell averages in its non-river corners. Against a metre or
+ * two of `river_depth_m` that put nearly half of every watercourse underneath the
+ * terrain the other layer drew. Anything measuring the ground under a river should
+ * come here rather than derive it again.
+ *
+ * ### Why the surface is sampled uncut
+ *
+ * Deliberately the four-argument `elevation_at()`, without `RiverChannels`, so the
+ * height returned is the ground at the channel's *rim* rather than at its bed. The
+ * water then fills the channel instead of lying as a trickle at the bottom of a
+ * gorge, and the guarantee comes out trivially: inside the channel the drawn ground
+ * is lower than this by the whole depth of the cut, and at the rim it is lower by
+ * the freeboard.
+ *
+ * ### Why the maximum over a footprint, and not the midpoint
+ *
+ * The renderer strokes one flat height across a whole segment, `river_width()` wide
+ * plus the overlap either side, so a single sample at the centre can sit under the
+ * ground somewhere else in that rectangle. Sampling the centreline and its two
+ * offsets caught most of it and still left the *corners* of the swept rectangle
+ * failing, which is where the ground is furthest from the point that was measured.
+ *
+ * So the probe is a grid over the whole footprint, widened by the same reach along
+ * the segment as across it, since `draw_line` rounds its ends past the endpoints.
+ * The surface is piecewise linear, so a grid this coarse over a rectangle a few
+ * metres on a side finds the maximum to well within the freeboard.
+ *
+ * @param graph The generated graph; supplies corners, cells and the surface.
+ * @param river The watercourse being drawn.
+ * @param segment Index of the segment, `[0, river.points.size() - 1)`.
+ * @param config Supplies the freeboard, the river widths and the vertical scale.
+ * @param detail The detail field, so the sheet follows a roughened surface too.
+ * @return The water surface height, clamped to `[0, 1]`.
+ */
+inline double river_surface_at(const MapGraph& graph, const MapRiver& river,
+                               std::size_t segment, const MapConfig& config,
+                               const TerrainDetail& detail) {
+    if (river.points.size() < 2 || river.corners.empty()
+        || segment + 1 >= river.points.size()) {
+        return 0.0;
+    }
+    const std::size_t spans = river.points.size() - 1;
+    const std::size_t slot =
+        std::min(river.corners.size() - 1, segment * river.corners.size() / spans);
+    const MapCorner& corner = graph.corners[static_cast<std::size_t>(river.corners[slot])];
+    if (corner.touches.empty()) {
+        return 0.0;
+    }
+    const MapCenter& center = graph.centers[static_cast<std::size_t>(corner.touches.front())];
+
+    const MapPoint& from = river.points[segment];
+    const MapPoint& to = river.points[segment + 1];
+
+    // Half the stroke, so the probe reaches the edge of what is actually drawn.
+    const double reach =
+        (river_width(config, corner.river)
+         + meters_to_grid(config, config.water_edge_overlap_m) * 2.0)
+        * 0.5;
+    const double dx = to.x - from.x;
+    const double dy = to.y - from.y;
+    const double length = std::sqrt(dx * dx + dy * dy);
+    // Unit vectors along the segment and across it, scaled to the reach. A zero
+    // length segment degenerates to a disc, which the across vector alone covers.
+    const double ax = length > 0.0 ? dx / length * reach : reach;
+    const double ay = length > 0.0 ? dy / length * reach : 0.0;
+    const double nx = length > 0.0 ? -dy / length * reach : 0.0;
+    const double ny = length > 0.0 ? dx / length * reach : reach;
+
+    double ground = 0.0;
+    for (int along = -1; along <= 1; ++along) {
+        // -1 and 1 step *past* the endpoints by the reach, because the stroke's
+        // ends are rounded and cover ground the segment itself does not.
+        const double base_x = (along < 0 ? from.x - ax : (along > 0 ? to.x + ax : (from.x + to.x) * 0.5));
+        const double base_y = (along < 0 ? from.y - ay : (along > 0 ? to.y + ay : (from.y + to.y) * 0.5));
+        for (int across = -1; across <= 1; ++across) {
+            const double x = base_x + nx * static_cast<double>(across);
+            const double y = base_y + ny * static_cast<double>(across);
+            ground = std::max(ground, graph.elevation_at(center, x, y, detail));
+        }
+    }
+
+    const double depth = config.river_depth_m
+                       + config.river_depth_per_volume_m * static_cast<double>(corner.river);
+    return std::clamp(ground + meters_to_height(config, depth), 0.0, 1.0);
+}
 
 } // namespace maps
 } // namespace coopa

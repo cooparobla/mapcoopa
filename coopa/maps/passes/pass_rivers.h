@@ -129,9 +129,9 @@ private:
         if (static_cast<int>(path.size()) < config.river_min_length) {
             return false;
         }
-        // A river has to end somewhere. `PassElevation::fill_depressions_` is
-        // what makes that true -- it leaves every land corner with a strictly
-        // descending path to water -- so this rejection should never fire, and
+        // A river has to end somewhere. `fill_depressions()` is what makes that
+        // true -- it leaves every land corner with a strictly descending path
+        // to water -- so this rejection should never fire, and
         // `execute()` logs it if it does. It stays because "always ends in a
         // water body" is a property of the output that a caller can rely on, and
         // a property enforced only by an invariant two passes away is one a
