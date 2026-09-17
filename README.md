@@ -53,6 +53,80 @@ first build:
 cmake --build build && ./build/mapcoopa --out=world
 ```
 
+### The GUI viewer
+
+`./build/mapcoopa_viewer` is the same generator behind a window: a collapsible panel of the
+settings that most change what a map looks like, a Refresh button, a picker for all nine
+layers, and a File menu that imports and exports `.yaml` and `.png`.
+
+```bash
+cbuild
+./build/mapcoopa_viewer
+```
+
+It starts from exactly the settings the CLI starts from — the same tool defaults, the same
+[`assets/config.yaml`](./assets/config.yaml) — so the same seed gives the same map in both.
+Editing a control changes nothing until you press **Refresh**; switching layers re-renders
+from the map already generated, without regenerating it. The settings sections scroll when
+more of them are open than fit; Refresh and the progress bar stay pinned below them. Hovering
+any setting shows what it does — the text comes from that field's own documentation in
+[`coopa/maps/map_config.h`](./coopa/maps/map_config.h), which stays the source of truth.
+
+The **Shape** and **Surface** dropdowns change which rows appear below them, so the panel only
+ever offers settings the current choice actually reads: a rectangle shows width and height and
+no landmass count, an archipelago shows all six of its knobs, and the blur controls appear only
+under the `blended` surface — the other two surfaces are sampling rules with no settings of
+their own. Roughness deliberately stays visible in every surface mode: it stops texturing the
+drawn ground under `flat` and `blended`, but still shapes river channels, water surfaces and
+cave floors.
+
+Over the map:
+
+| Input | Effect |
+|---|---|
+| Wheel | Zoom in and out around the cursor, up to 16x |
+| Middle-drag | Pan |
+| Ctrl + 0 | Reset to fit |
+
+Zoom is instant — it samples a window out of the texture already on screen — and once you
+stop, the preview re-renders at up to 4x resolution so the detail sharpens up. That costs a
+full re-render of the whole map: mapcoopa has no way to rasterise just a sub-region (its
+render slices are row bands, which clip rather than translate), so a 4x view renders sixteen
+times the pixels it displays. The preview is capped at 4096px for that reason, and the export
+size is never affected. What you see is rendered at a
+smaller preview resolution than `image_size` (a default map is 4800px square, which is
+seconds of rasterising); every export still uses the full configured size.
+
+It honours the scripted-capture environment variables every uicoopa demo does, so it can be
+driven without a human at the window:
+
+```bash
+SEED=251 MAX_FRAMES=400 SCREENSHOT_NAME=viewer ./build/mapcoopa_viewer   # writes output/viewer.png
+```
+
+| Variable | Effect |
+|---|---|
+| `SEED=N` | Start on a given seed instead of `config.yaml`'s or a random one |
+| `THEME=name` | A uicoopa theme from `libs/uicoopa/assets/themes` (`dark`, `light`) |
+| `MAX_FRAMES=N` | Exit after N frames |
+| `ONESHOT=1` | Render a single frame and exit |
+| `SCREENSHOT_NAME=x` | Write `output/x.png` on exit |
+| `LAYER=name` | Start on a given layer (`composite`, `biomes`, `elevation`, …) |
+| `ZOOM=n` | Start zoomed in n times |
+| `HOVER_ROW=label` | Park the pointer on a settings row, to capture its tooltip |
+| `SHAPE=name` | Select a shape (`rectangle`, `circle`, `triangle`, `continent`, `archipelago`) |
+| `SURFACE=name` | Select a surface (`interpolated`, `flat`, `blended`) |
+| `EXPAND_ALL=1` | Open every settings section, so the sidebar scrolls |
+| `COLLAPSE=1` | Start with the sidebar folded to its rail |
+| `OPEN_MENU=1` | Start with the File menu open |
+| `OPEN_PICKER=1` | Start with the file browser open |
+
+The viewer needs the sibling `libs/uicoopa` checkout (and, through it, gfxcoopa and a
+Vulkan driver). It is built by default when that is present and skipped with a status
+message when it is not; `-DMAPCOOPA_WITH_VIEWER=OFF` skips it explicitly. The library target
+`coopa::maps` is unaffected either way — it still depends on nothing but libcoopa, and a
+consumer that pulls this repo in via `add_subdirectory()` never sees the viewer at all.
+
 ### Options
 
 | Flag | Default | Effect |
@@ -67,6 +141,10 @@ cmake --build build && ./build/mapcoopa --out=world
 | `--regions=N` | 3 | Provinces per nation |
 | `--no-regions` | — | Skip political geography entirely |
 | `--no-landmarks` | — | Skip notable places |
+| `--caves=N` | 18 | Cave systems to open, on the map's steepest slopes |
+| `--cave-depth=M` | 260 | Hard cap on how far below its mouth a system may reach, in metres |
+| `--cave-grade=F` | 0.25 | Steepness a slope needs to bear a cave; rise over run. A floor beneath a ranking — mouths land far above it |
+| `--no-caves` | — | Skip caves entirely |
 | `--no-roads` | — | Skip the road network |
 | `--no-subdivide` | — | Straight cell boundaries instead of wobbled ones |
 | `--out=PATH` | `map_out` | Output prefix |
@@ -175,7 +253,7 @@ To load the same settings from C++, `coopa::maps::load_config()` in
 
 Each run writes one PNG per layer rather than a single composited image, so a consumer can
 take the height field without the roads drawn over it, or the road network without the
-terrain under it. All eight register pixel for pixel.
+terrain under it. Every one of them registers pixel for pixel.
 
 | File | Format | Contents |
 |---|---|---|
@@ -183,13 +261,123 @@ terrain under it. All eight register pixel for pixel.
 | `_water.png` | RGB | Water-surface height, **on the same scale as `_elevation.png`**. Flat per body: the sea at `sea_level`, each lake at one height across all its cells, rivers at the ground height plus a depth. Dry land is black. See **Meshing the two together** for exactly where the water is guaranteed to sit above the terrain. |
 | `_biomes.png` | RGB | Flat terrain colour, no overlays. |
 | `_roads.png` | RGBA | The road network by class, transparent elsewhere. |
-| `_structures.png` | RGBA | Building footprints as rotated quads, transparent elsewhere. |
+| `_structures.png` | RGBA | A settlement entire: its market square, the streets its buildings front, and the footprints as rotated quads with the civic core picked out. Transparent elsewhere. |
 | `_landmarks.png` | RGBA | Settlement and landmark markers, transparent elsewhere. |
 | `_regions.png` | RGB | Provinces in flat colour, and nothing over them — the political counterpart of the biome layer, registering with it pixel for pixel. Every pixel is exactly one region's colour or exactly the background, so a consumer can recover which region covers a pixel; countries are not drawn. |
-| `_composite.png` | RGB | All of it: biome colour lit from the elevation field, then water, roads, buildings and markers. See **Shading** below. |
+| `_composite.png` | RGB | All of it: biome colour lit from the elevation field, then water, roads, buildings and markers — including a ring at each cave mouth, which is the only part of a cave that shows here. See **Shading** below. |
+| `_caves.png` | RGB | The readable overview: every system over heavily dimmed terrain, coloured by depth, chambers at their real size and a ring at each mouth. The passages are **not** in the composite — they are underground. See **Caves**. |
 
 The three overlay layers carry real transparency, so they stack over the terrain in any
 image editor and reproduce the composite's arrangement.
+
+### Caves
+
+Caves are the one feature that exists *below* the map rather than on it, and that shapes
+everything about how they are stored.
+
+**Where they open.** On the map's steepest ground, which in a Voronoi map is an edge with a
+big height difference across it — already the thing that sits *between* two cells. Every
+land edge is ranked by `edge_grade()`, rise over run in real metres, and the steepest are
+taken subject to a spacing rule. `--cave-grade` is a floor beneath that ranking, not the
+selection itself: at the default a map has thousands of qualifying edges and the eighteen
+that get mouths are far steeper than the threshold.
+
+**What shape they grow into.** Two regimes, which is what limestone actually does:
+
+| | Above the water table | At and below it |
+|---|---|---|
+| Water is | falling under gravity | moving sideways through saturated rock |
+| Passage | steep, narrow | level, wide |
+| Branching | rare (`branch_chance_vadose`) | common (`branch_chance_phreatic`) |
+| Also | occasional vertical pitch | chambers, maze |
+
+So a system reads as an entrance series leading into a level network, and every knob means
+something physical rather than being a tuning number. The water table is a *subdued replica
+of the surface* — `vadose_share` of the relief between the mouth and the sea — not a flat
+sheet at sea level, because rain falls on the hill and drains toward the valleys either
+side. Measured against sea level alone, a cave 400 m up needs 250 m of descent before it can
+level out, further than its length budget reaches, and the phreatic half never appears on a
+map at all.
+
+**They never break the surface**, and that is a guarantee rather than a tendency. Every
+station is clamped to `roof_clearance_m` beneath the ground, and the clamp is applied
+**twice** — once as the station is grown and again on every point of the smoothed passage,
+because corner-cutting moves points and the smoothed path is the one that is drawn and
+exported. `test_caves_stay_under_the_terrain` fails on the smoothed points alone if the
+second clamp is removed.
+
+The surface it clamps against is the one `elevation_at()` returns *with* terrain detail and
+river channels applied, not the control mesh. `river_channel_depth_m` alone cuts 18 m out of
+the drawn surface, so a cave given 25 m of clearance against the mesh has 7 m of rock over it
+where it crosses under a river — and less than none at a higher `--channel`.
+
+> **The guarantee is against `elevation_at()`, not against `_elevation.png`.** Those are not
+> quite the same surface, and the difference is the renderer's rather than the caves'.
+> `elevation_at()` takes a cell as a hint and falls back to inverse-distance over that cell's
+> corners for a point outside every triangle incident to it, so two cells can answer
+> differently for one position; the layer draws a pixel with whichever cell's *subdivided*
+> outline contains it, and a wobbled outline bulges past the straight Voronoi boundary. With
+> caves disabled entirely, **5.7% of drawn land pixels already differ from `elevation_at()`
+> by more than 25 m**, up to 212 m at the worst. The pass takes the lowest reading of the
+> nearest cell and its neighbours, which is what makes the clamp hold against whichever of
+> them the renderer picks; a few pixels per map still land on the wrong side of that when a
+> stroke's rounded cap reaches between two clamped stations. Compare a cave floor against
+> `elevation_at()` if you need the real answer — which is what the repository already tells
+> you to do for a heightfield, since the PNG is a lossy 8-bit debugging aid.
+
+**Why a system has storeys.** A water table is not fixed. The valley a cave drains to cuts
+down over time and the table follows it, which abandons the network standing at the old level
+— leaving it as dry passage — and starts a new one below. `level_spacing_m` is the drop
+between one stage and the next, and how many stages a system gets is derived from the relief
+beneath its mouth rather than configured: a mouth high in the hills has the height to spend
+on three or four, one near the coast on one. Each storey is joined to the next by the same
+vadose descent that cuts the entrance series, so a shaft between levels is not a special case
+in the model.
+
+That spacing has one hard constraint, and it is against `chamber_height_m` rather than
+against anything on the surface: two tables closer together than the tallest space cut at
+either of them produce storeys that touch where they cross, and two surfaces sharing a place
+really are one void, so the export merges them back into the single sheet the storeys existed
+to break up.
+
+**Caves are not rastered, and the saved map is why.** Every other feature of this generator
+is a surface, and a surface is what a PNG is good at. A cave is not: it is a branching network
+of passages at several depths, and squeezing one into a stack of heightmaps means flattening
+it *and* quantising it. The generator did ship a `cave_floor_N` / `cave_roof_N` pair per
+storey for a while, and measuring it settled the question:
+
+| | the PNG pairs | the same caves in `.yaml` |
+|---|---|---|
+| Size | **6.9 MB** across 10 files | **873 KB** |
+| Fidelity | 8-bit — 2.34 m per grey level at the default 600 m range, so an 8 m passage is 3 levels | full float floor, roof and radius per point, plus zone, feature and storey |
+| Export cost | 0.57 s of a 6.62 s run | already written |
+
+Most of those megabytes were compressed black — a layer with three lit pixels still cost
+670 KB. So the pairs are gone. `PATH.yaml` carries every system entire: each station with its
+position, floor, roof, radius, cell, zone, feature and storey, and each passage with the
+smoothed polyline that gets drawn, all at full precision. Read that if you want cave geometry;
+read `_caves.png` if you want to look at it.
+
+What the composite gets is the one part of a cave that is genuinely on the surface: a ring at
+each mouth, in `cave_mouth_color`, distinct from the filled squares that mark towns and the
+diamonds that mark natural landmarks. Passages stay off it, and
+`test_only_cave_mouths_reach_the_surface_layers` checks that every pixel the caves change on
+the composite lies within a mouth marker's radius.
+
+Per-cave identity is not lost — `save_map()` writes every station, zone, feature and
+smoothed passage exactly. The rasters answer "what is under this pixel"; the YAML answers
+"give me cave 7". Keying the files by cave would answer the first question with the second
+question's key.
+
+| Knob | Default | Effect |
+|---|---|---|
+| `cave_count` | **18** | Systems to open, clamped to the qualifying slopes available |
+| `min_grade` | **0.25** | Rise over run a slope needs; a floor beneath the ranking |
+| `roof_clearance_m` | **25** | Rock left above every ceiling — the invariant's margin |
+| `passage_height_m` | **8** | Floor to ceiling. Worth choosing against `elevation_range_m`: the exported layers are 8-bit on the elevation scale, so over 600 m one grey level is 2.34 m and this is three levels of separation. Over a 256 m world it is 1 m per level and the same passage is eight |
+| `vadose_share` | **0.6** | Share of the relief below a mouth that is entrance series; where the water table goes |
+| `descent_grade` | **0.15** | How steeply the entrance series falls |
+| `massif_bias` | **0.6** | How hard a passage steers toward thicker rock when the rock ahead thins. At 0 a head wanders out from under its own hill in a few hundred metres and has to stop, and every system comes out a stub |
 
 ### Shading
 
@@ -252,7 +440,8 @@ MapTask task = exporter.export_layers_async(graph, config, "world");
 
 ### What it costs, and what it buys
 
-Measured on 20 cores at the default 4.8 km world, 4800 × 4800, seven layers:
+Measured on 20 cores at the default 4.8 km world, 4800 × 4800, before the cave layers
+existed (seven layers):
 
 | | generate | export | yaml | total |
 |---|---|---|---|---|
@@ -355,7 +544,7 @@ Build a terrain mesh from `_elevation.png` and a water mesh from `_water.png` at
 vertical scale, and this is what holds:
 
 - **Rivers: the water is above the terrain, everywhere, by construction.** The surface
-  comes from `river_surface_at()` ([`map_data.h`](./coopa/maps/map_data.h)), which measures
+  comes from `make_river_surfaces()` ([`map_data.h`](./coopa/maps/map_data.h)), which measures
   the ground with the *same* call the elevation layer draws with — `elevation_at()` — and
   takes the highest point over the whole footprint of the stroke before adding
   `river_depth_m`.
@@ -380,6 +569,53 @@ vertical scale, and this is what holds:
   every vertex the sampler can reach is under water and so is the blend — zero violations
   measured across five maps. Elsewhere, **clip the water to where the terrain is below it**,
   which is how water is normally drawn in any case.
+
+### River mouths
+
+A river's surface used to fall smoothly along its course and then meet the sea at a step:
+measured, the median mouth ended **10.9 m above the sea it ran into** and the worst **100.8 m**.
+Two other things were wrong with it at the same time — **48 of 55 rivers rose somewhere
+downstream**, because the highest ground under the stroke set the height and a bank beside the
+course lifted the sheet over it, and rivers meeting at a confluence disagreed by up to **30.8 m**.
+
+All three are properties of a *course*, not of a segment, so the surface is now computed for
+the whole network at once by `make_river_surfaces()`. It only ever falls, it agrees exactly
+wherever two rivers meet, and it arrives at the waterline.
+
+Arriving needed the terrain to move. The ground at a mouth stands **9 to 70 m above sea
+level** depending on the map, so a sheet drawn at sea level would lie under the terrain and a
+sheet above the terrain ends on a lip — there is no third option without lowering the ground.
+Over the last `river_mouth_blend_m` the channel therefore becomes an **estuary**: it deepens
+until its bed reaches the water it empties into, and widens with a *flat* bed. Flat matters —
+a wider parabola does not help, because at 94% of its radius a parabolic bed has already risen
+back to within 11% of the rim, leaving the edges of the ribbon resting on the bank.
+
+| Knob | Default | Effect |
+|---|---|---|
+| `river_mouth_blend_m` | **250** | How far upstream the estuary opens; about four cells. |
+
+**A river ends at or above the water it feeds, never below it.** That needed the carve to stop
+at the waterline rather than past it: taking the deeper of the ordinary channel and the depth
+needed to reach the sea meant a mouth wanting 2 m of cut got 22 m, and the sheet resting on
+that bed finished a clear 20 m *under* the sea — the dark notch where a river met a body. The
+bed is now cut to exactly one freeboard below the target, so the sheet sits on it at the
+target with a river's own depth of clearance.
+
+The surface falls everywhere except the last stretch into a body standing **above** it, where
+it rises to meet it. That is a drowned inlet, and it is bounded twice: only within
+`river_mouth_blend_m`, and never above the body's own level.
+
+Measured before and after, on the same map: ocean mouths **median +10.9 m → +0.0 m**, worst
+overshoot **+100.8 m → +9.5 m**, and none now below sea level (they were at a median of
+−13.3 m partway through this work); lake mouths land **exactly** on the lake; rivers rising
+outside the mouth blend **48 / 55 → 0**; confluence disagreement **worst 30.8 m → 0.00 m**.
+
+> **A caveat about lakes, which this exposed rather than caused.** A lake's `water_level` is
+> the *highest bed* in its body, which puts its surface above the land around it — measured on
+> one map, the three lakes stand 204 m, 236 m and 214 m above the lowest dry ground on their
+> own shores, and **100%, 80% and 96%** of their shore cells sit below their surface. A river
+> now rises to meet that level, so the join is seamless, but the level itself is not one water
+> would hold. Fixing it means changing how a lake's extent is decided, not how a river ends.
 
 ### River valleys
 
@@ -449,6 +685,56 @@ Moving the ground owes the map its drainage back — carving digs pits where a v
 grades into ground with no outlet, the waterline clamp flattens river mouths into ties, and
 `downslope` was read off a field that no longer exists. Without it, 42% of rivers would
 start ending in the middle of a field again.
+
+## Settlements
+
+A settlement is a cluster of cells, not a point: seven for a capital, three for a town, one
+for a village. Inside them, three things give it structure.
+
+**Streets.** The roads and rivers bordering each claimed cell become lanes running from the
+cell's site out to those edges; a cell with neither gets fallback lanes toward its farthest
+corners. Buildings are placed in pairs flanking each lane, then the remaining budget is spent
+on interior infill.
+
+These were private to the town pass for a long time — real enough to place plots against, and
+invisible to everyone else. Buildings lined up along something nobody could see, so a
+settlement read as a scatter of identical specks however carefully it had been arranged. They
+are now `MapTown::streets`: drawn on the structures layer, written to the map file, and
+available to a consumer laying cobbles.
+
+**Alignment.** Interior infill takes the bearing of the street nearest it rather than a yaw
+drawn uniformly from a full turn. Measured, that moved the fraction of buildings fronting a
+street from **51% to 83%** — a row is only legible if its neighbours agree with it. Positions
+stay jittered, so the layout never becomes a lattice.
+
+**Clearance.** Buildings are kept off the carriageway: every candidate is tested against the
+settlement's streets and against the `MapRoad` polylines passing through its cells, each at
+half its own width plus `street_clearance_m`. Frontage plots are also set back by their *own*
+rotated size rather than a flat distance — at 8 m of `street_offset_m` a 14 m plot reached to
+1 m from the centreline of a 4 m lane, so the largest buildings were laid onto the street by
+construction. Before this, **37% of buildings stood on a lane and 18% on a road**; both are
+now zero.
+
+The test is against the whole footprint, not its corners: a corner test misses a street
+crossing the middle of a large plot, and misses a short road segment lying wholly inside one.
+A corridor is a rotated box, so it goes through the same separating-axis routine two
+buildings use.
+
+**A square, and roles.** A settlement claiming at least `plaza_min_cells` gets a `MapPlaza` at
+its primary site — a disc, trimmed to fit the cell and skipped when there is no room — which
+the packer keeps clear. The buildings nearest it take civic roles from one roster shared by
+every tier (`well, hall, market, smithy, temple, inn, granary, barracks, warehouse`), so a
+town is a prefix of a capital rather than a different kind of place. Everything else is a
+`Dwelling`. `BuildingRole` names are append-only, like `Biome`'s: they are the on-disk
+identity of every building in every saved map.
+
+| Knob | Default | Effect |
+|---|---|---|
+| `plaza_radius_m` | **26** | Radius of the market square, trimmed to fit the cell. |
+| `plaza_min_cells` | **2** | Claimed cells needed before a settlement gets one, so a village has none. |
+| `capital_civic_count` / `town_civic_count` / `village_civic_count` | **7 / 4 / 2** | How far down the roster each tier goes. |
+| `street_width_m` | **4** | Width a street is drawn at; a lane, narrower than the trail reaching the settlement. |
+| `street_clearance_m` | **1.5** | Clear ground between a building and any roadway, added to half its width. |
 
 ## Landmass shape
 
@@ -524,6 +810,43 @@ canvas: one continent as wide as fits, or an archipelago's worth spread across i
 it trades separation for scale — three large landmasses will fuse into a horseshoe
 continent around an inland sea, which is often what you want.
 
+## Climate
+
+Temperature is a latitude band, minus an altitude lapse rate, plus a noise field, plus a
+global offset — and it is the first axis `classify_biome()` branches on, so it decides more
+about what a map looks like than anything except the coastline.
+
+| Knob | Default | Effect |
+|---|---|---|
+| `temperature_offset` | **0** | Shifts the whole world warmer or colder. **0 changes nothing.** `--temperature=F` |
+| `polar_extent_north` | **0.065** | Frozen fraction of the map at the `y = 0` edge, 0 to 0.5. `--polar-north=F` |
+| `polar_extent_south` | **0.065** | The same at the far edge. `--polar=F` sets both. |
+| `temperature_falloff` | **1.7** | Shapes the curve *between* the cap and the equator. |
+| `temperature_lapse_rate` | **0.40** | How much a full unit of height cools the air. |
+
+**A polar extent of 0 means no ice cap on that side**, and no value of `temperature_falloff`
+could ever express that — an exponent shapes how fast the cold arrives, never whether it
+arrives at all. The caps used to be emergent: at a falloff of 1.7 the ground froze beyond
+87% of the way to the pole, the outer 6.5% of the map, and nothing in the configuration said
+6.5%. Now they are stated, one per pole, anchored to the freezing threshold so the number
+means the fraction that actually classifies as frozen.
+
+The two poles are independent, so a world can carry an ice cap at one end and none at the
+other. With an extent of 0 the curve spans freezing to equatorial across the whole
+hemisphere, so *latitude* alone never selects ice, glacier or cold desert — altitude still
+can, which is what should happen to a mountain.
+
+```bash
+cplay --polar=0              # no ice caps anywhere
+cplay --polar=0.25           # a quarter of the map frozen at each end
+cplay --polar-north=0.3 --polar-south=0   # ice at the top only
+cplay --temperature=-0.25    # ice age
+cplay --temperature=0.25     # hothouse
+```
+
+Measured on a 48-cell map: ice cells go 9 → 0 at `--polar=0` and 9 → 105 at `--polar=0.25`;
+mean temperature runs 0.238 / 0.433 / 0.664 across `--temperature=-0.25 / 0 / 0.25`.
+
 ## Terrain
 
 Height is breadth-first **distance from the coast**, which is what keeps coastlines at sea
@@ -540,9 +863,144 @@ Three knobs, at three scales:
   water, so rivers still run off the land into the sea. **0 restores the pure distance
   field** — what Amit Patel's original produced.
 - **`elevation_smoothing_iterations`** relaxes the height field — how smooth the *landform*
-  is.
+  is. **Not how smooth the render looks:** setting it to 0 does not produce facets, because
+  the drawn surface is interpolated between the stored values whatever it says. Two things
+  smooth the picture regardless — a cell is always the *mean* of its corners (which span
+  ~70 m), and `elevation_at()` interpolates between cell sites, so at 1 px/m a 60 m cell
+  spans 60 px and a step between two cells is spread over all of them. Measured on one map,
+  0.2% of adjacent pixels differ by 3+ grey at 4800 px against 8.6% at 900 px, from identical
+  data. Use `elevation_surface` below for hard edges.
 - **`terrain_roughness`** (0 to 1, default 0) displaces the *sampled surface* with a much
   finer detail field — how rough the skin over it is. `--roughness=F`.
+
+### Elevation surface
+
+`elevation_surface` decides how the height field is drawn **between** the cells it is stored
+at — which is what actually governs how smooth a map looks.
+
+| Mode | Effect |
+|---|---|
+| `interpolated` *(default)* | Barycentric over the Delaunay triangle: the piecewise-linear surface through the cell sites, and what a terrain mesh built from this data would be. Continuous by construction. |
+| `flat` | One height per cell, hard edge at every boundary — `MapCenter::elevation` drawn flat, the stored field with nothing interpolated over it. |
+| `blended` | `flat`, then **blurred**. The cells are drawn flat and the finished raster is smoothed by a box blur `elevation_blend` cells across, with the river channels cut back in afterwards. A pass over the image, not a sampling rule. |
+
+```bash
+cplay --surface=flat
+cplay --surface=blended --blend=0.5
+cplay --surface=blended --blend=0.5 --blend-variation=0.8
+```
+
+`elevation_blend` (default **0.5**) is that blur's radius as a fraction of a cell, so one
+number means the same thing at 512 px as at 4800. **0 is byte-identical to `flat`** — there is
+no blur to run. 1 is the ceiling, past which the blur is wider than the tessellation and starts
+erasing the landforms along with the facets. It does not converge on `interpolated` at the top
+end and is not meant to: this is a smoothed *picture* of the stored field, where `interpolated`
+is a different surface through the same points.
+
+Three stages, and the order is what makes the rivers work: the cells are drawn flat and
+**uncut**, the whole raster is blurred, and the channels are cut in afterwards. Blurring a
+raster that already carried them costs a river nearly half its contrast — 15.0 grey levels down
+to 8.0, because a channel a few pixels wide is exactly the feature a half-cell blur destroys —
+and cutting again on top of that would subtract each river twice.
+
+99th-percentile adjacent-pixel step across the sweep, which is the edge hardness: **34 → 12 → 8
+→ 6** grey levels for blend 0 / 0.25 / 0.5 / 1, at 512 px. The *worst* step stays near 75 at
+every setting, and that is the point — it is a river bank, re-cut after the blur. Turn the
+channels off and the same render's worst step is 12.
+
+### Varying the blur, per cell
+
+One radius smooths everywhere equally, which is the one thing real ground never does.
+`elevation_blend_variation` (default **0.0**) gives **every cell its own radius**, drawn from
+`noise_blend` at that cell's site — so one cell keeps hard edges while the cell beside it is
+fully smoothed.
+
+The factor is `1 + variation × n` for a field value `n` in `[-1, 1]`, so it is **symmetric
+about `elevation_blend`**: the average radius stays where you put it and turning this up makes
+a map *more varied* rather than uniformly softer or sharper. At 0 the field is never consulted
+at all — change its seed or frequency and the render does not move by a byte.
+
+#### Distributing the soft and hard cells
+
+`noise_blend.frequency` is the second knob, and here it means something unusually concrete.
+Sites sit one grid unit apart and a grid unit *is* a cell, so the field's wavelength
+`1 / frequency` is the patch size in cells. Measured as the correlation between the factors of
+two cells that share an edge:
+
+| `frequency` | wavelength | neighbour correlation | reads as |
+|---|---|---|---|
+| `0.5` *(default)* | 2 cells | −0.01 | every cell independent |
+| `0.33` | 3 cells | 0.14 | mostly independent |
+| `0.25` | 4 cells | 0.35 | loose clumps |
+| `0.2` | 5 cells | 0.51 | clear patches |
+| `0.125` | 8 cells | 0.78 | broad regions |
+| `0.045` | 22 cells | **0.97** | no visible variation |
+
+Note the knee: at or above `0.5` the field is already fully decorrelated, so raising it
+further buys nothing. The useful range is `0.5` down to `0.125`.
+
+That last row is where this started. The first version ran the field at `0.045` on the theory
+that smoothness should vary the way bedrock hardness does — a defensible idea that produced
+nothing anyone could see, because at a correlation of 0.97 every cell in any neighbourhood
+gets the same factor and the map comes out uniformly blurred. **What varies has to vary at the
+scale of the thing it varies.**
+
+The field uses **one** octave rather than the usual five. Octaves above the first sit below
+cell size, so point-sampling one value per cell picks up near-white noise from them whatever
+the base frequency says; and FBm's gain leaves the base octave only about two thirds of the
+amplitude. Dropping the rest widens the effect measurably — the spread of per-cell edge
+sharpness goes 0.213 → 0.294, and adjacent cells land on opposite sides of the uniform blur
+half again as often (2.3% of shared edges → 3.5%).
+
+It is not rescaled by `grid_size`, unlike `noise_island`: a patch measured in cells should be
+that many cells on any map.
+
+#### How it is built
+
+A three-level pyramid — the untouched raster, a blur at the base radius, and a blur at twice
+it — with a per-cell factor choosing where between them each pixel lands. A box blur whose
+radius genuinely changed per pixel is not one filter but a different one at every pixel, and
+neighbouring pixels drawing from differently-sized boxes have no reason to agree; three
+globally consistent blurs and a feathered weight cannot seam by construction. Three levels
+rather than two so the variation can fall either side of the base radius.
+
+The factor is drawn one flat value per cell through the same polygon rasteriser the layer
+itself uses, then feathered by the **blur radius** — that is the width over which
+`blurred − sharp` is non-trivial near an edge, so it is exactly how far the weight must travel
+to hide its own step, capped at a quarter cell so a large `elevation_blend` cannot feather a
+whole cell and homogenise neighbours. Sizing the feather against the cell instead was a real
+defect: at 3000 px with `elevation_blend = 0.1` it gave a 7 px feather against a 3 px blur and
+averaged the whole effect away.
+
+Cost: the elevation layer goes **1.20 s → 2.35 s** at 4800 px, and nothing at all at
+variation 0.
+
+**The variation scales `elevation_blend`, so a small blend leaves little to vary.** At
+`elevation_blend = 0.1` the radius is 3–4 px on a 60 px cell, and the difference between
+neighbouring cells is correspondingly slight. Raise the blend to see the effect.
+
+An earlier version blended each cell toward the interpolated surface near its own rim, keeping
+the core flat. That is not a smoothing pass and it does not work at any setting: every cell
+independently ramps its own edge, so the map comes out a field of bevelled tiles with a soft
+halo tracing every Voronoi outline — reading *more* tessellated than the hard edges it was
+meant to hide. A blend is a property of the image, not of a cell.
+
+Note this is **not** `elevation_smoothing_iterations`. Those relax the heights the graph
+*stores*; this changes only how the drawn surface gets from one stored height to the next, and
+nothing downstream of the renderer can tell it was set.
+
+It affects the elevation layer and the composite's elevation shading, and so hillshade too,
+which is derived from that raster.
+
+**Rivers show in `flat` as well.** The channel cut is a function of position, not of the
+interpolation, so it subtracts from a flat cell as readily as from a gradient — measured,
+**11.6 grey levels** of contrast half a cell from a centreline against **12.3** interpolated,
+and against a uniform cell they arguably read better. River *valleys* are there too, carved
+into the cell heights themselves, as stepped cells rather than a smooth trough.
+
+The one thing `flat` drops is `terrain_roughness`, deliberately: that is surface *texture*,
+which a fill constant across a cell has no business carrying, where a river is a feature of
+the ground.
 
 Blended rather than multiplied, incidentally, because scaling the distance field by noise
 cannot reorder it: distances span tens of units and a noise factor spans one, so the ridge
@@ -655,6 +1113,10 @@ Drawn over the filled cells, in this order — each layer covers the one beneath
 | ![](assets/svg/settlement.svg) | Settlement | `#782828` | 120, 40, 40 | Square marker; 25 m capital, 17 m town, 11 m village |
 | ![](assets/svg/landmark-natural.svg) | Natural landmark | `#283C82` | 40, 60, 130 | Diamond; 21 m for a region's wonder, 13 m otherwise |
 | ![](assets/svg/landmark-built.svg) | Built landmark | `#5A3C82` | 90, 60, 130 | Square, 13 m |
+| ![](assets/svg/cave-shallow.svg) | Cave, shallow | `#ECC478` | 236, 196, 120 | One end of the cave overview's depth ramp |
+| ![](assets/svg/cave-deep.svg) | Cave, deep | `#56489C` | 86, 72, 156 | The other end. Stretched over the range of cave floors *on that map*, so two systems are comparable |
+| ![](assets/svg/cave-chamber.svg) | Cave chamber | `#D28C60` | 210, 140, 96 | Where passages meet or a run ends |
+| ![](assets/svg/cave-mouth.svg) | Cave mouth | `#E6E6EC` | 230, 230, 236 | Ring on the slope a system opens on |
 | ![](assets/svg/background.svg) | Background | `#FFFFFF` | 255, 255, 255 | Whatever no cell covers |
 
 The three road tiers are told apart by **width** first and colour second, which is how a

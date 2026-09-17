@@ -42,29 +42,31 @@ coastline.
           │ builds, then annotates in place
           ▼
    ┌───────────────────────────────────────────────┐        ┌───────────────────┐
-   │                 MapGraph                       │        │      passes/       │
-   │                                                │◄───────│                    │
-   │  centers[]  cells (biome, elevation, water)    │        │  1 water           │
-   │  corners[]  Voronoi verts  (rivers, downslope) │        │  2 coast           │
-   │  edges[]    Delaunay + Voronoi edge, shared    │        │  3 elevation       │
-   │  roads[]    routed runs, graded by traffic     │        │  4 temperature     │
-   │  rivers[]   smoothed watercourses              │        │  5 rivers          │
-   │  towns[]    settlements + packed buildings     │        │  6 moisture        │
-   │  regions[]  provinces, countries[] nations     │        │  7 biomes          │
-   │  landmarks[] notable places                    │        │  8 roads           │
-   │                                                │        │  9 regions         │
-   │  all adjacency by index, never by pointer      │        │ 10 towns           │
-   └──────┬───────────────────────────┬────────────┘        │ 11 landmarks       │
-          │                            │                     │ 12 noisy edges     │
-          ▼                            ▼                     └───────────────────┘
+   │                 MapGraph                      │        │      passes/      │
+   │                                               │◄───────│                   │
+   │  centers[]  cells (biome, elevation, water)   │        │  1 water          │
+   │  corners[]  Voronoi verts  (rivers, downslope)│        │  2 coast          │
+   │  edges[]    Delaunay + Voronoi edge, shared   │        │  3 elevation      │
+   │  roads[]    routed runs, graded by traffic    │        │  4 temperature    │
+   │  rivers[]   smoothed watercourses             │        │  5 rivers         │
+   │  towns[]    settlements + packed buildings    │        │  6 valleys        │
+   │  regions[]  provinces, countries[] nations    │        │  7 moisture       │
+   │  landmarks[] notable places                   │        │  8 biomes         │
+   │  caves[]    systems, floor and roof per node  │        │  9 roads          │
+   │                                               │        │ 10 regions        │
+   │  all adjacency by index, never by pointer     │        │ 11 towns          │
+   └──────┬───────────────────────────┬────────────┘        │ 12 landmarks      │
+          │                           │                     │ 13 caves          │
+          │                           │                     │ 14 noisy edges    │
+          ▼                           ▼                     └───────────────────┘
    ┌─────────────────┐        ┌─────────────────┐
-   │  map_renderer.h  │        │   map_yaml.h     │
-   │  MapLayers       │        │  save_map()      │
-   │  7 image layers  │        │  load_map()      │
+   │  map_renderer.h │        │   map_yaml.h    │
+   │  MapLayers      │        │  save_map()     │
+   │ 13 image layers │        │  load_map()     │
    └────────┬────────┘        └─────────────────┘
             ▼
    ┌─────────────────┐
-   │ image_writer.h   │  ──►  7 .png layers
+   │ image_writer.h  │  ──►  13 .png layers
    └─────────────────┘
 ```
 
@@ -100,6 +102,12 @@ do not; regions get a dialect of their country's. `language_for()` and `dialect_
 rebuild a language from an id, so any pass can name a place in the right voice without a
 language being passed around or serialised.
 
+### [`cave.h`](./cave.h)
+`CaveZone` (`Vadose` / `Phreatic`) and `CaveFeature` (`Passage`, `Chamber`, `Shaft`, `Sump`),
+with their stable `snake_case` names, exactly as `building.h` carries the building roles. The
+zone is *recorded* rather than inferred from the floor height, because which regime cut a
+passage depends on where that system's mouth opened and on nothing about the passage in hand.
+
 ### [`landmark.h`](./landmark.h)
 `LandmarkKind`, its names, the descriptive noun each takes, and `landmark_suits_biome()` —
 the gate that stops a volcano appearing on ice or an oasis outside a desert.
@@ -110,7 +118,7 @@ alongside the graph that owns them.
 
 ### [`map_data.h`](./map_data.h)
 `MapPoint`, `MapCenter`, `MapCorner`, `MapEdge`, `MapTown`, `MapBuilding`, `MapRegion`,
-`MapCountry`, `MapLandmark` and the `MapGraph` that owns them, plus the geometry a
+`MapCountry`, `MapLandmark`, `MapCave` and the `MapGraph` that owns them, plus the geometry a
 consumer needs to place them:
 `building_corners()` gives a footprint's four rotated corners — the authoritative shape,
 since containment and non-overlap are guaranteed against those rather than an
@@ -131,15 +139,24 @@ a fresh one per corner.
 the enabled passes in order. Exposes the finished graph through `graph()`.
 
 ### [`passes/`](./passes/)
-The nine annotation stages, one header each. See [`passes/README.md`](./passes/README.md).
+The fourteen annotation stages, one header each. See [`passes/README.md`](./passes/README.md).
 
 ### [`image.h`](./image.h) and [`image_writer.h`](./image_writer.h)
 `Image` (an 8-bit interleaved buffer, not a texture — mapcoopa carries no graphics
 dependency) plus half-space triangle fill, convex polygon fan fill and Bresenham strokes.
 ### [`map_renderer.h`](./map_renderer.h)
-`MapLayers` renders any of eight views of a map — elevation, water surface, biomes, roads,
-structures, landmarks, regions, and a lit composite of all of them. The three overlay layers
-are RGBA on transparency so they stack; the rest are RGB. Every layer is drawn at the same
+`MapLayers` renders nine views of a map — elevation, water surface, biomes, roads,
+structures, landmarks, regions, a lit composite of all of them, and a readable cave overview.
+Cave *geometry* is deliberately not among them and is not rastered at all: a branching network
+at several depths does not fit a stack of heightmaps without being both flattened and
+quantised, and the saved map already carries every station and passage at full precision, so
+the picture would be a lossy and much larger copy of the document. See the
+[repository README](../../README.md#caves) for the measurements that settled it.
+
+What the composite does carry is a ring at each cave mouth, drawn by `draw_markers_()`
+alongside the town and landmark markers so the composite and the landmarks overlay cannot
+disagree about it. A passage is underground; a mouth is a hole in a hillside. The three overlay layers are RGBA on transparency so they stack; the rest
+are RGB. Every layer is drawn at the same
 scale, so at the default one pixel per metre a width measured off a render is a
 measurement of the ground. See the [repository README](../../README.md#layers) for the file
 list and the colour legend.
@@ -205,7 +222,7 @@ the operation has already run inline by the time a task exists, so there is one 
 call pattern either way.
 
 ### [`map_export.h`](./map_export.h)
-`MapExporter` — renders all seven layers and writes them, in parallel. Its own header rather
+`MapExporter` — renders all thirteen layers and writes them, in parallel. Its own header rather
 than more of `map_renderer.h` because exporting needs `image_writer.h`, which carries the
 stb *implementation*; a consumer rendering a layer into a texture should not have to link an
 encoder.

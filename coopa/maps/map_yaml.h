@@ -70,6 +70,38 @@ inline std::vector<IdType> read_id_sequence(const fkyaml::node& parent, const ch
     return ids;
 }
 
+/**
+ * @brief Builds a YAML sequence node from a list of doubles.
+ *
+ * The scalar counterpart of `point_sequence()`, for the per-point arrays a cave
+ * passage carries alongside its centreline.
+ */
+inline fkyaml::node scalar_sequence(const std::vector<double>& values) {
+    std::vector<fkyaml::node> nodes;
+    nodes.reserve(values.size());
+    for (const double value : values) {
+        nodes.push_back(fkyaml::node(value));
+    }
+    return fkyaml::node::sequence(std::move(nodes));
+}
+
+/** @brief Reads a YAML sequence of numbers back into a list of doubles. */
+inline std::vector<double> read_scalar_sequence(const fkyaml::node& parent, const char* key) {
+    std::vector<double> values;
+    if (!parent.contains(key)) {
+        return values;
+    }
+    const fkyaml::node& sequence = parent.at(key);
+    if (!sequence.is_sequence()) {
+        return values;
+    }
+    values.reserve(sequence.size());
+    for (const fkyaml::node& item : sequence) {
+        values.push_back(item.get_value<double>());
+    }
+    return values;
+}
+
 /** @brief Builds a YAML sequence of `[x, y]` pairs from a polyline. */
 inline fkyaml::node point_sequence(const std::vector<MapPoint>& points) {
     std::vector<fkyaml::node> nodes;
@@ -194,6 +226,13 @@ inline fkyaml::node config_to_node(const MapConfig& config) {
     towns["town_building_scale"] = config.towns.town_building_scale;
     towns["village_building_scale"] = config.towns.village_building_scale;
     towns["water_clearance_m"] = config.towns.water_clearance_m;
+    towns["street_clearance_m"] = config.towns.street_clearance_m;
+    towns["street_width_m"] = config.towns.street_width_m;
+    towns["plaza_radius_m"] = config.towns.plaza_radius_m;
+    towns["plaza_min_cells"] = config.towns.plaza_min_cells;
+    towns["capital_civic_count"] = config.towns.capital_civic_count;
+    towns["town_civic_count"] = config.towns.town_civic_count;
+    towns["village_civic_count"] = config.towns.village_civic_count;
     towns["household_size_min"] = config.towns.household_size_min;
     towns["household_size_max"] = config.towns.household_size_max;
     towns["capital_density"] = config.towns.capital_density;
@@ -240,6 +279,7 @@ inline fkyaml::node config_to_node(const MapConfig& config) {
     passes["enable_regions"] = config.enable_regions;
     passes["enable_towns"] = config.enable_towns;
     passes["enable_landmarks"] = config.enable_landmarks;
+    passes["enable_caves"] = config.enable_caves;
     passes["enable_noisy_edges"] = config.enable_noisy_edges;
 
     fkyaml::node roads = fkyaml::node::mapping();
@@ -265,6 +305,9 @@ inline fkyaml::node config_to_node(const MapConfig& config) {
     node["elevation_range_m"] = config.elevation_range_m;
     node["meters_per_pixel"] = config.meters_per_pixel;
     node["composite_shading"] = std::string(composite_shading_name(config.composite_shading));
+    node["elevation_surface"] = std::string(elevation_surface_name(config.elevation_surface));
+    node["elevation_blend"] = config.elevation_blend;
+    node["elevation_blend_variation"] = config.elevation_blend_variation;
     node["image_size"] = config.image_size;
     node["png_compression_level"] = config.png_compression_level;
     node["border_length"] = config.border_length;
@@ -284,6 +327,7 @@ inline fkyaml::node config_to_node(const MapConfig& config) {
     node["river_depth_per_volume_m"] = config.river_depth_per_volume_m;
     node["river_channel_depth_m"] = config.river_channel_depth_m;
     node["river_channel_depth_per_volume_m"] = config.river_channel_depth_per_volume_m;
+    node["river_mouth_blend_m"] = config.river_mouth_blend_m;
     node["river_incision_m"] = config.river_incision_m;
     node["river_incision_per_volume_m"] = config.river_incision_per_volume_m;
     node["river_valley_width"] = config.river_valley_width;
@@ -294,6 +338,9 @@ inline fkyaml::node config_to_node(const MapConfig& config) {
     node["highway_width_m"] = config.highway_width_m;
     node["temperature_lapse_rate"] = config.temperature_lapse_rate;
     node["temperature_falloff"] = config.temperature_falloff;
+    node["temperature_offset"] = config.temperature_offset;
+    node["polar_extent_north"] = config.polar_extent_north;
+    node["polar_extent_south"] = config.polar_extent_south;
     node["elevation_smoothing_iterations"] = config.elevation_smoothing_iterations;
     node["elevation_smoothing_strength"] = config.elevation_smoothing_strength;
     node["subdivide_noisy_edges"] = config.subdivide_noisy_edges;
@@ -304,6 +351,8 @@ inline fkyaml::node config_to_node(const MapConfig& config) {
     node["noise_relief"] = detail::noise_to_node(config.noise_relief);
     node["noise_terrain"] = detail::noise_to_node(config.noise_terrain);
     node["noise_shape"] = detail::noise_to_node(config.noise_shape);
+    node["noise_blend"] = detail::noise_to_node(config.noise_blend);
+    node["noise_cave"] = detail::noise_to_node(config.noise_cave);
     fkyaml::node shape = fkyaml::node::mapping();
     shape["shape"] = std::string(map_shape_name(config.shape.shape));
     shape["width_m"] = config.shape.width_m;
@@ -322,6 +371,35 @@ inline fkyaml::node config_to_node(const MapConfig& config) {
     node["roads"] = std::move(roads);
     node["regions"] = std::move(regions);
     node["landmarks"] = std::move(landmarks);
+
+    fkyaml::node caves = fkyaml::node::mapping();
+    caves["cave_count"] = config.caves.cave_count;
+    caves["min_grade"] = config.caves.min_grade;
+    caves["min_spacing_m"] = config.caves.min_spacing_m;
+    caves["roof_clearance_m"] = config.caves.roof_clearance_m;
+    caves["passage_height_m"] = config.caves.passage_height_m;
+    caves["chamber_height_m"] = config.caves.chamber_height_m;
+    caves["max_depth_m"] = config.caves.max_depth_m;
+    caves["vadose_share"] = config.caves.vadose_share;
+    caves["level_spacing_m"] = config.caves.level_spacing_m;
+    caves["max_levels"] = config.caves.max_levels;
+    caves["level_budget"] = config.caves.level_budget;
+    caves["step_m"] = config.caves.step_m;
+    caves["passage_length_m"] = config.caves.passage_length_m;
+    caves["descent_grade"] = config.caves.descent_grade;
+    caves["massif_bias"] = config.caves.massif_bias;
+    caves["meander"] = config.caves.meander;
+    caves["branch_chance_vadose"] = config.caves.branch_chance_vadose;
+    caves["branch_chance_phreatic"] = config.caves.branch_chance_phreatic;
+    caves["branch_budget"] = config.caves.branch_budget;
+    caves["max_branches"] = config.caves.max_branches;
+    caves["max_nodes"] = config.caves.max_nodes;
+    caves["passage_width_m"] = config.caves.passage_width_m;
+    caves["chamber_radius_m"] = config.caves.chamber_radius_m;
+    caves["shaft_chance"] = config.caves.shaft_chance;
+    caves["shaft_drop_m"] = config.caves.shaft_drop_m;
+    caves["smoothing_iterations"] = config.caves.smoothing_iterations;
+    node["caves"] = std::move(caves);
     node["passes"] = std::move(passes);
     return node;
 }
@@ -357,6 +435,12 @@ inline void apply_config_node(const fkyaml::node& node, MapConfig& config) {
     config.meters_per_pixel = detail::read_or(node, "meters_per_pixel", config.meters_per_pixel);
     config.composite_shading = composite_shading_from_name(detail::read_or(
         node, "composite_shading", std::string(composite_shading_name(config.composite_shading))));
+    config.elevation_surface = elevation_surface_from_name(detail::read_or(
+        node, "elevation_surface", std::string(elevation_surface_name(config.elevation_surface))));
+    config.elevation_blend =
+        detail::read_or(node, "elevation_blend", config.elevation_blend);
+    config.elevation_blend_variation = detail::read_or(node, "elevation_blend_variation",
+                                                       config.elevation_blend_variation);
     config.image_size = detail::read_or(node, "image_size", config.image_size);
     config.png_compression_level =
         detail::read_or(node, "png_compression_level", config.png_compression_level);
@@ -385,6 +469,8 @@ inline void apply_config_node(const fkyaml::node& node, MapConfig& config) {
         detail::read_or(node, "river_channel_depth_m", config.river_channel_depth_m);
     config.river_channel_depth_per_volume_m = detail::read_or(
         node, "river_channel_depth_per_volume_m", config.river_channel_depth_per_volume_m);
+    config.river_mouth_blend_m =
+        detail::read_or(node, "river_mouth_blend_m", config.river_mouth_blend_m);
     config.river_incision_m = detail::read_or(node, "river_incision_m", config.river_incision_m);
     config.river_incision_per_volume_m =
         detail::read_or(node, "river_incision_per_volume_m", config.river_incision_per_volume_m);
@@ -401,6 +487,12 @@ inline void apply_config_node(const fkyaml::node& node, MapConfig& config) {
         detail::read_or(node, "temperature_lapse_rate", config.temperature_lapse_rate);
     config.temperature_falloff =
         detail::read_or(node, "temperature_falloff", config.temperature_falloff);
+    config.temperature_offset =
+        detail::read_or(node, "temperature_offset", config.temperature_offset);
+    config.polar_extent_north =
+        detail::read_or(node, "polar_extent_north", config.polar_extent_north);
+    config.polar_extent_south =
+        detail::read_or(node, "polar_extent_south", config.polar_extent_south);
     config.elevation_smoothing_iterations =
         detail::read_or(node, "elevation_smoothing_iterations", config.elevation_smoothing_iterations);
     config.elevation_smoothing_strength =
@@ -439,11 +531,13 @@ inline void apply_config_node(const fkyaml::node& node, MapConfig& config) {
     config.show_regions = detail::read_or(node, "show_regions", config.show_regions);
     config.region_tint = detail::read_or(node, "region_tint", config.region_tint);
 
+    detail::noise_from_node(node, "noise_cave", config.noise_cave);
     detail::noise_from_node(node, "noise_island", config.noise_island);
     detail::noise_from_node(node, "noise_temperature", config.noise_temperature);
     detail::noise_from_node(node, "noise_relief", config.noise_relief);
     detail::noise_from_node(node, "noise_terrain", config.noise_terrain);
     detail::noise_from_node(node, "noise_shape", config.noise_shape);
+    detail::noise_from_node(node, "noise_blend", config.noise_blend);
 
     if (node.contains("regions")) {
         const fkyaml::node& regions = node.at("regions");
@@ -456,6 +550,47 @@ inline void apply_config_node(const fkyaml::node& node, MapConfig& config) {
         target.elevation_cost = detail::read_or(regions, "elevation_cost", target.elevation_cost);
         target.water_crossing_cost =
             detail::read_or(regions, "water_crossing_cost", target.water_crossing_cost);
+    }
+
+    if (node.contains("caves")) {
+        const fkyaml::node& caves = node.at("caves");
+        CaveConfig& target = config.caves;
+        target.cave_count = detail::read_or(caves, "cave_count", target.cave_count);
+        target.min_grade = detail::read_or(caves, "min_grade", target.min_grade);
+        target.min_spacing_m = detail::read_or(caves, "min_spacing_m", target.min_spacing_m);
+        target.roof_clearance_m =
+            detail::read_or(caves, "roof_clearance_m", target.roof_clearance_m);
+        target.passage_height_m =
+            detail::read_or(caves, "passage_height_m", target.passage_height_m);
+        target.chamber_height_m =
+            detail::read_or(caves, "chamber_height_m", target.chamber_height_m);
+        target.max_depth_m = detail::read_or(caves, "max_depth_m", target.max_depth_m);
+        target.vadose_share = detail::read_or(caves, "vadose_share", target.vadose_share);
+        target.level_spacing_m =
+            detail::read_or(caves, "level_spacing_m", target.level_spacing_m);
+        target.max_levels = detail::read_or(caves, "max_levels", target.max_levels);
+        target.level_budget = detail::read_or(caves, "level_budget", target.level_budget);
+        target.step_m = detail::read_or(caves, "step_m", target.step_m);
+        target.passage_length_m =
+            detail::read_or(caves, "passage_length_m", target.passage_length_m);
+        target.descent_grade = detail::read_or(caves, "descent_grade", target.descent_grade);
+        target.massif_bias = detail::read_or(caves, "massif_bias", target.massif_bias);
+        target.meander = detail::read_or(caves, "meander", target.meander);
+        target.branch_chance_vadose =
+            detail::read_or(caves, "branch_chance_vadose", target.branch_chance_vadose);
+        target.branch_chance_phreatic =
+            detail::read_or(caves, "branch_chance_phreatic", target.branch_chance_phreatic);
+        target.branch_budget = detail::read_or(caves, "branch_budget", target.branch_budget);
+        target.max_branches = detail::read_or(caves, "max_branches", target.max_branches);
+        target.max_nodes = detail::read_or(caves, "max_nodes", target.max_nodes);
+        target.passage_width_m =
+            detail::read_or(caves, "passage_width_m", target.passage_width_m);
+        target.chamber_radius_m =
+            detail::read_or(caves, "chamber_radius_m", target.chamber_radius_m);
+        target.shaft_chance = detail::read_or(caves, "shaft_chance", target.shaft_chance);
+        target.shaft_drop_m = detail::read_or(caves, "shaft_drop_m", target.shaft_drop_m);
+        target.smoothing_iterations =
+            detail::read_or(caves, "smoothing_iterations", target.smoothing_iterations);
     }
 
     if (node.contains("landmarks")) {
@@ -496,6 +631,7 @@ inline void apply_config_node(const fkyaml::node& node, MapConfig& config) {
         config.enable_towns = detail::read_or(passes, "enable_towns", config.enable_towns);
         config.enable_landmarks =
             detail::read_or(passes, "enable_landmarks", config.enable_landmarks);
+        config.enable_caves = detail::read_or(passes, "enable_caves", config.enable_caves);
         config.enable_noisy_edges =
             detail::read_or(passes, "enable_noisy_edges", config.enable_noisy_edges);
     }
@@ -569,6 +705,20 @@ inline void apply_config_node(const fkyaml::node& node, MapConfig& config) {
             detail::read_or(towns, "village_building_scale", config.towns.village_building_scale);
         config.towns.water_clearance_m =
             detail::read_or(towns, "water_clearance_m", config.towns.water_clearance_m);
+        config.towns.street_clearance_m =
+            detail::read_or(towns, "street_clearance_m", config.towns.street_clearance_m);
+        config.towns.street_width_m =
+            detail::read_or(towns, "street_width_m", config.towns.street_width_m);
+        config.towns.plaza_radius_m =
+            detail::read_or(towns, "plaza_radius_m", config.towns.plaza_radius_m);
+        config.towns.plaza_min_cells =
+            detail::read_or(towns, "plaza_min_cells", config.towns.plaza_min_cells);
+        config.towns.capital_civic_count =
+            detail::read_or(towns, "capital_civic_count", config.towns.capital_civic_count);
+        config.towns.town_civic_count =
+            detail::read_or(towns, "town_civic_count", config.towns.town_civic_count);
+        config.towns.village_civic_count =
+            detail::read_or(towns, "village_civic_count", config.towns.village_civic_count);
         config.towns.household_size_min =
             detail::read_or(towns, "household_size_min", config.towns.household_size_min);
         config.towns.household_size_max =
@@ -849,7 +999,23 @@ inline fkyaml::node map_to_node(const MapGraph& graph, const MapConfig& config) 
             node["w"] = building.width;
             node["h"] = building.height;
             node["r"] = building.rotation;
+            // Written unconditionally, even for a dwelling: a reader that saw the
+            // key only on civic buildings would have to guess whether its absence
+            // meant "a house" or "saved before roles existed".
+            node["role"] = std::string(building_role_name(building.role));
             buildings.push_back(std::move(node));
+        }
+
+        std::vector<fkyaml::node> streets;
+        streets.reserve(town.streets.size());
+        for (const MapStreet& street : town.streets) {
+            fkyaml::node node = fkyaml::node::mapping();
+            node["x0"] = street.from.x;
+            node["y0"] = street.from.y;
+            node["x1"] = street.to.x;
+            node["y1"] = street.to.y;
+            node["clearance"] = street.clearance;
+            streets.push_back(std::move(node));
         }
 
         fkyaml::node node = fkyaml::node::mapping();
@@ -867,6 +1033,14 @@ inline fkyaml::node map_to_node(const MapGraph& graph, const MapConfig& config) 
         node["population"] = town.population;
         node["prosperity"] = town.prosperity;
         node["buildings"] = fkyaml::node::sequence(std::move(buildings));
+        node["streets"] = fkyaml::node::sequence(std::move(streets));
+        if (town.plaza.radius > 0.0) {
+            fkyaml::node plaza = fkyaml::node::mapping();
+            plaza["x"] = town.plaza.centre.x;
+            plaza["y"] = town.plaza.centre.y;
+            plaza["radius"] = town.plaza.radius;
+            node["plaza"] = std::move(plaza);
+        }
         towns.push_back(std::move(node));
     }
 
@@ -920,6 +1094,61 @@ inline fkyaml::node map_to_node(const MapGraph& graph, const MapConfig& config) 
         landmarks.push_back(std::move(node));
     }
 
+    std::vector<fkyaml::node> caves;
+    caves.reserve(graph.caves.size());
+    for (const MapCave& cave : graph.caves) {
+        // Stations and passages both, because they are different things rather
+        // than one derived from the other: the stations are the system as it was
+        // grown and carry its zones and features, while a passage is the smoothed
+        // run that gets drawn and exported. Recomputing either from the other
+        // needs the terrain and the pass's own random stream.
+        std::vector<fkyaml::node> nodes;
+        nodes.reserve(cave.nodes.size());
+        for (const CaveNode& station : cave.nodes) {
+            fkyaml::node node = fkyaml::node::mapping();
+            node["x"] = station.point.x;
+            node["y"] = station.point.y;
+            node["f"] = station.floor;
+            node["r"] = station.roof;
+            node["w"] = station.radius;
+            node["c"] = static_cast<int>(station.center);
+            node["zone"] = std::string(cave_zone_name(station.zone));
+            node["feature"] = std::string(cave_feature_name(station.feature));
+            node["l"] = static_cast<int>(station.level);
+            node["p"] = static_cast<int>(station.parent);
+            nodes.push_back(std::move(node));
+        }
+
+        std::vector<fkyaml::node> passages;
+        passages.reserve(cave.passages.size());
+        for (const CavePassage& passage : cave.passages) {
+            fkyaml::node node = fkyaml::node::mapping();
+            node["level"] = static_cast<int>(passage.level);
+            node["nodes"] = detail::id_sequence(passage.nodes);
+            node["points"] = detail::point_sequence(passage.points);
+            node["floors"] = detail::scalar_sequence(passage.floors);
+            node["roofs"] = detail::scalar_sequence(passage.roofs);
+            node["radii"] = detail::scalar_sequence(passage.radii);
+            passages.push_back(std::move(node));
+        }
+
+        fkyaml::node node = fkyaml::node::mapping();
+        node["mouth_edge"] = static_cast<int>(cave.mouth_edge);
+        node["x"] = cave.mouth.x;
+        node["y"] = cave.mouth.y;
+        node["grade"] = cave.mouth_grade;
+        node["surface"] = cave.surface_at_mouth;
+        node["phreatic"] = cave.phreatic_level;
+        node["levels"] = detail::scalar_sequence(cave.levels);
+        node["deepest"] = cave.deepest;
+        node["length_m"] = cave.length_m;
+        node["region"] = static_cast<int>(cave.region);
+        node["name"] = cave.name;
+        node["nodes"] = fkyaml::node::sequence(std::move(nodes));
+        node["passages"] = fkyaml::node::sequence(std::move(passages));
+        caves.push_back(std::move(node));
+    }
+
     fkyaml::node root = fkyaml::node::mapping();
     root["version"] = k_map_yaml_version;
     root["config"] = config_to_node(config);
@@ -932,6 +1161,7 @@ inline fkyaml::node map_to_node(const MapGraph& graph, const MapConfig& config) 
     root["regions"] = fkyaml::node::sequence(std::move(regions));
     root["countries"] = fkyaml::node::sequence(std::move(countries));
     root["landmarks"] = fkyaml::node::sequence(std::move(landmarks));
+    root["caves"] = fkyaml::node::sequence(std::move(caves));
     return root;
 }
 
@@ -1074,8 +1304,29 @@ inline bool map_from_node(const fkyaml::node& root, MapGraph& out_graph, MapConf
                     building.width = detail::read_or(building_node, "w", 0.0);
                     building.height = detail::read_or(building_node, "h", 0.0);
                     building.rotation = detail::read_or(building_node, "r", 0.0);
+                    building.role = building_role_from_name(
+                        detail::read_or(building_node, "role", std::string("dwelling")));
                     town.buildings.push_back(building);
                 }
+            }
+            if (node.contains("streets") && node.at("streets").is_sequence()) {
+                for (const fkyaml::node& street_node : node.at("streets")) {
+                    // Bearing and length are derived, not stored: two numbers that
+                    // must agree with the endpoints are two numbers that can
+                    // disagree with them.
+                    town.streets.push_back(
+                        make_street(MapPoint{detail::read_or(street_node, "x0", 0.0),
+                                             detail::read_or(street_node, "y0", 0.0)},
+                                    MapPoint{detail::read_or(street_node, "x1", 0.0),
+                                             detail::read_or(street_node, "y1", 0.0)},
+                                    detail::read_or(street_node, "clearance", 0.0)));
+                }
+            }
+            if (node.contains("plaza")) {
+                const fkyaml::node& plaza = node.at("plaza");
+                town.plaza.centre = {detail::read_or(plaza, "x", 0.0),
+                                     detail::read_or(plaza, "y", 0.0)};
+                town.plaza.radius = detail::read_or(plaza, "radius", 0.0);
             }
             out_graph.towns.push_back(std::move(town));
         }
@@ -1133,6 +1384,64 @@ inline bool map_from_node(const fkyaml::node& root, MapGraph& out_graph, MapConf
             landmark.region = static_cast<RegionId>(
                 detail::read_or(node, "region", static_cast<int>(k_invalid_id)));
             out_graph.landmarks.push_back(std::move(landmark));
+        }
+    }
+
+    if (root.contains("caves") && root.at("caves").is_sequence()) {
+        for (const fkyaml::node& node : root.at("caves")) {
+            MapCave cave;
+            cave.mouth_edge = static_cast<EdgeId>(
+                detail::read_or(node, "mouth_edge", static_cast<int>(k_invalid_id)));
+            cave.mouth = {detail::read_or(node, "x", 0.0), detail::read_or(node, "y", 0.0)};
+            cave.mouth_grade = detail::read_or(node, "grade", 0.0);
+            cave.surface_at_mouth = detail::read_or(node, "surface", 0.0);
+            cave.phreatic_level = detail::read_or(node, "phreatic", 0.0);
+            cave.levels = detail::read_scalar_sequence(node, "levels");
+            if (cave.levels.empty()) {
+                // Written before caves had storeys. Its one water table is its one
+                // level, which is exactly the system it was when it was saved.
+                cave.levels.push_back(cave.phreatic_level);
+            }
+            cave.deepest = detail::read_or(node, "deepest", 0.0);
+            cave.length_m = detail::read_or(node, "length_m", 0.0);
+            cave.region = static_cast<RegionId>(
+                detail::read_or(node, "region", static_cast<int>(k_invalid_id)));
+            cave.name = detail::read_or(node, "name", std::string());
+
+            if (node.contains("nodes") && node.at("nodes").is_sequence()) {
+                for (const fkyaml::node& entry : node.at("nodes")) {
+                    CaveNode station;
+                    station.point = {detail::read_or(entry, "x", 0.0),
+                                     detail::read_or(entry, "y", 0.0)};
+                    station.floor = detail::read_or(entry, "f", 0.0);
+                    station.roof = detail::read_or(entry, "r", 0.0);
+                    station.radius = detail::read_or(entry, "w", 0.0);
+                    station.center = static_cast<CenterId>(
+                        detail::read_or(entry, "c", static_cast<int>(k_invalid_id)));
+                    station.zone = cave_zone_from_name(
+                        detail::read_or(entry, "zone", std::string("vadose")));
+                    station.feature = cave_feature_from_name(
+                        detail::read_or(entry, "feature", std::string("passage")));
+                    // Defaults to the shallowest level, so a map written before
+                    // caves had storeys loads as the single-level system it was.
+                    station.level = detail::read_or(entry, "l", 0);
+                    station.parent = detail::read_or(entry, "p", -1);
+                    cave.nodes.push_back(station);
+                }
+            }
+            if (node.contains("passages") && node.at("passages").is_sequence()) {
+                for (const fkyaml::node& entry : node.at("passages")) {
+                    CavePassage passage;
+                    passage.nodes = detail::read_id_sequence<std::int32_t>(entry, "nodes");
+                    passage.points = detail::read_point_sequence(entry, "points");
+                    passage.level = detail::read_or(entry, "level", 0);
+                    passage.floors = detail::read_scalar_sequence(entry, "floors");
+                    passage.roofs = detail::read_scalar_sequence(entry, "roofs");
+                    passage.radii = detail::read_scalar_sequence(entry, "radii");
+                    cave.passages.push_back(std::move(passage));
+                }
+            }
+            out_graph.caves.push_back(std::move(cave));
         }
     }
 

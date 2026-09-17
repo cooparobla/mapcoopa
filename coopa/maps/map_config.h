@@ -209,6 +209,87 @@ inline CompositeShading composite_shading_from_name(std::string_view name) {
 }
 
 /**
+ * @enum ElevationSurface
+ * @brief How the height field is drawn between the points it is stored at.
+ *
+ * The graph holds one height per cell and one per corner. Everything between
+ * those is a choice, and it is the choice -- not the smoothing passes -- that
+ * decides how smooth a rendered map looks: `elevation_smoothing_iterations`
+ * relaxes the stored values, and no setting of it can stop the surface being
+ * continuous between them.
+ */
+enum class ElevationSurface {
+    /**
+     * @brief Barycentric over the Delaunay triangle containing the sample.
+     *
+     * The piecewise-linear surface through the cell sites, and what a terrain
+     * mesh built from this data would be. Continuous by construction, so a map
+     * reads smooth however rough the underlying field is -- at one pixel to the
+     * metre a 60 m cell spans 60 pixels, and a step between two cells is spread
+     * across all of them.
+     */
+    Interpolated,
+    /**
+     * @brief One height per cell, hard-edged at every boundary.
+     *
+     * Draws `MapCenter::elevation` flat across the cell, which is the value the
+     * graph actually stores -- so this is the height field shown without any
+     * interpolation over it, Voronoi tessellation and all. What was wanted when
+     * turning the smoothing off did not produce facets.
+     */
+    Flat,
+    /**
+     * @brief `Flat`, then blurred: a smoothing pass over the rasterised height field.
+     *
+     * The other two modes are sampling rules -- given a point, what height is
+     * there. This one is not, and that is the whole idea. The cells are drawn flat
+     * exactly as `Flat` draws them, and the *image* is then smoothed by a box blur
+     * `elevation_blend` cells across, with the river channels cut back in
+     * afterwards so a watercourse keeps its full contrast on the smoothed ground.
+     *
+     * Blending per cell instead was tried first and cannot work, however it is
+     * tuned: a cell that ramps its own rim is a raised tile with a bevel, so a map
+     * of them traces every Voronoi outline in a soft halo and reads *more*
+     * tessellated than the hard edges it set out to hide. A blend is a property of
+     * the image, not of a cell.
+     *
+     * A blend of 0 is `Flat` byte for byte -- there is no blur to run. It does not
+     * converge on `Interpolated` at the top end and is not meant to: this is a
+     * smoothed picture of the stored field, where `Interpolated` is a different
+     * surface through the same points.
+     */
+    Blended
+};
+
+/** @brief Number of distinct `ElevationSurface` values. */
+inline constexpr std::size_t k_elevation_surface_count = 3;
+
+/**
+ * @brief Maps an elevation surface style to its serialisation name.
+ * @param surface The style to name.
+ * @return A `snake_case` identifier, e.g. `"flat"`.
+ */
+inline std::string_view elevation_surface_name(ElevationSurface surface) {
+    switch (surface) {
+        case ElevationSurface::Interpolated: return "interpolated";
+        case ElevationSurface::Flat:         return "flat";
+        case ElevationSurface::Blended:      return "blended";
+    }
+    return "interpolated";
+}
+
+/**
+ * @brief Resolves a serialisation name back to an elevation surface style.
+ * @param name A name previously produced by `elevation_surface_name()`.
+ * @return The matching style, or `ElevationSurface::Interpolated` if unknown.
+ */
+inline ElevationSurface elevation_surface_from_name(std::string_view name) {
+    if (name == "flat") return ElevationSurface::Flat;
+    if (name == "blended") return ElevationSurface::Blended;
+    return ElevationSurface::Interpolated;
+}
+
+/**
  * @enum MapShape
  * @brief The outline the landmass is confined to; everything outside it is sea.
  */
@@ -392,6 +473,16 @@ struct TownConfig {
      * rivers are used as streets, so the packer marches plots straight at them.
      */
     double water_clearance_m = 3.0;
+    /**
+     * @brief Clear ground kept between a building and any roadway, in grid units.
+     *
+     * The counterpart of `water_clearance_m`, and needed for the same reason: a
+     * street is a line the packer aims plots at, so without a stated clearance it
+     * marches them onto the carriageway. Added to half the roadway's width -- a
+     * lane's `street_width_m`, or a road's own width by class -- so a trail and a
+     * highway are each given the verge they actually need.
+     */
+    double street_clearance_m = 1.5;
     /** @brief Fewest occupants in a household. */
     int household_size_min = 3;
     /** @brief Most occupants in a household. */
@@ -400,7 +491,18 @@ struct TownConfig {
     double capital_density = 1.6;
     /** @brief Population density multiplier applied to a town. */
     double town_density = 1.2;
-    /** @brief Perpendicular distance from a street's centreline to a plot centre. */
+    /**
+     * @brief Nominal distance from a street's centreline to a plot centre, in metres.
+     *
+     * A *minimum*, not the whole story. A plot is also pushed out far enough that
+     * its own rotated footprint clears the carriageway and its verge, because this
+     * alone cannot: at 8 m a `building_size_max_m` plot of 14 m reaches back to 1 m
+     * from the centreline, and the lane is 2 m of half-width, so the largest plots
+     * were laid straight onto the street by construction.
+     *
+     * At the default a small plot still sits exactly here and only an oversized one
+     * moves, which is what keeps the rows looking as they did.
+     */
     double street_offset_m = 8.0;
     /** @brief Spacing along a street between successive plots. */
     double street_spacing_m = 14.0;
@@ -410,6 +512,42 @@ struct TownConfig {
     double rotation_jitter = 0.25;
     /** @brief Rejection draws before interior infill gives up on a cramped cell. */
     int infill_attempts = 200;
+    /**
+     * @brief Radius of a settlement's market square, in metres.
+     *
+     * Open ground at the heart of a town, which the packer keeps clear and the
+     * civic buildings front onto. A settlement only gets one if the ground is
+     * genuinely there -- see `plaza_min_cells` -- because a square carved out of a
+     * hamlet is just a hamlet with a hole in it.
+     */
+    double plaza_radius_m = 26.0;
+    /**
+     * @brief Fewest claimed cells a settlement needs before it is granted a square.
+     *
+     * Two, so a capital and a town have one and a single-cell village does not.
+     * That is the point of a village: it is the size that has no civic centre.
+     */
+    int plaza_min_cells = 2;
+    /**
+     * @brief Civic buildings a capital is given, beyond its dwellings.
+     *
+     * Taken in order from the roster in `PassTowns`, so raising this adds the next
+     * kind rather than reshuffling the ones already there. Lesser tiers take a
+     * prefix of the same list, which is what makes a town read as a smaller
+     * version of a capital rather than a different kind of place.
+     */
+    int capital_civic_count = 7;
+    /** @brief Civic buildings a town is given. */
+    int town_civic_count = 4;
+    /** @brief Civic buildings a village is given; a well, and perhaps a smithy. */
+    int village_civic_count = 2;
+    /**
+     * @brief Width of a street where it is drawn, in metres.
+     *
+     * A lane, narrower than the `RoadClass::Trail` that reaches the settlement, so
+     * the network and the streets inside it read as different things.
+     */
+    double street_width_m = 4.0;
 };
 
 /**
@@ -553,6 +691,234 @@ struct LandmarkConfig {
 };
 
 /**
+ * @struct CaveConfig
+ * @brief Where caves open, how far down they reach, and what shape they take.
+ *
+ * Every length here is in metres and every rate is dimensionless, so the numbers
+ * describe caves rather than describing this generator's units. The two that
+ * decide most of what a system looks like are `descent_grade`, which sets how
+ * hard the entrance series falls, and the pair of branch chances, which is what
+ * makes the top of a cave a single way down and the bottom of it a network.
+ */
+struct CaveConfig {
+    /** @brief Systems to open; clamped to the qualifying slopes the map actually has. */
+    int cave_count = 18;
+    /**
+     * @brief Rise over run a slope must reach before a cave may open on it, dimensionless.
+     *
+     * The whole of the placement rule. A cave mouth is a hole in a face of rock,
+     * so the map's steepest ground is where one belongs -- measured by
+     * `edge_grade()`, which puts every edge on the same footing whatever the
+     * vertical and horizontal scales are set to. The default is a one-in-four
+     * slope, steep enough to read as a face on a render and common enough that a
+     * default map has far more candidates than `cave_count` asks for.
+     *
+     * Raising it concentrates caves in the mountains; lowering it lets them open
+     * on rolling ground, where a mouth has no visible face to sit in.
+     */
+    double min_grade = 0.25;
+    /** @brief How far apart two mouths must be, in metres. */
+    double min_spacing_m = 300.0;
+    /**
+     * @brief Rock left between a passage ceiling and the ground above it, in metres.
+     *
+     * The margin the "a cave stays underground" invariant is enforced with, and
+     * the reason it is an invariant rather than a tendency: every station is
+     * clamped to this clearance as it is grown, and clamped again after the
+     * passage is smoothed, because corner-cutting moves points.
+     *
+     * Measured against the surface `MapGraph::elevation_at()` returns *with*
+     * terrain detail and river channels applied -- the one anyone can see -- not
+     * against the control mesh. `river_channel_depth_m` alone cuts 18 m out of
+     * that surface, so a clearance measured against the mesh is not the clearance
+     * that exists.
+     *
+     * Against `elevation_at()` and not against the rendered elevation *layer*,
+     * which is a slightly different surface for reasons that predate caves: the
+     * sampler's answer depends on the cell it is given as a hint, and the layer
+     * draws a pixel with whichever cell's subdivided outline contains it. With
+     * caves off, 5.7% of drawn land pixels already differ from the sampler by more
+     * than this clearance. The pass takes the lowest reading of the nearest cell
+     * and its neighbours to cover the ambiguity, which leaves a handful of pixels
+     * per map where a rounded stroke cap reaches between two clamped stations.
+     */
+    double roof_clearance_m = 25.0;
+    /**
+     * @brief Floor to ceiling in an ordinary passage, in metres.
+     *
+     * Worth choosing against `level_spacing_m` rather than by eye. That is the
+     * drop between one storey and the next, so a passage taller than it reaches
+     * into the level below and the two interpenetrate -- which is a cave that
+     * cannot be walked and cannot be meshed. `chamber_height_m` is the binding
+     * one of the pair, being the larger.
+     */
+    double passage_height_m = 8.0;
+    /** @brief Floor to ceiling in a chamber, in metres; a room has headroom a passage does not. */
+    double chamber_height_m = 20.0;
+    /**
+     * @brief Hard cap on how far below its own mouth a system may reach, in metres.
+     *
+     * A bound, not the usual constraint: `vadose_share` is what normally decides
+     * where a cave levels out. This is here so an unusually high mouth over an
+     * unusually deep base level cannot grow a system that falls further than the
+     * configuration ever meant to allow.
+     */
+    double max_depth_m = 260.0;
+    /**
+     * @brief Share of the relief beneath a mouth that is entrance series, 0 to 1.
+     *
+     * Where the water table goes, and therefore where a system stops descending
+     * and starts branching. A water table is a *subdued replica of the surface*,
+     * not a flat sheet at sea level -- rain falls on the hill and drains toward
+     * the valleys either side, so it stands well above base level under high
+     * ground and meets it at the coast. Taking a share of the relief between the
+     * mouth and the sea says exactly that, and says it without needing a second
+     * field to be computed and stored.
+     *
+     * It also decides what a cave *looks* like, which is why it is not simply
+     * `max_depth_m`. Measured against the sea alone a cave 400 m up needs some
+     * 250 m of descent before it can level out -- further than the length budget
+     * reaches -- so every system came out as pure entrance series and the
+     * phreatic half of the model never appeared on a map at all. At the default
+     * share both halves show on every cave that has relief to spare.
+     *
+     * Zero puts the water table at the mouth, so a system is level throughout;
+     * one puts it at sea level and restores the pure-descent behaviour.
+     */
+    double vadose_share = 0.6;
+    /**
+     * @brief Drop from one abandoned water table to the next, in metres.
+     *
+     * What makes a cave multi-level, and it is not a stylistic choice: a valley
+     * downcuts, the water table follows it down, and the phreatic network cut at
+     * the old level is left behind as dry passage above the new one. Do that
+     * twice and the system has three storeys with rock between them, which is
+     * exactly the structure the exported floor and roof layers exist to carry.
+     *
+     * The constraint that matters is against `chamber_height_m`, not against
+     * anything on the surface. Two tables closer together than the tallest space
+     * cut at either of them produce storeys that intersect where they cross, which
+     * is not a multi-level cave but one malformed one -- there is no rock left
+     * between the levels to stand on. The default leaves most of a chamber's
+     * height again in rock between one storey's ceiling and the one above it.
+     *
+     * It is also what decides how many storeys a map's caves actually get, and the
+     * relationship is not gentle: a system needs `level_spacing_m` of relief to
+     * spend per extra table, so doubling this roughly halves the storey count. At
+     * 55 m against the default terrain only six systems in seventeen reached a
+     * second table; at 38 m most do.
+     */
+    double level_spacing_m = 38.0;
+    /**
+     * @brief Cap on abandoned levels per system.
+     *
+     * A bound rather than the usual constraint, in the same spirit as
+     * `max_depth_m`: how many levels a cave actually grows comes from the relief
+     * beneath its mouth divided by `level_spacing_m`, so a mouth high above base
+     * level grows several and one near the coast grows one. This stops an
+     * exceptionally high mouth from spending the whole node budget on storeys and
+     * leaving each of them a stub.
+     */
+    int max_levels = 4;
+    /**
+     * @brief Share of the trunk length budget a newly-opened level inherits, 0 to 1.
+     *
+     * The counterpart of `branch_budget`, and deliberately larger. A branch is a
+     * side passage off a network and should be shorter than what it leaves; a new
+     * level is a whole network in its own right and wants most of a trunk's worth
+     * of length, or the lower storeys come out as stubs hanging off the shafts
+     * that reach them.
+     *
+     * This buys *network*, not descent. The climb down to the next table is added
+     * on top of it, because it is overhead rather than passage anyone explores:
+     * charged against the same budget, a descent at the default grade spends
+     * `level_spacing_m / descent_grade` -- some 250 m of the 630 m it was given --
+     * before it reaches the level it was sent to dig.
+     */
+    double level_budget = 0.7;
+    /** @brief Distance advanced per station, in metres. */
+    double step_m = 30.0;
+    /** @brief Length budget of the trunk passage, in metres; branches spend from it. */
+    double passage_length_m = 900.0;
+    /**
+     * @brief How steeply the passage falls above the water table, dimensionless.
+     *
+     * Water above the water table is falling under gravity and cuts downward, so
+     * this is what makes an entrance series an entrance series. Below it the
+     * passage runs level and this has no effect.
+     */
+    double descent_grade = 0.15;
+    /**
+     * @brief How hard a passage steers toward thicker rock, 0 to 1.
+     *
+     * The single thing that makes a system reach anywhere. A passage ignoring the
+     * ground above it wanders out from under its own hill within a few hundred
+     * metres, at which point the roof clamp has nowhere left to put it and the
+     * head ends -- so caves came out as stubs, which is the one shape a cave
+     * system is not.
+     *
+     * Real caves are not shy of the hillside by accident: a passage only exists
+     * where there was rock to dissolve and a head of water to do it, and both are
+     * greatest under the mass of the massif. So each station probes the surface a
+     * step ahead to either side and leans toward the higher one, which is the same
+     * thing said in one line of arithmetic.
+     *
+     * Zero bores on regardless and produces the stubs. One turns as hard as
+     * `meander` does, which pins a passage to the ridge line above it.
+     */
+    double massif_bias = 0.6;
+    /**
+     * @brief How far a passage wanders from a straight line, 0 to 1.
+     *
+     * Applied through a coherent noise field rather than a fresh draw per step,
+     * for the same reason `noise_relief` is coherent: a random turn at every
+     * station is a drunkard's walk, and no passage ever cut looks like one. Zero
+     * bores dead straight.
+     */
+    double meander = 0.5;
+    /** @brief Chance a station above the water table also starts a branch. */
+    double branch_chance_vadose = 0.06;
+    /**
+     * @brief Chance a station at or below the water table also starts a branch.
+     *
+     * Deliberately several times `branch_chance_vadose`. Water moving sideways
+     * through rock already saturated attacks every joint it meets rather than one
+     * line of them, which is why maze cave is a thing that happens at the water
+     * table and not above it. Equal chances give a cave that is the same shape
+     * top to bottom, which is the shape no cave is.
+     */
+    double branch_chance_phreatic = 0.26;
+    /** @brief Share of the parent's remaining length budget a branch inherits, 0 to 1. */
+    double branch_budget = 0.55;
+    /** @brief Cap on branches per system, so one cave cannot swallow the node budget. */
+    int max_branches = 6;
+    /**
+     * @brief Cap on stations per system; the hard bound on how long growth can run.
+     *
+     * Shared across every level a system grows, so it is divided rather than
+     * spent once. At the old 400 a three-level cave got some 130 stations a
+     * storey and read as three stubs stacked up, which is why this is generous.
+     */
+    int max_nodes = 900;
+    /** @brief Width of an ordinary passage, in metres. */
+    double passage_width_m = 6.0;
+    /** @brief Half-width of a chamber, in metres. */
+    double chamber_radius_m = 18.0;
+    /**
+     * @brief Chance a station above the water table is a vertical pitch instead.
+     *
+     * What puts a drop in the middle of an otherwise walkable cave. A pitch
+     * advances almost nothing in plan and falls `shaft_drop_m`, so it is the one
+     * thing that can take a system deep without taking it far.
+     */
+    double shaft_chance = 0.10;
+    /** @brief How far a pitch falls, in metres. */
+    double shaft_drop_m = 45.0;
+    /** @brief Chaikin corner-cutting passes applied to each passage, matching rivers and roads. */
+    int smoothing_iterations = 2;
+};
+
+/**
  * @struct MapConfig
  * @brief The complete description of a map to generate.
  *
@@ -631,6 +997,82 @@ struct MapConfig {
      * asked.
      */
     CompositeShading composite_shading = CompositeShading::Elevation;
+    /**
+     * @brief How the height field is drawn between the cells it is stored at.
+     *
+     * `Flat` gives every cell one height and a hard edge at every boundary -- the
+     * stored field shown without interpolation -- with the river channels still cut
+     * through it. The cut is a function of position rather than of the
+     * interpolation, so it subtracts from a constant as readily as from a gradient:
+     * measured, 11.6 grey levels of contrast half a cell from a centreline, against
+     * 12.3 for the interpolated surface. River valleys are there too, carved into
+     * the cell heights themselves, and come out as stepped cells rather than a
+     * smooth trough.
+     *
+     * Terrain roughness is the one thing `Flat` drops, and deliberately: that is
+     * surface texture, which a fill constant across a cell has no business
+     * carrying, where a river is a feature of the ground.
+     */
+    ElevationSurface elevation_surface = ElevationSurface::Interpolated;
+    /**
+     * @brief How wide `ElevationSurface::Blended` blurs, as a fraction of a cell.
+     *
+     * The radius of the box blur that mode runs over the finished raster, in cells
+     * -- so 0.5 is half a cell at any render size, and one number means the same
+     * thing at 512 px as at 4800. At 0 there is no blur and the mode is `Flat` byte
+     * for byte. One cell is the ceiling, because past there the blur is wider than
+     * the tessellation and starts erasing the landforms along with the facets.
+     *
+     * Measured at 512 px: the 99th-percentile adjacent-pixel step falls from 34 grey
+     * levels flat to 12, 8 and 6 at a quarter, half and a full cell. The worst step
+     * stays near 75 throughout and is meant to -- that is a river bank, cut back in
+     * after the blur.
+     *
+     * **Not one of the `elevation_smoothing_*` knobs, and not a substitute for
+     * them.** Those relax the heights the graph *stores*, which is the shape of the
+     * landform everything else is classified from. This changes only how the drawn
+     * surface gets from one stored height to the next, and nothing downstream of the
+     * renderer can tell it was set.
+     */
+    double elevation_blend = 0.5;
+    /**
+     * @brief How much `elevation_blend` varies from cell to cell, 0 to 1.
+     *
+     * A single blur radius smooths everywhere equally, which is the one thing real
+     * ground never does. This gives **every cell its own radius**, drawn from
+     * `noise_blend` at the cell's own site, so one cell keeps hard edges while the
+     * cell beside it is fully smoothed. `noise_blend.frequency` controls how those
+     * cells are distributed -- per-cell random through to broad patches.
+     *
+     * The factor is `1 + variation * n` for a field value `n` in `[-1, 1]`, so the
+     * variation is **symmetric about `elevation_blend`** -- the measured mean factor
+     * is 0.999, so the average radius is where `elevation_blend` put it and turning
+     * this up makes a map more varied rather than uniformly softer or sharper.
+     *
+     * At 0 the field is not consulted at all -- move its seed or its frequency and
+     * the render does not shift by a byte. At 1 the factor is nominally `[0, 2]`,
+     * though a noise field seldom reaches its extremes.
+     *
+     * Note the top of that range can exceed the one-cell ceiling `elevation_blend`
+     * is capped at, and deliberately: asking for full variation is asking for some
+     * cells smoothed past a cell width, and clamping would quietly make the knob
+     * one-sided.
+     *
+     * What it buys, measured at 900 px with `elevation_blend = 0.5` as the spread
+     * of each cell's own edge sharpness against an unvaried render: standard
+     * deviation 0.154 at variation 0.5 and 0.294 at 1, and adjacent cells landing
+     * on opposite sides of the uniform blur across 3.5% of shared edges -- against
+     * 0.3% for the low-frequency field this replaced, which is the difference
+     * between variation you can see and variation you cannot.
+     *
+     * **It scales `elevation_blend`, so a small blend leaves little to vary.** At
+     * `elevation_blend = 0.1` the radius is 3 to 4 px on a 60 px cell and
+     * neighbouring cells differ correspondingly little.
+     *
+     * Costs two extra blurs of the raster and one polygon pass, no matter how high
+     * it is set: the elevation layer goes from 1.20 s to 2.35 s at 4800 px.
+     */
+    double elevation_blend_variation = 0.0;
 
     /**
      * @brief Deflate effort used when encoding a PNG; higher is smaller and slower.
@@ -721,6 +1163,67 @@ struct MapConfig {
      */
     NoiseConfig noise_terrain{4919, 0.35};
     /**
+     * @brief The field that varies the blur radius under `ElevationSurface::Blended`.
+     *
+     * Only read when `elevation_blend_variation` is above 0, and sampled **once per
+     * cell, at the cell's site** -- so `frequency` here means something unusually
+     * concrete. Sites sit one grid unit apart, and a grid unit is a cell, so the
+     * field's wavelength `1 / frequency` *is* the patch size in cells:
+     *
+     * This is the knob for how the variation is *distributed*, where
+     * `elevation_blend_variation` is how strong it is. Measured as the correlation
+     * between the factors of two cells that share an edge:
+     *
+     * | `frequency` | wavelength | neighbour correlation | reads as |
+     * |---|---|---|---|
+     * | 0.5 *(default)* | 2 cells | -0.01 | every cell independent |
+     * | 0.33 | 3 cells | 0.14 | mostly independent |
+     * | 0.25 | 4 cells | 0.35 | loose clumps |
+     * | 0.2 | 5 cells | 0.51 | clear patches |
+     * | 0.125 | 8 cells | 0.78 | broad regions |
+     * | 0.045 | 22 cells | **0.97** | the old behaviour: no visible variation |
+     *
+     * Note the knee: anything at or above 0.5 is already fully decorrelated, so
+     * raising it further buys nothing. The interesting range is 0.5 down to 0.125.
+     *
+     * That last row is where this started. The field ran at 0.045 on the theory
+     * that smoothness should vary the way bedrock hardness does -- a defensible
+     * idea that produced nothing anyone could see, because at a correlation of 0.97
+     * every cell in any neighbourhood gets the same factor and the map comes out
+     * uniformly blurred. What varies has to vary at the scale of the thing it
+     * varies.
+     *
+     * One octave, not the usual five, and that matters twice. Octaves above the
+     * first sit below cell size, so point-sampling one value per cell picks up
+     * near-white noise from them whatever the base frequency says -- which blurs
+     * the distinction the table draws. And FBm's gain leaves the base octave only
+     * about two thirds of the amplitude, so dropping the rest measurably widens the
+     * effect: the spread of per-cell edge sharpness goes from 0.213 to 0.294, and
+     * adjacent cells land on opposite sides of the uniform blur half again as often
+     * (2.3% of shared edges to 3.5%).
+     *
+     * Not rescaled by `grid_size`, unlike `noise_island`: a patch measured in cells
+     * should be the same number of cells on any map.
+     */
+    NoiseConfig noise_blend{3571, 0.5, FastNoiseLite::NoiseType_OpenSimplex2,
+                            FastNoiseLite::FractalType_FBm, 1};
+    /**
+     * @brief The field a cave passage takes its wandering from.
+     *
+     * The frequency is set against `CaveConfig::step_m`, not against the landforms
+     * the other fields shape, and that is the whole of why it is this high. A
+     * station advances half a grid unit; sampled at a landform frequency the field
+     * barely changes over that, so every station turns by very nearly the same
+     * amount as the last -- which is the definition of a circle, and is what the
+     * passages came out as. At this frequency a step crosses a fifth of a period,
+     * which wanders smoothly over a handful of stations and never closes a loop.
+     *
+     * Sampled at the station's own position, so two passages of one system that
+     * pass near each other bend alike -- which is what a shared joint in the rock
+     * would do.
+     */
+    NoiseConfig noise_cave{2011, 0.45};
+    /**
      * @brief How strongly the detail field displaces the sampled surface, 0 to 1.
      *
      * Zero -- the default -- leaves the surface exactly as the passes computed
@@ -743,21 +1246,72 @@ struct MapConfig {
      */
     double temperature_lapse_rate = 0.40;
     /**
-     * @brief Shapes the latitude curve between pole and equator.
+     * @brief Shapes the latitude curve between the polar cap and the equator.
      *
      * A straight ramp (1.0) makes most of the map cold once the lapse rate is
      * subtracted -- the mean latitude term is only 0.5 before altitude takes its
      * cut. Values above 1 hold the temperate band wide across the middle and
-     * push the drop out toward narrow polar caps, which is how a real world is
+     * push the drop out toward the caps, which is how a real world is
      * distributed.
+     *
+     * It shapes the *temperate* half of the curve only. Where the frozen ground
+     * begins is `polar_extent_north` / `polar_extent_south`, which used to be an
+     * emergent consequence of this exponent and is now said outright.
      */
     double temperature_falloff = 1.7;
+    /**
+     * @brief Shifts the whole world warmer or colder, before the range clamp.
+     *
+     * The knob the climate had no way of expressing: latitude said where the cold
+     * went and the lapse rate said how much height cost, but nothing said how warm
+     * the world *is*. Added to every sample, so an ice age and a hothouse are one
+     * number apart on the same map.
+     *
+     * Roughly -0.5 to +0.5 is useful; beyond that the clamp flattens whole
+     * hemispheres to one value. Zero changes nothing.
+     */
+    double temperature_offset = 0.0;
+    /**
+     * @brief Fraction of the map at the `y = 0` edge that is frozen, 0 to 0.5.
+     *
+     * The polar cap, stated as a share of the map rather than inferred from an
+     * exponent. Inside it the curve falls from freezing at the cap's inner edge to
+     * nothing at the pole; outside it the curve climbs from freezing to full warmth
+     * at the equator, shaped by `temperature_falloff`.
+     *
+     * **Zero means no polar region on this side.** The cap vanishes and the curve
+     * spans freezing to equatorial across the whole hemisphere, so latitude alone
+     * never selects ice, glacier or cold desert. Altitude still can, which is
+     * right: a mountain is cold at any latitude.
+     *
+     * The default reproduces the cap the old curve happened to produce -- at a
+     * falloff of 1.7 the band fell below freezing beyond `0.8^(1/1.7)` of the way
+     * to the pole, which is the outer 6.5% of the map.
+     */
+    double polar_extent_north = 0.065;
+    /** @brief Fraction of the map at the `y = grid_size` edge that is frozen, 0 to 0.5. */
+    double polar_extent_south = 0.065;
     /**
      * @brief Laplacian relaxation passes applied to the height field.
      *
      * Distance-from-coast elevation is terraced: a quarter of the full height
-     * range could fall between two adjacent cells, which reads as facets rather
-     * than terrain. Each pass pulls a corner toward the mean of its neighbours.
+     * range could fall between two adjacent cells. Each pass pulls a corner toward
+     * the mean of its neighbours, and then a cell toward the mean of its
+     * neighbours, so what this relaxes is the *stored* field -- the shape of the
+     * landform, and what biomes and routing are classified from.
+     *
+     * It is not what decides how smooth a rendered map looks, and setting it to 0
+     * does not produce facets. Two things smooth the picture regardless:
+     * `assign_center_elevations_()` always gives a cell the mean of its corners --
+     * which span some 70 m -- and `MapGraph::elevation_at()` interpolates between
+     * cell sites, so the drawn surface is continuous by construction. At one pixel
+     * to the metre a 60 m cell is 60 pixels across, and a step between two cells is
+     * spread over all of them.
+     *
+     * `MapConfig::elevation_surface` is the setting that turns the interpolation
+     * off. The facet claim this doc used to make belonged to the corner-fan
+     * interpolation these passes were written against, which creased once per fan
+     * edge and put a tent pole at every site; the Delaunay surface replaced it.
      */
     int elevation_smoothing_iterations = 6;
     /** @brief How far toward the neighbour mean each smoothing pass moves a corner. */
@@ -873,6 +1427,22 @@ struct MapConfig {
      */
     double river_channel_depth_per_volume_m = 4.0;
     /**
+     * @brief How far upstream a river's surface transitions to meet its mouth, in metres.
+     *
+     * Over this last stretch two things change together: the sheet settles from the
+     * rim of its channel down into the bed, and it is drawn toward the level of the
+     * water it empties into. Both are needed to arrive flush -- sampling the rim
+     * holds a river 10 m above the sea at the median mouth, and without the pull
+     * toward the body it lands wherever the ground happened to leave it.
+     *
+     * The pull is downward only, so a river entering a lake standing above it keeps
+     * its own height rather than climbing to meet it.
+     *
+     * About four cells at the default scale: long enough to read as a descent rather
+     * than a kink, short enough that the upland profile is untouched.
+     */
+    double river_mouth_blend_m = 250.0;
+    /**
      * @brief How deep a river cuts the valley it runs in, in metres.
      *
      * Rivers erode. Without this the elevation field has no idea a river pass
@@ -950,6 +1520,8 @@ struct MapConfig {
     RegionConfig regions;
     /** @brief Notable-place parameters. */
     LandmarkConfig landmarks;
+    /** @brief Cave system parameters. */
+    CaveConfig caves;
 
     // --- Pass toggles ---
 
@@ -965,6 +1537,7 @@ struct MapConfig {
     bool enable_regions = true;     /**< @brief Run the region pass. */
     bool enable_towns = true;       /**< @brief Run the town pass. */
     bool enable_landmarks = true;   /**< @brief Run the landmark pass. */
+    bool enable_caves = true;       /**< @brief Run the cave pass. */
     bool enable_noisy_edges = true; /**< @brief Run the noisy-edge pass. */
 
     /**
@@ -1623,6 +2196,38 @@ struct BiomePalette {
     glm::vec3 landmark_built_color = glm::vec3(90, 60, 130);
     /** @brief Colour of an individual packed building footprint. */
     glm::vec3 building_color = glm::vec3(70, 50, 40);
+    /**
+     * @brief Colour of a civic building -- a hall, market, temple and the rest.
+     *
+     * Distinct from `building_color` on purpose: a settlement whose key structures
+     * look exactly like its houses has no legible centre, which is what every
+     * settlement used to be.
+     */
+    glm::vec3 civic_color = glm::vec3(150, 92, 46);
+    /** @brief Colour of a street inside a settlement; a lane, not a road. */
+    glm::vec3 street_color = glm::vec3(176, 158, 134);
+    /** @brief Colour of the open ground of a market square. */
+    glm::vec3 plaza_color = glm::vec3(206, 192, 170);
+    /**
+     * @brief Colour of the shallowest cave passage on the overview layer.
+     *
+     * The two ends of a ramp, not two categories: a passage is coloured by
+     * interpolating between them on its floor height, so the overview reads as an
+     * elevation map of the caves in the same way the terrain layer does of the
+     * ground. Warm at the top and cold at the bottom, which is the one ordering a
+     * reader does not have to be told.
+     *
+     * The exported `cave_floor_*` and `cave_roof_*` layers ignore both: those are
+     * data, written in the same eight-bit greyscale as the elevation layer so they
+     * can be compared with it directly.
+     */
+    glm::vec3 cave_shallow_color = glm::vec3(236, 196, 120);
+    /** @brief Colour of the deepest cave passage on the overview layer. */
+    glm::vec3 cave_deep_color = glm::vec3(86, 72, 156);
+    /** @brief Colour of the ringed marker drawn where a cave opens. */
+    glm::vec3 cave_mouth_color = glm::vec3(230, 230, 236);
+    /** @brief Colour of a chamber outline, drawn over the passage colour. */
+    glm::vec3 cave_chamber_color = glm::vec3(210, 140, 96);
     /** @brief Colour the canvas is cleared to before any cell is filled. */
     glm::vec3 background_color = glm::vec3(255, 255, 255);
 

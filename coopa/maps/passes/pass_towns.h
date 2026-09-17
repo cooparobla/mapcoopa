@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <limits>
 #include <numeric>
 #include <queue>
 #include <random>
@@ -108,7 +109,12 @@ public:
             town.score = scores[static_cast<std::size_t>(candidate)];
             town.tier = tier_for_rank_(static_cast<int>(graph.towns.size()), towns);
             town.cells = claim_cells_(graph, center, towns, town.tier, claimed);
+            // Streets and square before the packer: both are things the buildings
+            // have to be laid out *around*, so they cannot be decided afterwards.
+            town.streets = gather_streets_(graph, town, config);
+            town.plaza = site_plaza_(graph, town, config);
             town.buildings = pack_settlement_(graph, town, config, rng);
+            assign_roles_(town, config.towns);
             assign_statistics_(town, center, towns, rng);
             town.name = name_for_(graph, town, rng);
             graph.towns.push_back(std::move(town));
@@ -297,29 +303,11 @@ private:
             if (static_cast<int>(buildings.size()) >= budget) {
                 break;
             }
-            pack_cell_(graph, graph.centers[static_cast<std::size_t>(cell_id)], config, budget,
-                       rng, buildings);
+            pack_cell_(graph, graph.centers[static_cast<std::size_t>(cell_id)], config,
+                       town.plaza, budget, rng, buildings);
         }
         return buildings;
     }
-
-    /**
-     * @struct Street
-     * @brief A line a settlement's buildings front onto, in grid units.
-     */
-    struct Street {
-        MapPoint from;      /**< @brief Inner end, at the cell's site. */
-        MapPoint to;        /**< @brief Outer end, where the street leaves the cell. */
-        double bearing = 0.0; /**< @brief Direction from `from` to `to`, in radians. */
-        double length = 0.0;  /**< @brief Distance between the ends. */
-        /**
-         * @brief Extra setback before the first plot, in grid units.
-         *
-         * A river's half-width, so plots line the bank rather than the channel.
-         * Zero for a road, which buildings may front directly.
-         */
-        double clearance = 0.0;
-    };
 
     /**
      * @brief Derives the streets running through a settlement's cell.
@@ -337,16 +325,16 @@ private:
      * @param center The settlement's cell.
      * @return The streets, innermost end first.
      */
-    std::vector<Street> derive_streets_(const MapGraph& graph, const MapCenter& center,
+    std::vector<MapStreet> derive_streets_(const MapGraph& graph, const MapCenter& center,
                                         const MapConfig& config) const {
-        std::vector<Street> streets;
+        std::vector<MapStreet> streets;
 
         for (const EdgeId edge_id : center.borders) {
             const MapEdge& edge = graph.edges[static_cast<std::size_t>(edge_id)];
             if (!edge.road && edge.river <= 0) {
                 continue;
             }
-            Street street = make_street_(center.point, edge.midpoint);
+            MapStreet street = make_street(center.point, edge.midpoint);
             if (edge.river > 0) {
                 // Set the frontage back past the water's edge. Without this the
                 // packer aims plots at the channel and every one is rejected,
@@ -366,7 +354,7 @@ private:
                       });
             const std::size_t wanted = std::min<std::size_t>(k_fallback_streets, by_distance.size());
             for (std::size_t i = 0; i < wanted; ++i) {
-                streets.push_back(make_street_(
+                streets.push_back(make_street(
                     center.point, graph.corners[static_cast<std::size_t>(by_distance[i])].point));
             }
         }
@@ -374,14 +362,129 @@ private:
         return streets;
     }
 
-    /** @brief Builds a street between two points, precomputing its bearing and length. */
-    static Street make_street_(const MapPoint& from, const MapPoint& to) {
-        Street street;
-        street.from = from;
-        street.to = to;
-        street.bearing = std::atan2(to.y - from.y, to.x - from.x);
-        street.length = from.distance_to(to);
-        return street;
+    /**
+     * @brief Every street of a settlement, one fan per cell it claims.
+     *
+     * A capital spans seven cells and each has its own approaches, so its streets
+     * are the union rather than the primary cell's alone. That was already how the
+     * packer worked; this is what makes it visible.
+     *
+     * @param graph The map being generated.
+     * @param town The settlement, with its cells already claimed.
+     * @param config Supplies the river setbacks.
+     * @return Every street, grouped by cell in claim order.
+     */
+    std::vector<MapStreet> gather_streets_(const MapGraph& graph, const MapTown& town,
+                                           const MapConfig& config) const {
+        std::vector<MapStreet> streets;
+        for (const CenterId cell_id : town.cells) {
+            const MapCenter& cell = graph.centers[static_cast<std::size_t>(cell_id)];
+            const std::vector<MapStreet> fan = derive_streets_(graph, cell, config);
+            streets.insert(streets.end(), fan.begin(), fan.end());
+        }
+        return streets;
+    }
+
+    /**
+     * @brief Places a settlement's market square, when it has the ground for one.
+     *
+     * At the primary cell's site, because that is where the street fan already
+     * converges -- so the lanes radiate from the square without either being made
+     * to agree with the other.
+     *
+     * Granted on two conditions, and both matter. The settlement must claim at
+     * least `plaza_min_cells`, which is what keeps a one-cell village a village
+     * rather than a hamlet with a hole in it. And the square must actually fit:
+     * the radius is trimmed against the distance to the nearest cell corner, and
+     * abandoned if what is left could not hold even one building's frontage
+     * around it.
+     *
+     * @param graph The map being generated.
+     * @param town The settlement, with its cells already claimed.
+     * @param config Supplies the plaza radius and the tier thresholds.
+     * @return The square, or a zero radius when the settlement gets none.
+     */
+    MapPlaza site_plaza_(const MapGraph& graph, const MapTown& town,
+                         const MapConfig& config) const {
+        MapPlaza plaza;
+        const TownConfig& towns = config.towns;
+        if (static_cast<int>(town.cells.size()) < towns.plaza_min_cells
+            || towns.plaza_radius_m <= 0.0) {
+            return plaza;
+        }
+        const MapCenter& primary = graph.centers[static_cast<std::size_t>(town.center)];
+        if (primary.corners.empty()) {
+            return plaza;
+        }
+
+        double nearest_corner = std::numeric_limits<double>::max();
+        for (const CornerId corner_id : primary.corners) {
+            nearest_corner = std::min(
+                nearest_corner,
+                primary.point.distance_to(graph.corners[static_cast<std::size_t>(corner_id)].point));
+        }
+
+        const double wanted = meters_to_grid(config, towns.plaza_radius_m);
+        const double frontage = meters_to_grid(config, towns.building_size_max_m);
+        // Leave a building's depth of ground between the square and the cell edge,
+        // or the square swallows the cell and there is nowhere left to build.
+        const double room = nearest_corner - frontage;
+        if (room <= 0.0) {
+            return plaza;
+        }
+        plaza.centre = primary.point;
+        plaza.radius = std::min(wanted, room);
+        return plaza;
+    }
+
+    /**
+     * @brief Hands the civic roles to the buildings nearest the heart of the town.
+     *
+     * Nearest the square when there is one, nearest the site when there is not, so
+     * the hall and the market end up at the centre rather than scattered through
+     * the outskirts. Taken in order from one roster shared by every tier -- a town
+     * is a prefix of a capital, which is what makes it read as a smaller version
+     * of the same thing rather than a different kind of place.
+     *
+     * @param town The settlement; its buildings must already be packed.
+     * @param towns Supplies how many civic buildings each tier is given.
+     */
+    void assign_roles_(MapTown& town, const TownConfig& towns) const {
+        static constexpr std::array<BuildingRole, 9> k_roster = {
+            BuildingRole::Well,     BuildingRole::Hall,      BuildingRole::Market,
+            BuildingRole::Smithy,   BuildingRole::Temple,    BuildingRole::Inn,
+            BuildingRole::Granary,  BuildingRole::Barracks,  BuildingRole::Warehouse};
+
+        int wanted = 0;
+        switch (town.tier) {
+            case TownTier::Capital: wanted = towns.capital_civic_count; break;
+            case TownTier::Town:    wanted = towns.town_civic_count; break;
+            case TownTier::Village: wanted = towns.village_civic_count; break;
+        }
+        wanted = std::clamp(wanted, 0, static_cast<int>(k_roster.size()));
+        // And never more than half the settlement. A hamlet that came out with
+        // three buildings does not have a hall, a market and one house -- the tier
+        // says what it may have, the ground says what it did.
+        wanted = std::min(wanted, static_cast<int>(town.buildings.size() / 2));
+        if (wanted <= 0 || town.buildings.empty()) {
+            return;
+        }
+
+        const MapPoint heart = town.plaza.radius > 0.0 ? town.plaza.centre : town.point;
+        std::vector<std::size_t> order(town.buildings.size());
+        for (std::size_t i = 0; i < order.size(); ++i) {
+            order[i] = i;
+        }
+        std::sort(order.begin(), order.end(), [&town, &heart](std::size_t a, std::size_t b) {
+            return heart.distance_to(town.buildings[a].point)
+                 < heart.distance_to(town.buildings[b].point);
+        });
+
+        const std::size_t granted =
+            std::min(static_cast<std::size_t>(wanted), order.size());
+        for (std::size_t i = 0; i < granted; ++i) {
+            town.buildings[order[i]].role = k_roster[i];
+        }
     }
 
     /**
@@ -413,7 +516,8 @@ private:
      * @return The placed buildings.
      */
     void pack_cell_(const MapGraph& graph, const MapCenter& center, const MapConfig& config,
-                    int budget, std::mt19937& rng, std::vector<MapBuilding>& buildings) const {
+                    const MapPlaza& plaza, int budget, std::mt19937& rng,
+                    std::vector<MapBuilding>& buildings) const {
         if (center.corners.size() < 3 || budget <= 0) {
             return;
         }
@@ -424,11 +528,13 @@ private:
             polygon.push_back(graph.corners[static_cast<std::size_t>(corner_id)].point);
         }
 
-        const WaterKeepOut keep_out = collect_water_(graph, center, config);
         const Layout layout = layout_for_(config);
-        place_street_frontage_(polygon, derive_streets_(graph, center, config), layout, keep_out,
-                               budget, rng, buildings);
-        place_infill_(polygon, layout, keep_out, budget, rng, buildings);
+        // Streets first: they are one of the things the buildings must keep clear
+        // of, as well as the lines they are ranged along.
+        const std::vector<MapStreet> streets = derive_streets_(graph, center, config);
+        const KeepOut keep_out = collect_keep_out_(graph, center, streets, config);
+        place_street_frontage_(polygon, streets, layout, keep_out, plaza, budget, rng, buildings);
+        place_infill_(polygon, streets, layout, keep_out, plaza, budget, rng, buildings);
     }
 
     /**
@@ -607,24 +713,64 @@ private:
     }
 
     /**
-     * @struct WaterKeepOut
-     * @brief The water a settlement's buildings must stay clear of.
+     * @struct KeepOut
+     * @brief Everything a settlement's buildings must stay clear of, as segments.
      *
-     * Segments are the cell's own bounding edges: a river runs *along* a cell
-     * boundary, and a lake or sea sits on the far side of one, so both hazards
-     * are edges of the polygon the buildings sit inside. Containment alone
-     * therefore cannot catch them.
+     * Water came first: a river runs *along* a cell boundary and a lake or sea sits
+     * on the far side of one, so both are edges of the polygon the buildings sit
+     * inside, and containment alone cannot catch them.
+     *
+     * Roadways joined it for the opposite reason. A street is a line the packer
+     * deliberately aims plots *at*, and the road network runs through a
+     * settlement's cells on its way between them -- so with nothing stated, 37% of
+     * buildings stood on a lane and 18% on a road. One list, because the test is
+     * identical: keep every rotated corner further than this clearance from this
+     * segment.
      */
-    struct WaterKeepOut {
+    struct KeepOut {
         /** @brief Segment endpoints paired with the clearance required from each. */
         std::vector<std::array<MapPoint, 2>> segments;
         std::vector<double> clearances;
     };
 
     /** @brief Gathers the river and shoreline edges bounding a cell, with their clearances. */
-    WaterKeepOut collect_water_(const MapGraph& graph, const MapCenter& center,
-                                const MapConfig& config) const {
-        WaterKeepOut keep_out;
+    KeepOut collect_keep_out_(const MapGraph& graph, const MapCenter& center,
+                              const std::vector<MapStreet>& streets,
+                              const MapConfig& config) const {
+        KeepOut keep_out;
+        const double verge = meters_to_grid(config, config.towns.street_clearance_m);
+
+        // The cell's own lanes. These are the lines the frontage marches along, so
+        // without them the packer walks plots straight onto the carriageway.
+        const double lane = meters_to_grid(config, config.towns.street_width_m) * 0.5 + verge;
+        for (const MapStreet& street : streets) {
+            keep_out.segments.push_back({street.from, street.to});
+            keep_out.clearances.push_back(lane);
+        }
+
+        // And the road network passing through. Measured against the *smoothed*
+        // centreline the roads layer actually strokes, not the straight Delaunay
+        // edge it was derived from -- a building clear of one can still stand on
+        // the other. Filtered to the segments that could possibly reach this cell,
+        // so the inner loop stays short.
+        double cell_reach = 0.0;
+        for (const CornerId corner_id : center.corners) {
+            cell_reach = std::max(
+                cell_reach,
+                center.point.distance_to(graph.corners[static_cast<std::size_t>(corner_id)].point));
+        }
+        for (const MapRoad& road : graph.roads) {
+            const double clearance = road_width_for(config, road.road_class) * 0.5 + verge;
+            for (std::size_t i = 0; i + 1 < road.points.size(); ++i) {
+                if (distance_to_segment_(center.point, road.points[i], road.points[i + 1])
+                    > cell_reach + clearance) {
+                    continue;
+                }
+                keep_out.segments.push_back({road.points[i], road.points[i + 1]});
+                keep_out.clearances.push_back(clearance);
+            }
+        }
+
         for (const EdgeId edge_id : center.borders) {
             const MapEdge& edge = graph.edges[static_cast<std::size_t>(edge_id)];
             if (edge.v0 == k_invalid_id || edge.v1 == k_invalid_id) {
@@ -670,6 +816,8 @@ private:
         double street_spacing = 0.0; /**< @brief Along the street, between plots. */
         double position_jitter = 0.0;/**< @brief Random offset applied to a street-front plot. */
         double water_clearance = 0.0;/**< @brief Clear ground kept between a building and water. */
+        /** @brief Centreline to the nearest ground a building may stand on, across a lane. */
+        double lane_clearance = 0.0;
         double rotation_jitter = 0.0;/**< @brief Radians of yaw wobble; already unit-free. */
         int infill_attempts = 0;     /**< @brief Rejection draws before infill gives up. */
     };
@@ -684,6 +832,8 @@ private:
         layout.street_spacing = meters_to_grid(config, towns.street_spacing_m);
         layout.position_jitter = meters_to_grid(config, towns.position_jitter_m);
         layout.water_clearance = meters_to_grid(config, towns.water_clearance_m);
+        layout.lane_clearance = meters_to_grid(config, towns.street_width_m) * 0.5
+                              + meters_to_grid(config, towns.street_clearance_m);
         layout.rotation_jitter = towns.rotation_jitter;
         layout.infill_attempts = towns.infill_attempts;
         return layout;
@@ -703,9 +853,9 @@ private:
 
     /** @brief Places plots in pairs flanking each street, walking outward from the site. */
     void place_street_frontage_(const std::vector<MapPoint>& polygon,
-                                const std::vector<Street>& streets, const Layout& layout,
-                                const WaterKeepOut& keep_out, int budget, std::mt19937& rng,
-                                std::vector<MapBuilding>& buildings) const {
+                                const std::vector<MapStreet>& streets, const Layout& layout,
+                                const KeepOut& keep_out, const MapPlaza& plaza, int budget,
+                                std::mt19937& rng, std::vector<MapBuilding>& buildings) const {
         if (streets.empty() || layout.street_spacing <= 0.0) {
             return;
         }
@@ -717,12 +867,11 @@ private:
         std::uniform_real_distribution<double> pick_size(layout.building_min,
                                                          layout.building_max);
 
-        for (const Street& street : streets) {
+        for (const MapStreet& street : streets) {
             const double along_x = std::cos(street.bearing);
             const double along_y = std::sin(street.bearing);
             const double across_x = -along_y;
             const double across_y = along_x;
-            const double offset = layout.street_offset + street.clearance;
 
             for (double t = layout.street_spacing; t < street.length;
                  t += layout.street_spacing) {
@@ -731,17 +880,32 @@ private:
                         return;
                     }
                     const double size = pick_size(rng);
+                    const double yaw = yaw_jitter(rng);
                     MapBuilding candidate;
                     candidate.width = size;
                     candidate.height = size;
-                    candidate.rotation = street.bearing + yaw_jitter(rng);
+                    candidate.rotation = street.bearing + yaw;
+
+                    // Set back by the plot's own reach across the lane, not by a
+                    // flat distance. A square of side `s` turned by `yaw` relative
+                    // to the street reaches `(s/2)(|cos| + |sin|)` across it, so a
+                    // flat offset puts every plot larger than it expected onto the
+                    // carriageway -- which is what the largest ones were, by a
+                    // metre, before this. `street_offset` stays as the nominal
+                    // setback and a smaller plot still sits exactly where it did.
+                    const double reach =
+                        size * 0.5 * (std::abs(std::cos(yaw)) + std::abs(std::sin(yaw)));
+                    const double offset =
+                        std::max(layout.street_offset, layout.lane_clearance + reach)
+                        + street.clearance;
+
                     candidate.point = {
                         street.from.x + along_x * t + across_x * side * offset
                             + offset_jitter(rng),
                         street.from.y + along_y * t + across_y * side * offset
                             + offset_jitter(rng)};
 
-                    if (can_place_(polygon, buildings, keep_out, candidate)) {
+                    if (can_place_(polygon, buildings, keep_out, plaza, candidate)) {
                         buildings.push_back(candidate);
                     }
                 }
@@ -749,10 +913,20 @@ private:
         }
     }
 
-    /** @brief Spends the remaining budget on jittered rejection sampling inside the cell. */
-    void place_infill_(const std::vector<MapPoint>& polygon, const Layout& layout,
-                       const WaterKeepOut& keep_out, int budget, std::mt19937& rng,
-                       std::vector<MapBuilding>& buildings) const {
+    /**
+     * @brief Spends the remaining budget on jittered rejection sampling inside the cell.
+     *
+     * Aligned to the nearest street, not to a random bearing. It used to draw a yaw
+     * uniformly from a full turn, which is why a settlement read as scatter however
+     * carefully the frontage had been laid: half the buildings faced nowhere, and a
+     * row is only legible if its neighbours agree with it. Position stays jittered,
+     * which is what keeps the layout off a lattice -- that is a property of where
+     * buildings sit, not of which way they face.
+     */
+    void place_infill_(const std::vector<MapPoint>& polygon,
+                       const std::vector<MapStreet>& streets, const Layout& layout,
+                       const KeepOut& keep_out, const MapPlaza& plaza, int budget,
+                       std::mt19937& rng, std::vector<MapBuilding>& buildings) const {
         if (static_cast<int>(buildings.size()) >= budget) {
             return;
         }
@@ -769,6 +943,8 @@ private:
         std::uniform_real_distribution<double> pick_x(min_x, max_x);
         std::uniform_real_distribution<double> pick_y(min_y, max_y);
         std::uniform_real_distribution<double> pick_yaw(0.0, k_two_pi);
+        std::uniform_real_distribution<double> yaw_jitter(-layout.rotation_jitter,
+                                                          layout.rotation_jitter);
         std::uniform_real_distribution<double> pick_size(layout.building_min,
                                                          layout.building_max);
 
@@ -782,10 +958,12 @@ private:
             MapBuilding candidate;
             candidate.width = size;
             candidate.height = size;
-            candidate.rotation = pick_yaw(rng);
             candidate.point = {pick_x(rng), pick_y(rng)};
+            candidate.rotation = streets.empty()
+                                     ? pick_yaw(rng)
+                                     : nearest_bearing_(streets, candidate.point) + yaw_jitter(rng);
 
-            if (can_place_(polygon, buildings, keep_out, candidate)) {
+            if (can_place_(polygon, buildings, keep_out, plaza, candidate)) {
                 buildings.push_back(candidate);
             }
         }
@@ -800,7 +978,7 @@ private:
      */
     bool can_place_(const std::vector<MapPoint>& polygon,
                     const std::vector<MapBuilding>& buildings,
-                    const WaterKeepOut& keep_out,
+                    const KeepOut& keep_out, const MapPlaza& plaza,
                     const MapBuilding& candidate) const {
         const std::array<MapPoint, 4> corners = building_corners(candidate);
 
@@ -809,13 +987,27 @@ private:
                 return false;
             }
         }
-        for (std::size_t i = 0; i < keep_out.segments.size(); ++i) {
-            const double clearance = keep_out.clearances[i];
+        if (plaza.radius > 0.0) {
+            // The square is open ground. Testing every rotated corner rather than
+            // the centre is what stops a building from leaning into it.
             for (const MapPoint& corner : corners) {
-                if (distance_to_segment_(corner, keep_out.segments[i][0],
-                                         keep_out.segments[i][1]) < clearance) {
+                if (plaza.centre.distance_to(corner) < plaza.radius) {
                     return false;
                 }
+            }
+        }
+        for (std::size_t i = 0; i < keep_out.segments.size(); ++i) {
+            // Against the whole footprint, not its corners. A corner test misses a
+            // lane that crosses the *middle* of a large plot -- all four corners
+            // are then further from the centreline than the clearance while the
+            // street runs straight through the building -- and misses a short road
+            // segment lying wholly inside one. The corridor is a rotated box, and
+            // box-against-box is exactly what `buildings_overlap()` already
+            // decides, by separating axis.
+            if (buildings_overlap(corridor_(keep_out.segments[i][0], keep_out.segments[i][1],
+                                            keep_out.clearances[i]),
+                                  candidate)) {
+                return false;
             }
         }
         for (const MapBuilding& placed : buildings) {
@@ -824,6 +1016,51 @@ private:
             }
         }
         return true;
+    }
+
+    /**
+     * @brief Bearing of the street a point sits nearest to.
+     *
+     * Nearest by distance to the *segment*, not to its ends: a plot beside the
+     * middle of a lane fronts that lane, however far its junctions are.
+     *
+     * @param streets The cell's streets; must not be empty.
+     * @param point The plot centre being oriented.
+     * @return The bearing to face, in radians.
+     */
+    double nearest_bearing_(const std::vector<MapStreet>& streets, const MapPoint& point) const {
+        double best = streets.front().bearing;
+        double nearest = std::numeric_limits<double>::max();
+        for (const MapStreet& street : streets) {
+            const double distance = distance_to_segment_(point, street.from, street.to);
+            if (distance < nearest) {
+                nearest = distance;
+                best = street.bearing;
+            }
+        }
+        return best;
+    }
+
+    /**
+     * @brief A keep-out segment as the rotated box its clearance sweeps out.
+     *
+     * Lets a corridor be tested against a footprint with the same separating-axis
+     * routine two footprints use, rather than a second near-miss geometry written
+     * specially for it.
+     *
+     * @param from One end of the segment.
+     * @param to The other end.
+     * @param clearance Half the corridor's width, in grid units.
+     * @return A box covering the corridor; square ends, which under-covers the caps
+     *         by less than a clearance and never over-covers.
+     */
+    static MapBuilding corridor_(const MapPoint& from, const MapPoint& to, double clearance) {
+        MapBuilding box;
+        box.point = {(from.x + to.x) * 0.5, (from.y + to.y) * 0.5};
+        box.width = std::max(from.distance_to(to), 1e-9);
+        box.height = std::max(clearance * 2.0, 1e-9);
+        box.rotation = std::atan2(to.y - from.y, to.x - from.x);
+        return box;
     }
 
     /** @brief Shortest distance from a point to a line segment. */

@@ -37,7 +37,7 @@ namespace maps {
  *
  * ### Why this is the part worth threading
  *
- * A default map -- 4800 x 4800, seven layers -- spends about 135 ms generating
+ * A default map -- 4800 x 4800, thirteen layers -- spends about 135 ms generating
  * the world and the rest of its time here: roughly 3.9 s rasterising and 5.5 s
  * inside stb's deflate. Generation is a rounding error by comparison, which is
  * why it is not what this class parallelises.
@@ -45,7 +45,7 @@ namespace maps {
  * Two levels, both partitioned by *disjoint output*, which is what keeps the
  * result bit-identical to a serial run:
  *
- * - **Across layers.** The seven layers share nothing but the map they read;
+ * - **Across layers.** The layers share nothing but the map they read;
  *   each owns its own `Image` and its own file. This is the level that
  *   parallelises the PNG encode, and nothing else can: stb's deflate is one
  *   opaque call per image.
@@ -196,10 +196,19 @@ private:
         // composite reads it across the whole image, so a band cannot build its
         // own -- and left to, every band would rebuild the entire raster. Only
         // that one mode needs it, so only that mode pays for it.
+        //
+        // `ElevationSurface::Blended` needs one for a different reason -- the
+        // composite's elevation shading has to read the smoothed raster rather than
+        // sample the flat surface the blend is applied *after* -- and asks for no
+        // extra blur on top of it.
         HeightField height;
         const HeightField* height_ptr = nullptr;
-        if (config.composite_shading == CompositeShading::Hillshade) {
+        const bool hillshade = config.composite_shading == CompositeShading::Hillshade;
+        if (hillshade) {
             height = MapLayers::build_height_field(graph, config, palette, &geometry);
+            height_ptr = &height;
+        } else if (MapLayers::effective_surface(config) == ElevationSurface::Blended) {
+            height = MapLayers::build_height_field(graph, config, palette, &geometry, 0.0);
             height_ptr = &height;
         }
 
@@ -228,8 +237,8 @@ private:
                     if (inner.is_cancelled()) {
                         return;
                     }
-                    one_layer_(graph, config, prefix, palette, logger, geometry, height_ptr, i,
-                               ok, &inner);
+                    one_layer_(graph, config, prefix, palette, logger, geometry, height_ptr, i, ok,
+                               &inner);
                     state->step();
                 }
             },
@@ -239,9 +248,8 @@ private:
     /** @brief Renders one layer -- banded if there is an engine -- then writes it. */
     void one_layer_(const MapGraph& graph, const MapConfig& config, const std::string& prefix,
                     const BiomePalette& palette, coopa::debug::Logger* logger,
-                    const CellGeometry& geometry, const HeightField* height,
-                    std::size_t index, std::atomic<bool>& ok,
-                    const coopa::job::JobContext* ctx) const {
+                    const CellGeometry& geometry, const HeightField* height, std::size_t index,
+                    std::atomic<bool>& ok, const coopa::job::JobContext* ctx) const {
         const MapLayer layer = static_cast<MapLayer>(index);
         Image image = render_layer_(graph, config, palette, geometry, height, layer, ctx);
         if (ctx != nullptr && ctx->is_cancelled()) {
@@ -270,35 +278,33 @@ private:
      * The bands write into one `Image`, which is safe because each owns a
      * disjoint run of rows -- and reproducible, because each replays the same
      * draw sequence clipped to those rows.
+     *
+     * One route, whatever the thread count: allocate, draw, finish. The engineless
+     * case used to hand off to `MapLayers::render()` instead, and that shortcut
+     * stopped being harmless the moment a layer grew a whole-image pass -- only
+     * that one path would have run it, so an unthreaded render and a threaded one
+     * would have produced different pixels. `finish()` is called exactly once here,
+     * after every band, which is the only place it can be correct.
      */
     Image render_layer_(const MapGraph& graph, const MapConfig& config,
                         const BiomePalette& palette, const CellGeometry& geometry,
                         const HeightField* height, MapLayer layer,
                         const coopa::job::JobContext* ctx) const {
         const RenderSlice whole{RowBand{}, &geometry, height};
-        if (engine_ == nullptr) {
-            return MapLayers::render(layer, graph, config, palette, whole);
-        }
-
-        (void)ctx;
-        const int rows = config.image_size;
-        const int band_rows =
-            band_rows_ > 0
-                ? band_rows_
-                : std::max(1, rows / static_cast<int>(
-                                         std::max(1u, engine_->worker_count()) * 4));
-        const std::size_t bands =
-            static_cast<std::size_t>((rows + band_rows - 1) / std::max(1, band_rows));
 
         // Cleared once, here, and then only drawn into. This is why `allocate()`
         // and `render_into()` are separate entry points: a band that cleared the
         // buffer itself would wipe whatever its neighbours had already drawn.
         Image image = MapLayers::allocate(layer, config, palette);
+        const int rows = config.image_size;
+        const std::size_t bands = engine_ == nullptr ? 1 : band_count_(rows);
         if (bands <= 1) {
             MapLayers::render_into(image, layer, graph, config, palette, whole);
+            MapLayers::finish(image, layer, graph, config, palette, whole);
             return image;
         }
 
+        (void)ctx;
         engine_->parallel_for_blocking(
             bands, 1,
             [&](std::size_t begin, std::size_t end, const coopa::job::JobContext& inner) {
@@ -318,7 +324,22 @@ private:
                 }
             },
             k_map_job_type);
+        MapLayers::finish(image, layer, graph, config, palette, whole);
         return image;
+    }
+
+    /**
+     * @brief How many row bands to split a layer into.
+     * @param rows Image height in pixels.
+     * @return At least one band; one means draw it in a single call.
+     */
+    std::size_t band_count_(int rows) const {
+        const int band_rows =
+            band_rows_ > 0
+                ? band_rows_
+                : std::max(1, rows / static_cast<int>(
+                                         std::max(1u, engine_->worker_count()) * 4));
+        return static_cast<std::size_t>((rows + band_rows - 1) / std::max(1, band_rows));
     }
 
     /** @brief The engine work is spread across, or null for inline. */

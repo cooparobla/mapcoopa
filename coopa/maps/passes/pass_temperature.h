@@ -12,6 +12,7 @@
 #include <cstddef>
 
 #include <coopa/debug/logger.h>
+#include <coopa/maps/biome.h>
 #include <coopa/maps/map_config.h>
 #include <coopa/maps/map_data.h>
 #include <coopa/maps/noise.h>
@@ -29,8 +30,15 @@ namespace maps {
  * axis, so a generated world reads as a north-south slice of a globe -- cold at
  * both edges, warm through the middle.
  *
- * Three terms combine: a latitude band, a lapse rate that cools high ground,
- * and a noise field that keeps isotherms from running as straight lines.
+ * Four terms combine: a latitude band, a lapse rate that cools high ground, a
+ * noise field that keeps isotherms from running as straight lines, and a global
+ * offset that moves the whole world warmer or colder.
+ *
+ * The latitude band names its polar caps rather than implying them. It used to be
+ * `1 - d^falloff`, which does produce caps -- at the default exponent the ground
+ * froze beyond 87% of the way to the pole, the outer 6.5% of the map -- but
+ * nothing in the configuration said 6.5%, and no value of the exponent says zero.
+ * `polar_extent_north` and `polar_extent_south` say it outright, one per pole.
  */
 class PassTemperature {
 public:
@@ -72,6 +80,41 @@ private:
     static constexpr double k_variation_scale = 0.12;
 
     /**
+     * @brief The latitude term, before altitude, noise and the global offset.
+     *
+     * Piecewise about the inner edge of the polar cap, and anchored to
+     * `k_biome_frigid` there so that "polar extent" means the fraction of the map
+     * that actually classifies as frozen rather than an abstract coefficient.
+     *
+     * With `extent` of zero the cap vanishes: `polar_d` is 1, the first branch is
+     * unreachable, and the curve spans freezing to equatorial across the whole
+     * hemisphere. The coldest latitude is then exactly freezing, so latitude alone
+     * never selects ice -- altitude still can, which is what should happen.
+     *
+     * @param distance Distance from the equator, 0 at the middle and 1 at a pole.
+     * @param extent Polar fraction of the map for this hemisphere, 0 to 0.5.
+     * @param falloff Shapes the temperate half of the curve.
+     * @return Warmth in `[0, 1]` from latitude alone.
+     */
+    static double latitude_band_(double distance, double extent, double falloff) {
+        const double cap_width = 2.0 * std::clamp(extent, 0.0, 0.5);
+        const double polar_d = 1.0 - cap_width;
+        if (polar_d <= 0.0) {
+            // The whole hemisphere is cap: ramp straight from freezing to nothing.
+            return k_biome_frigid * (1.0 - distance);
+        }
+        // The width guard is not defensive: with no cap at all `polar_d` is exactly
+        // 1, and a point exactly at the pole has `distance` exactly 1, so the ramp
+        // below would divide zero by zero and hand back a NaN temperature for the
+        // whole border ring.
+        if (cap_width > 0.0 && distance >= polar_d) {
+            return k_biome_frigid * (1.0 - distance) / cap_width;
+        }
+        return k_biome_frigid
+             + (1.0 - k_biome_frigid) * (1.0 - std::pow(distance / polar_d, falloff));
+    }
+
+    /**
      * @brief Temperature at one point.
      *
      * @param noise The configured variation field.
@@ -83,13 +126,17 @@ private:
      */
     static double sample_(const Noise& noise, const MapConfig& config, double grid_size,
                           const MapPoint& point, double elevation) {
-        // 1 at the equator, falling to 0 at either pole.
         const double latitude = std::clamp(point.y / grid_size, 0.0, 1.0);
-        const double band =
-            1.0 - std::pow(std::abs(2.0 * latitude - 1.0), config.temperature_falloff);
+        // 0 at the equator, 1 at either pole. Which pole decides whose cap applies:
+        // the two are independent, so a world can carry ice at one end only.
+        const double distance = std::abs(2.0 * latitude - 1.0);
+        const double extent =
+            latitude < 0.5 ? config.polar_extent_north : config.polar_extent_south;
+
+        const double band = latitude_band_(distance, extent, config.temperature_falloff);
         const double lapse = elevation * config.temperature_lapse_rate;
         const double variation = noise.sample(point.x, point.y) * k_variation_scale;
-        return std::clamp(band - lapse + variation, 0.0, 1.0);
+        return std::clamp(band - lapse + variation + config.temperature_offset, 0.0, 1.0);
     }
 };
 

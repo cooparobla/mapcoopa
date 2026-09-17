@@ -26,6 +26,7 @@
 #include <coopa/maps/map_config.h>
 #include <coopa/maps/map_data.h>
 #include <coopa/maps/passes/pass_biomes.h>
+#include <coopa/maps/passes/pass_caves.h>
 #include <coopa/maps/passes/pass_coast.h>
 #include <coopa/maps/passes/pass_elevation.h>
 #include <coopa/maps/passes/pass_landmarks.h>
@@ -377,7 +378,7 @@ private:
         sort_cell_corners_();
         border_check_();
         if (state) {
-            state->step();   // The geometry build is one stage of the thirteen.
+            state->step();   // The geometry build is one stage of the fifteen.
         }
         if (!execute_passes_(state, ctx)) {
             logger_.info("map generation: cancelled");
@@ -389,8 +390,8 @@ private:
                      + " corners, " + std::to_string(graph_.edges.size()) + " edges)");
     }
 
-    /** @brief Steps `generate_()` reports: the geometry build plus the thirteen passes. */
-    static constexpr int k_generation_steps = 14;
+    /** @brief Steps `generate_()` reports: the geometry build plus the fourteen passes. */
+    static constexpr int k_generation_steps = 15;
 
     /**
      * @brief Runs one pass, counting it and checking for cancellation first.
@@ -448,6 +449,7 @@ private:
             && stage_<PassRegions>(config_.enable_regions, state, ctx)
             && stage_<PassTowns>(config_.enable_towns, state, ctx)
             && stage_<PassLandmarks>(config_.enable_landmarks, state, ctx)
+            && stage_<PassCaves>(config_.enable_caves, state, ctx)
             && stage_<PassNoisyEdges>(config_.enable_noisy_edges, state, ctx);
     }
 

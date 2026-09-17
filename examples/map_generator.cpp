@@ -67,11 +67,21 @@ void print_usage() {
         << "  --regions=N      provinces per nation (default 3)\n"
         << "  --no-regions     skip political geography entirely\n"
         << "  --no-landmarks   skip notable places\n"
+        << "  --caves=N        cave systems to open (default 18)\n"
+        << "  --cave-depth=M   how far below its mouth a system may reach, in metres\n"
+        << "  --cave-grade=F   steepness a slope needs to bear a cave; rise over run\n"
+        << "  --no-caves       skip caves entirely\n"
         << "  --no-roads       skip the road network\n"
         << "  --no-subdivide   draw straight cell boundaries instead of wobbled ones\n"
         << "  --out=PATH       output prefix (default \"map_out\")\n"
         << "  --config=PATH    settings file (default assets/config.yaml)\n"
         << "  --shading=MODE   composite lighting: elevation (default) | hillshade\n"
+        << "  --surface=MODE   height field between cells: interpolated (default) | flat |\n"
+        << "                   blended. flat gives one height per cell with hard edges;\n"
+        << "                   blended is flat, then blurred over the whole raster\n"
+        << "  --blend=F        blended's blur radius in cells, 0 to 1; 0 is flat exactly\n"
+        << "  --blend-variation=F  how much that radius varies from cell to cell, 0 to 1;\n"
+        << "                   0 blurs every cell equally, 1 ranges from 0 to twice --blend\n"
         << "  --threads=N      worker threads; 0 = all cores (default), 1 = serial\n"
         << "  --png-level=N    PNG deflate effort 1-9; lower is faster and larger\n"
         << "  --shape=S        landmass outline: rect (default) | circle | triangle |\n"
@@ -87,10 +97,20 @@ void print_usage() {
         << "  --channel=M      how deep the river channel itself is cut; 0 for none\n"
         << "  --no-valleys     leave the height field uncarved by the rivers\n"
         << "  --roughness=F    terrain detail amplitude, 0 (default) to 1\n"
+        << "  --temperature=F  shifts the whole world warmer or colder, -1 to 1\n"
+        << "  --polar=F        frozen fraction at each pole, 0 to 0.5; 0 for no ice caps\n"
+        << "  --polar-north=F  frozen fraction at the north pole alone\n"
+        << "  --polar-south=F  frozen fraction at the south pole alone\n"
         << "  --help           show this message\n"
         << "\n"
         << "writes PATH.yaml and one PNG per layer: elevation, water, biomes,\n"
-        << "roads, structures, landmarks, composite\n";
+        << "roads, structures, landmarks, regions, composite, and the caves --\n"
+        << "a readable caves overview, plus a cave_floor_N and cave_roof_N pair\n"
+        << "for every storey the map's systems reach, on the elevation layer's\n"
+        << "own greyscale. How many pairs that is comes from the caves rather\n"
+        << "than being fixed: a map of single-level systems writes one, and one\n"
+        << "with three-storey systems writes three. The caves are underground\n"
+        << "and are never drawn into the composite.\n";
 }
 
 /**
@@ -196,6 +216,8 @@ int main(int argc, char** argv) {
             config.show_regions = false;
         } else if (argument == "--no-landmarks") {
             config.enable_landmarks = false;
+        } else if (argument == "--no-caves") {
+            config.enable_caves = false;
         } else if (argument == "--no-roads") {
             config.enable_roads = false;
         } else if (argument == "--no-valleys") {
@@ -213,6 +235,24 @@ int main(int argc, char** argv) {
             config.towns.town_count = std::atoi(std::string(value).c_str());
         } else if (match_option(argument, "road-hubs", value)) {
             config.roads.hub_count = std::atoi(std::string(value).c_str());
+        } else if (match_option(argument, "caves", value)) {
+            config.caves.cave_count = std::atoi(std::string(value).c_str());
+            if (config.caves.cave_count < 0) {
+                std::cerr << "coopa_mapgen: --caves must not be negative\n";
+                return 1;
+            }
+        } else if (match_option(argument, "cave-depth", value)) {
+            config.caves.max_depth_m = std::atof(std::string(value).c_str());
+            if (config.caves.max_depth_m < 0.0) {
+                std::cerr << "coopa_mapgen: --cave-depth must not be negative\n";
+                return 1;
+            }
+        } else if (match_option(argument, "cave-grade", value)) {
+            config.caves.min_grade = std::atof(std::string(value).c_str());
+            if (config.caves.min_grade < 0.0 || config.caves.min_grade > 4.0) {
+                std::cerr << "coopa_mapgen: --cave-grade must be between 0 and 4\n";
+                return 1;
+            }
         } else if (match_option(argument, "countries", value)) {
             config.regions.country_count = std::atoi(std::string(value).c_str());
         } else if (match_option(argument, "regions", value)) {
@@ -290,6 +330,51 @@ int main(int argc, char** argv) {
                 std::cerr << "coopa_mapgen: --roughness must be between 0 and 1\n";
                 return 1;
             }
+        } else if (match_option(argument, "temperature", value)) {
+            config.temperature_offset = std::atof(std::string(value).c_str());
+            if (config.temperature_offset < -1.0 || config.temperature_offset > 1.0) {
+                std::cerr << "coopa_mapgen: --temperature must be between -1 and 1\n";
+                return 1;
+            }
+        } else if (match_option(argument, "polar", value)
+                   || match_option(argument, "polar-north", value)
+                   || match_option(argument, "polar-south", value)) {
+            const double extent = std::atof(std::string(value).c_str());
+            if (extent < 0.0 || extent > 0.5) {
+                std::cerr << "coopa_mapgen: polar extents must be between 0 and 0.5\n";
+                return 1;
+            }
+            // `--polar` sets both; the two sided flags set one each, so a world can
+            // carry an ice cap at one end only.
+            if (argument.rfind("--polar=", 0) == 0) {
+                config.polar_extent_north = extent;
+                config.polar_extent_south = extent;
+            } else if (argument.rfind("--polar-north=", 0) == 0) {
+                config.polar_extent_north = extent;
+            } else {
+                config.polar_extent_south = extent;
+            }
+        } else if (match_option(argument, "surface", value)) {
+            const std::string mode(value);
+            if (mode != "interpolated" && mode != "flat" && mode != "blended") {
+                std::cerr << "coopa_mapgen: --surface must be 'interpolated', 'flat' or "
+                             "'blended'\n";
+                return 1;
+            }
+            config.elevation_surface = coopa::maps::elevation_surface_from_name(mode);
+        } else if (match_option(argument, "blend", value)) {
+            config.elevation_blend = std::atof(std::string(value).c_str());
+            if (config.elevation_blend < 0.0 || config.elevation_blend > 1.0) {
+                std::cerr << "coopa_mapgen: --blend must be between 0 and 1\n";
+                return 1;
+            }
+        } else if (match_option(argument, "blend-variation", value)) {
+            config.elevation_blend_variation = std::atof(std::string(value).c_str());
+            if (config.elevation_blend_variation < 0.0
+                || config.elevation_blend_variation > 1.0) {
+                std::cerr << "coopa_mapgen: --blend-variation must be between 0 and 1\n";
+                return 1;
+            }
         } else if (match_option(argument, "shading", value)) {
             const std::string mode(value);
             if (mode != "elevation" && mode != "hillshade") {
@@ -354,6 +439,8 @@ int main(int argc, char** argv) {
     // reproduces the whole map rather than just the pass ordering.
     config.noise_island.seed = config.seed;
     config.noise_temperature.seed = config.seed + 1;
+    config.noise_blend.seed = config.seed + 2;
+    config.noise_cave.seed = config.seed + 3;
 
     // Scale the island field with the grid so --grid-size controls detail, not
     // the size of the world. The frequency is in grid units, so holding it fixed
@@ -411,6 +498,19 @@ int main(int argc, char** argv) {
         population += town.population;
     }
 
+    double cave_metres = 0.0;
+    double cave_depth_m = 0.0;
+    std::size_t cave_storeys = 0;
+    for (const coopa::maps::MapCave& cave : generator.graph().caves) {
+        cave_metres += cave.length_m;
+        cave_depth_m += coopa::maps::height_to_meters(
+            config, cave.surface_at_mouth - cave.deepest);
+        cave_storeys = std::max(cave_storeys, cave.levels.size());
+    }
+    if (!generator.graph().caves.empty()) {
+        cave_depth_m /= static_cast<double>(generator.graph().caves.size());
+    }
+
     const double world_km =
         static_cast<double>(config.grid_size) * config.meters_per_grid_unit / 1000.0;
     std::cout << "\nseed:       " << config.seed << "  (rerun with --seed=" << config.seed << ")\n"
@@ -426,6 +526,10 @@ int main(int argc, char** argv) {
               << "towns:      " << generator.graph().towns.size()
               << "  population: " << population << "\n"
               << "landmarks:  " << generator.graph().landmarks.size() << "\n"
+              << "caves:      " << generator.graph().caves.size() << "  passage: "
+              << static_cast<int>(cave_metres) << " m, mean depth "
+              << static_cast<int>(cave_depth_m) << " m, up to " << cave_storeys
+              << " storeys\n"
               << "written:    " << coopa::maps::k_map_layer_count << " layers as "
               << out_prefix << "_<layer>.png\n"
               << "            " << yaml_path << "\n"

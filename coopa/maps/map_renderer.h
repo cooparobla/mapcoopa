@@ -10,7 +10,9 @@
 #include <array>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -40,11 +42,22 @@ enum class MapLayer {
     Structures, /**< @brief Building footprints, transparent elsewhere. */
     Landmarks,  /**< @brief Settlement and landmark markers, transparent elsewhere. */
     Regions,    /**< @brief Provinces in flat colour, one fill per region and nothing over them. */
-    Composite   /**< @brief Every layer above, lit and blended. */
+    Composite,  /**< @brief Every surface layer above, lit and blended. Cave mouths, no passage. */
+    Caves       /**< @brief Readable overview of every system, over dimmed terrain. */
 };
 
-/** @brief Number of distinct `MapLayer` values. */
-inline constexpr std::size_t k_map_layer_count = 8;
+/**
+ * @brief Number of distinct `MapLayer` values.
+ *
+ * A cave's *geometry* is deliberately not among them, and is not rastered at all.
+ * A branching network of passages at several depths does not fit a stack of
+ * heightmaps without being both flattened and quantised, and the saved map
+ * already carries every station and every smoothed passage at full precision --
+ * so the picture would be a lossy, far larger copy of the document. `Caves` is
+ * the one readable overview, and `Composite` shows where systems *open*, which is
+ * the only part of a cave anyone on the surface could see.
+ */
+inline constexpr std::size_t k_map_layer_count = 9;
 
 /**
  * @brief Maps a layer to the suffix its file takes, after the output prefix.
@@ -61,6 +74,7 @@ inline std::string_view map_layer_name(MapLayer layer) {
         case MapLayer::Landmarks:  return "landmarks";
         case MapLayer::Regions:    return "regions";
         case MapLayer::Composite:  return "composite";
+        case MapLayer::Caves:      return "caves";
     }
     return "composite";
 }
@@ -79,7 +93,7 @@ inline bool map_layer_has_alpha(MapLayer layer) {
  * @struct CellGeometry
  * @brief Every cell's outline in pixel space, and the rows it spans.
  *
- * Built once and reused, for two reasons. Each of the seven layers otherwise
+ * Built once and reused, for two reasons. Each of the layers otherwise
  * rebuilds the same 6,889 outlines from scratch -- `MapGraph::cell_outline()`
  * walks a cell's edges and concatenates their subdivided paths, which is not
  * free and does not depend on which layer is being drawn.
@@ -164,7 +178,7 @@ struct RenderSlice {
  *
  * One layer is built at a time. At a 4.8 km world and 1 m/px a layer is 23
  * megapixels, which is ~92 MB held as RGBA; the generator renders, writes and
- * drops each in turn rather than holding all seven at once.
+ * drops each in turn rather than holding them all at once.
  */
 class MapLayers {
 public:
@@ -215,18 +229,80 @@ public:
      * needs nothing precomputed. Build it once per image and hand it to every
      * band through `RenderSlice::height`.
      *
+     * Under `ElevationSurface::Blended` the composite needs one too, for a
+     * different reason: its elevation shading would otherwise sample the *unsmoothed*
+     * flat surface while the elevation layer showed the smoothed one, and the two
+     * layers would disagree about the same ground. Pass `extra_blur_cells = 0` for
+     * that case -- the raster it reads has already been smoothed by `finish()`, and
+     * blurring it again would shade from a field no layer draws.
+     *
      * @param graph The map to measure.
      * @param config Supplies the render size and scale.
      * @param palette Passed through to the elevation render it is derived from.
+     * @param geometry Shared cell outlines, or null to build them locally.
+     * @param extra_blur_cells Box radius to apply on top of the raster, in cells.
      * @return The smoothed field, ready to share.
      */
     static HeightField build_height_field(const MapGraph& graph, const MapConfig& config,
                                           const BiomePalette& palette = BiomePalette{},
-                                          const CellGeometry* geometry = nullptr) {
+                                          const CellGeometry* geometry = nullptr,
+                                          double extra_blur_cells = k_shade_blur_cells) {
         const double scale = pixels_per_grid_unit_(config);
+        // `elevation()` finishes the raster itself, so under `Blended` this is
+        // already the smoothed field -- which is the whole point of reading it here
+        // rather than sampling `surface_height_()` again.
         const Image raster = elevation(graph, config, palette, RenderSlice{RowBand{}, geometry});
-        return smoothed_height_(raster,
-                                std::max(1, static_cast<int>(scale * k_shade_blur_cells)));
+        return smoothed_height_(raster, std::max(0, static_cast<int>(scale * extra_blur_cells)));
+    }
+
+    /**
+     * @brief The style actually drawn, once a blend too small to see collapses to flat.
+     *
+     * `Blended` and `Flat` are not merely close at a radius of 0 -- they are the
+     * same picture, and the knob is a continuum whose lower end has to *be* the
+     * lower style. Resolving it here rather than inside the pass is what makes that
+     * exact: the pass works on bytes, so a channel subtracted from an
+     * already-quantised height can land a grey level away from one subtracted
+     * before quantisation, and "byte-identical" would quietly become "almost".
+     *
+     * Resolved once per layer and handed down, not recomputed per pixel.
+     *
+     * @param config Supplies the style and the blend knob.
+     * @return The style to draw with.
+     */
+    static ElevationSurface effective_surface(const MapConfig& config) {
+        if (config.elevation_surface == ElevationSurface::Blended
+            && blend_radius_(config) <= 0) {
+            return ElevationSurface::Flat;
+        }
+        return config.elevation_surface;
+    }
+
+    /**
+     * @brief Applies the whole-image passes a layer needs once its pixels are drawn.
+     *
+     * The counterpart of `allocate()`: `render_into()` draws a *band*, and anything
+     * that reads outside the band it is given cannot live there. Today that is the
+     * `Blended` elevation surface, which is a blur over the finished raster.
+     *
+     * Call it exactly once per image, after every band has been drawn. Calling it
+     * twice blurs twice; calling it per band would make each band's output depend
+     * on which others had run. `render()` and `MapExporter` both do this for the
+     * caller -- a caller driving `render_into()` itself is the one that has to.
+     *
+     * @param image The fully drawn image.
+     * @param layer Which layer it holds.
+     * @param graph The map it was drawn from.
+     * @param config Supplies the surface mode and the blend radius.
+     * @param palette Unused today; taken so the signature can carry a layer that needs it.
+     * @param slice Supplies shared cell geometry; its band is ignored, by definition.
+     */
+    static void finish(Image& image, MapLayer layer, const MapGraph& graph,
+                       const MapConfig& config, const BiomePalette& palette = BiomePalette{},
+                       const RenderSlice& slice = RenderSlice{}) {
+        if (layer == MapLayer::Elevation) {
+            smooth_elevation_raster_(image, graph, config, palette, slice.geometry);
+        }
     }
 
     /**
@@ -282,6 +358,7 @@ public:
             case MapLayer::Structures: draw_structures_layer_(image, graph, config, palette, slice); return;
             case MapLayer::Landmarks:  draw_landmarks_layer_(image, graph, config, palette, slice); return;
             case MapLayer::Regions:    draw_regions_(image, graph, config, palette, slice); return;
+            case MapLayer::Caves:      draw_caves_(image, graph, config, palette, slice); return;
             case MapLayer::Composite:  break;
         }
         draw_composite_(image, graph, config, palette, slice);
@@ -306,6 +383,7 @@ public:
             case MapLayer::Structures: return structures(graph, config, palette, slice);
             case MapLayer::Landmarks:  return landmarks(graph, config, palette, slice);
             case MapLayer::Regions:    return regions(graph, config, palette, slice);
+            case MapLayer::Caves:      return caves(graph, config, palette, slice);
             case MapLayer::Composite:  break;
         }
         return composite(graph, config, palette, slice);
@@ -331,12 +409,20 @@ public:
      *
      * Set `river_incision_m` and `river_channel_depth_m` to 0 and the network
      * vanishes from here again, because then the ground really is flat under it.
+     *
+     * How the surface is drawn *between* the cells is
+     * `MapConfig::elevation_surface`. The default interpolates, which is why a map
+     * reads smooth whatever the smoothing passes are set to; `flat` gives one
+     * height per cell and a hard edge at every boundary; `blended` draws flat and
+     * then smooths the raster, which is why this function calls `finish()` rather
+     * than returning the moment the last cell is filled.
      */
     static Image elevation(const MapGraph& graph, const MapConfig& config,
                            const BiomePalette& palette = BiomePalette{},
                            const RenderSlice& slice = RenderSlice{}) {
         Image image = allocate(MapLayer::Elevation, config, palette);
         draw_elevation_(image, graph, config, palette, slice);
+        finish(image, MapLayer::Elevation, graph, config, palette, slice);
         return image;
     }
 
@@ -465,7 +551,164 @@ public:
         return image;
     }
 
+    /**
+     * @brief Every cave system over dimmed terrain, coloured by how deep it runs.
+     *
+     * The readable one, and the only cave layer meant to be looked at rather than
+     * sampled. The terrain behind it is the elevation layer at a fraction of its
+     * brightness, which is what lets a reader see *which hill* a system runs under
+     * -- a cave drawn on black is a tangle of lines with nothing to locate it
+     * against.
+     *
+     * Passages take their colour from `land_height()`, so the ramp means the same
+     * thing here as everywhere else and two systems on opposite sides of a map are
+     * directly comparable. Chambers are drawn at their real radius and mouths get a
+     * ring, because where a system *opens* is the one thing a reader looks for
+     * first.
+     *
+     * Deliberately absent from the composite. Caves are underground; drawing them
+     * on the surface render would be drawing something nobody standing there could
+     * see.
+     */
+    static Image caves(const MapGraph& graph, const MapConfig& config,
+                       const BiomePalette& palette = BiomePalette{},
+                       const RenderSlice& slice = RenderSlice{}) {
+        Image image = allocate(MapLayer::Caves, config, palette);
+        draw_caves_(image, graph, config, palette, slice);
+        return image;
+    }
+
 private:
+    /** @brief How much of its brightness the terrain keeps behind the cave overview. */
+    static constexpr double k_cave_backdrop_dim = 0.22;
+    /** @brief Radius of a cave mouth's ring, in metres. */
+    static constexpr double k_cave_mouth_radius_m = 26.0;
+    /** @brief Share of that radius the ring's bright rim takes. */
+    static constexpr double k_cave_mouth_rim = 0.45;
+    /** @brief Narrowest depth span the overview's ramp is ever stretched over. */
+    static constexpr double k_cave_ramp_minimum = 1e-4;
+
+    /** @brief Draws the readable cave overview into an already-allocated buffer. */
+    static void draw_caves_(Image& image, const MapGraph& graph, const MapConfig& config,
+                            const BiomePalette& palette, const RenderSlice& slice) {
+        const double scale = pixels_per_grid_unit_(config);
+        const double inverse_scale = 1.0 / scale;
+
+        // The terrain, dimmed. Drawn from the same sampler the elevation layer uses
+        // so the two register: a passage sitting on a ridge here is on that ridge
+        // there.
+        const Noise terrain(config.noise_terrain);
+        const TerrainDetail detail = make_terrain_detail(config, terrain);
+        const RiverChannels channels = make_river_channels(graph, config, detail);
+        const ElevationSurface surface = effective_surface(config);
+        Outlines outlines(graph, config, slice);
+        for (const MapCenter& center : graph.centers) {
+            const std::vector<MapPoint>& outline = outlines.of(center, slice);
+            if (outline.empty()) {
+                continue;
+            }
+            fill_polygon_shaded(
+                image, outline,
+                [&graph, &center, &detail, &channels, surface, inverse_scale](double px, double py) {
+                    const double height =
+                        surface_height_(graph, center, px * inverse_scale, py * inverse_scale,
+                                        detail, channels, surface);
+                    const float grey = static_cast<float>(std::clamp(height, 0.0, 1.0) * 255.0
+                                                          * k_cave_backdrop_dim);
+                    return glm::vec3(grey, grey, grey);
+                },
+                slice.band);
+        }
+
+        const CaveDepthRange range = cave_depth_range_(graph);
+        for (const MapCave& cave : graph.caves) {
+            for (const CavePassage& passage : cave.passages) {
+                const std::size_t count =
+                    std::min({passage.points.size(), passage.floors.size(), passage.radii.size()});
+                for (std::size_t i = 0; i + 1 < count; ++i) {
+                    const double middle = (passage.floors[i] + passage.floors[i + 1]) * 0.5;
+                    const double width = (passage.radii[i] + passage.radii[i + 1]) * 0.5;
+                    draw_line(image, passage.points[i].x * scale, passage.points[i].y * scale,
+                              passage.points[i + 1].x * scale, passage.points[i + 1].y * scale,
+                              std::max(1.0, width * scale), cave_depth_color_(range, palette, middle),
+                              slice.band);
+                }
+            }
+            // Chambers at their real radius, so a reader can tell a room from the
+            // going between rooms -- which is most of what makes a survey legible.
+            for (const CaveNode& node : cave.nodes) {
+                if (!is_open_feature(node.feature)) {
+                    continue;
+                }
+                fill_polygon(image, disc_outline_(node.point, node.radius, scale),
+                             cave_depth_color_(range, palette, node.floor), slice.band);
+            }
+        }
+
+        // Mouths last and on top: where a system opens is the first thing anyone
+        // looks for, and a ring reads as an entrance where a dot reads as a marker.
+        const double mouth_radius = meters_to_grid(config, k_cave_mouth_radius_m);
+        for (const MapCave& cave : graph.caves) {
+            fill_polygon(image, disc_outline_(cave.mouth, mouth_radius, scale),
+                         palette.cave_mouth_color, slice.band);
+            fill_polygon(image, disc_outline_(cave.mouth, mouth_radius * k_cave_mouth_rim, scale),
+                         cave_depth_color_(range, palette, cave.surface_at_mouth), slice.band);
+        }
+    }
+
+    /** @brief The span of cave floor heights on a map; what the overview's ramp covers. */
+    struct CaveDepthRange {
+        double low = 0.0;  /**< @brief Deepest floor anywhere on the map. */
+        double high = 1.0; /**< @brief Shallowest. */
+    };
+
+    /**
+     * @brief The range of floor heights every cave on a map covers.
+     *
+     * The overview's ramp is stretched over *this* rather than over the land
+     * range, and the difference is the difference between a legible picture and a
+     * uniform purple tangle. Caves occupy a narrow band low in the land range --
+     * floors run from about sea level to perhaps a third of the way up -- so a ramp
+     * spanning all of `land_height()` spends most of itself on ground no passage
+     * ever reaches and draws every cave on the map the same colour.
+     *
+     * It does make the overview's colour relative to the map it came from, which is
+     * the right trade for the one cave layer whose job is to be *looked at*.
+     * Absolute heights are what the four exported surface layers carry, on the
+     * elevation layer's own scale, and nothing about those depends on this.
+     */
+    static CaveDepthRange cave_depth_range_(const MapGraph& graph) {
+        CaveDepthRange range;
+        bool seen = false;
+        for (const MapCave& cave : graph.caves) {
+            for (const CavePassage& passage : cave.passages) {
+                for (const double floor : passage.floors) {
+                    range.low = seen ? std::min(range.low, floor) : floor;
+                    range.high = seen ? std::max(range.high, floor) : floor;
+                    seen = true;
+                }
+            }
+        }
+        if (!seen || range.high - range.low < k_cave_ramp_minimum) {
+            // One cave, or a map whose caves all sit at one height. A ramp with no
+            // span to stretch over would divide by nothing; widening it about the
+            // middle draws them all at the ramp's midpoint instead, which is what
+            // "these are all at the same depth" ought to look like.
+            const double middle = seen ? (range.low + range.high) * 0.5 : 0.5;
+            range.low = middle - k_cave_ramp_minimum * 0.5;
+            range.high = middle + k_cave_ramp_minimum * 0.5;
+        }
+        return range;
+    }
+
+    /** @brief Colour for a cave surface at a height, on the palette's depth ramp. */
+    static glm::vec3 cave_depth_color_(const CaveDepthRange& range, const BiomePalette& palette,
+                                       double height) {
+        const float deep = static_cast<float>(
+            std::clamp(1.0 - (height - range.low) / (range.high - range.low), 0.0, 1.0));
+        return palette.cave_shallow_color * (1.0f - deep) + palette.cave_deep_color * deep;
+    }
+
     /** @brief Draws the elevation layer into an already-allocated buffer. */
     static void draw_elevation_(Image& image, const MapGraph& graph, const MapConfig& config,
                          const BiomePalette& palette, const RenderSlice& slice) {
@@ -478,7 +721,8 @@ private:
         const TerrainDetail detail = make_terrain_detail(config, terrain);
         // Likewise one channel index for the whole layer. Walking the rivers per
         // pixel would be absurd; per layer it is a few milliseconds.
-        const RiverChannels channels = make_river_channels(graph, config);
+        const RiverChannels channels = make_river_channels(graph, config, detail);
+        const ElevationSurface surface = effective_surface(config);
         Outlines outlines(graph, config, slice);
         for (const MapCenter& center : graph.centers) {
             const std::vector<MapPoint>& outline = outlines.of(center, slice);
@@ -486,10 +730,11 @@ private:
                 continue;
             }
             fill_polygon_shaded(image, outline,
-                [&graph, &center, &detail, &channels, inverse_scale](double px, double py) {
-                    const double height = graph.elevation_at(center, px * inverse_scale,
-                                                             py * inverse_scale, detail,
-                                                             channels);
+                [&graph, &center, &detail, &channels, surface,
+                 inverse_scale](double px, double py) {
+                    const double height = surface_height_(graph, center, px * inverse_scale,
+                                                          py * inverse_scale, detail,
+                                                          channels, surface);
                     const float grey = static_cast<float>(std::clamp(height, 0.0, 1.0) * 255.0);
                     return glm::vec3(grey, grey, grey);
                 }, slice.band);
@@ -508,10 +753,16 @@ private:
         // sample the identical surface or the two disagree about where the bed is.
         const Noise terrain(config.noise_terrain);
         const TerrainDetail detail = make_terrain_detail(config, terrain);
+        // The channels too, because the sheet settles into its bed as it nears the
+        // mouth rather than staying up on the rim -- which is what lets it meet the
+        // sea flush instead of ending a few metres above it.
+        const RiverChannels channels = make_river_channels(graph, config, detail);
+        const RiverSurfaces surfaces = make_river_surfaces(graph, config, detail, channels);
 
         // Rivers first, so a body drawn over them keeps its flat surface.
-        for (const MapRiver& river : graph.rivers) {
-            stroke_river_surface_(image, graph, river, config, detail, overlap, slice.band);
+        for (std::size_t i = 0; i < graph.rivers.size(); ++i) {
+            stroke_river_surface_(image, graph, graph.rivers[i], config, surfaces, i, overlap,
+                                  slice.band);
         }
 
         Outlines outlines(graph, config, slice);
@@ -541,15 +792,15 @@ private:
     }
 
     /**
-     * @brief Strokes a river's water surface: the ground it runs over, plus a depth.
+     * @brief Strokes a river's water surface at the heights `RiverSurfaces` settled on.
      *
-     * The height comes from `river_surface_at()` and is not computed here. It used
-     * to be -- interpolated between the `MapCorner::elevation` values either end of
-     * a segment -- and that is exactly how the water layer and the elevation layer
-     * came to disagree: corner heights are the control mesh, while the elevation
-     * layer draws the Delaunay blend of *cell* heights, some 22 m higher at a river
-     * corner. Nearly half of every watercourse was drawn beneath the terrain. One
-     * definition, in one place, is the fix.
+     * The height is not computed here, and twice now that has been the whole bug.
+     * It was once interpolated between `MapCorner::elevation` values, which is the
+     * control mesh rather than the surface the elevation layer draws -- so half of
+     * every watercourse was drawn beneath the terrain. Then it was computed per
+     * segment in isolation, which cannot see that a water surface only falls, nor
+     * that a river has a sea to meet. Both are properties of the course, so the
+     * course is where they are decided.
      *
      * Width is still stepped along the corner chain here, since that is a property
      * of the stroke rather than of the surface: depth and width both rise with
@@ -558,8 +809,8 @@ private:
      */
     static void stroke_river_surface_(Image& image, const MapGraph& graph,
                                       const MapRiver& river, const MapConfig& config,
-                                      const TerrainDetail& detail, double overlap,
-                                      const RowBand& band) {
+                                      const RiverSurfaces& surfaces, std::size_t river_index,
+                                      double overlap, const RowBand& band) {
         if (river.points.size() < 2 || river.corners.empty()) {
             return;
         }
@@ -587,7 +838,7 @@ private:
                                 + (static_cast<double>(to.river)
                                    - static_cast<double>(from.river)) * fraction;
 
-            const double surface = river_surface_at(graph, river, i, config, detail);
+            const double surface = surfaces.at(river_index, i);
             const double width = river_width(config, static_cast<int>(volume)) + overlap * 2.0;
 
             draw_line(image, river.points[i].x * scale, river.points[i].y * scale,
@@ -656,7 +907,7 @@ private:
         const double inverse_scale = 1.0 / scale;
         const Noise terrain(config.noise_terrain);
         const TerrainDetail detail = make_terrain_detail(config, terrain);
-        const RiverChannels channels = make_river_channels(graph, config);
+        const RiverChannels channels = make_river_channels(graph, config, detail);
         Outlines outlines(graph, config, slice);
 
         // Only the slope mode needs the rasterised height field, and it is the
@@ -667,12 +918,29 @@ private:
         //
         // Which is exactly why a caller drawing in bands must pass one in. Built
         // here per band instead, the whole raster is rebuilt once per band.
+        //
+        // The elevation mode needs one too under `ElevationSurface::Blended`, and
+        // for a reason worth stating: the blend lives in the raster, not in
+        // `surface_height_()`, so shading from the sampler would light the composite
+        // by the *unsmoothed* flat surface while the elevation layer showed the
+        // smoothed one. Two layers disagreeing about the same ground is a class of
+        // bug this renderer has produced before.
+        const ElevationSurface surface = effective_surface(config);
+        const bool shade_from_raster = config.composite_shading == CompositeShading::Hillshade
+                                    || surface == ElevationSurface::Blended;
+
         HeightField local;
         const HeightField* height = slice.height;
         int baseline = 1;
-        if (config.composite_shading == CompositeShading::Hillshade) {
+        if (shade_from_raster) {
             if (height == nullptr) {
-                local = build_height_field(graph, config, palette, slice.geometry);
+                // No extra blur under the elevation mode: the raster arrives
+                // smoothed already, and blurring it again would shade from a field
+                // no layer draws.
+                const double extra = config.composite_shading == CompositeShading::Hillshade
+                                       ? k_shade_blur_cells
+                                       : 0.0;
+                local = build_height_field(graph, config, palette, slice.geometry, extra);
                 height = &local;
             }
             baseline = std::max(1, static_cast<int>(scale * k_shade_baseline_cells));
@@ -696,12 +964,19 @@ private:
                         return base * hillshade_(*height, static_cast<int>(px),
                                                  static_cast<int>(py), baseline);
                     }, slice.band);
+            } else if (surface == ElevationSurface::Blended) {
+                fill_polygon_shaded(image, outline,
+                    [height, base](double px, double py) {
+                        return base * height_tint_(height->at(static_cast<int>(px),
+                                                              static_cast<int>(py)));
+                    }, slice.band);
             } else {
                 fill_polygon_shaded(image, outline,
-                    [&graph, &center, &detail, &channels, base, inverse_scale](double px,
-                                                                               double py) {
+                    [&graph, &center, &detail, &channels, base, surface,
+                     inverse_scale](double px, double py) {
                         return base * elevation_shade_(graph, center, px * inverse_scale,
-                                                       py * inverse_scale, detail, channels);
+                                                       py * inverse_scale, detail, channels,
+                                                       surface);
                     }, slice.band);
             }
         }
@@ -764,6 +1039,16 @@ private:
     static constexpr double k_village_marker_m = 5.0;
     /** @brief Marker half-width in metres for a wonder, and for every other landmark. */
     static constexpr double k_wonder_marker_m = 10.0;
+    /**
+     * @brief Outer radius of the ring drawn at a cave mouth, in metres.
+     *
+     * Sized against `k_landmark_marker_m` and `k_wonder_marker_m` rather than
+     * against the overview's `k_cave_mouth_radius_m`, which is nearly three times
+     * this: the overview has a whole image to itself and can afford a bold ring,
+     * while this one has to sit among town and landmark markers without shouting
+     * over them.
+     */
+    static constexpr double k_cave_mouth_marker_m = 8.0;
     static constexpr double k_landmark_marker_m = 6.0;
 
     /** @brief Pixels per grid unit; equals `meters_per_grid_unit / meters_per_pixel`. */
@@ -912,11 +1197,25 @@ private:
      */
     static float elevation_shade_(const MapGraph& graph, const MapCenter& center, double x,
                                   double y, const TerrainDetail& detail,
-                                  const RiverChannels& channels) {
-        const double height =
-            std::clamp(graph.elevation_at(center, x, y, detail, channels), 0.0, 1.0);
+                                  const RiverChannels& channels, ElevationSurface surface) {
+        return height_tint_(surface_height_(graph, center, x, y, detail, channels, surface));
+    }
+
+    /**
+     * @brief The elevation tint for a height, whether sampled or read off a raster.
+     *
+     * Split out so the `Blended` composite, which has to read the smoothed raster
+     * rather than call the sampler, produces the *identical* brightness for an
+     * identical height. Two code paths computing the same ramp is how a composite
+     * comes to disagree with the layer it is meant to match.
+     *
+     * @param height A normalised height; clamped, so a cut river bed is safe.
+     * @return A multiplier in `[k_elevation_shade_min, k_elevation_shade_max]`.
+     */
+    static float height_tint_(double height) {
+        const double clamped = std::clamp(height, 0.0, 1.0);
         return static_cast<float>(k_elevation_shade_min
-                                  + (k_elevation_shade_max - k_elevation_shade_min) * height);
+                                  + (k_elevation_shade_max - k_elevation_shade_min) * clamped);
     }
 
     /**
@@ -938,6 +1237,267 @@ private:
      * @param radius Box radius in pixels.
      * @return The smoothed single-channel field.
      */
+    /**
+     * @brief How wide a blur `elevation_blend = 1` asks for, in cells.
+     *
+     * One cell is the ceiling because that is where the mode stops being a blend
+     * and starts being a different map: a radius wider than the tessellation
+     * itself erases the landforms along with the facets, and the interpolated
+     * surface is already there for anyone who wants smooth ground.
+     */
+    static constexpr double k_blend_max_cells = 1.0;
+
+    /** @brief The blend radius in whole pixels; 0 when the knob is off. */
+    static int blend_radius_(const MapConfig& config) {
+        const double cells = std::clamp(config.elevation_blend, 0.0, 1.0) * k_blend_max_cells;
+        return static_cast<int>(cells * pixels_per_grid_unit_(config));
+    }
+
+    /**
+     * @brief Widest the per-cell factor may be feathered, as a fraction of a cell.
+     *
+     * The factor is drawn one flat value per cell, which would put a hard step in
+     * the *weight* exactly where the weight matters most -- a cell boundary is
+     * where the sharp and blurred rasters differ by the whole facet, so a jump in
+     * the weight there redraws the edge this mode exists to remove.
+     *
+     * Feathering fixes that, and the width is a compromise with a floor and a
+     * ceiling. Too narrow and the seam survives; too wide and neighbouring cells
+     * average into each other and the variation is gone.
+     *
+     * The width itself comes from `blend_radius_()`, not from here: the blur radius
+     * is the distance over which `blurred - sharp` is non-trivial near an edge, so
+     * it is exactly how far the weight has to travel to hide the step. Sizing the
+     * feather against the *cell* instead was a real defect -- at a 3000 px grid-80
+     * render with `elevation_blend = 0.1` that gave a 7 px feather against a 3 px
+     * blur, smearing each cell's value across its neighbours and averaging the
+     * whole effect away.
+     *
+     * This caps it, for the other end of the range: at `elevation_blend = 1` the
+     * radius is a whole cell, and feathering by a whole cell would homogenise
+     * neighbours just as thoroughly.
+     */
+    static constexpr double k_factor_feather_max_cells = 0.25;
+
+    /**
+     * @struct BlendField
+     * @brief The local blur factor over the image, one value per cell.
+     *
+     * Stored as a raster rather than a per-cell array because that is how it is
+     * read -- per pixel, alongside the pyramid levels it weights -- and because
+     * feathering it is then the same box blur everything else here uses.
+     *
+     * Values are packed into a byte over `[0, 2]`, so the factor resolves to about
+     * 0.008. Against a knob whose whole range is 2 that is nothing, and it keeps
+     * the field the same size as the three rasters it selects between.
+     */
+    struct BlendField {
+        HeightField values; /**< @brief Factor at each pixel, scaled to `[0, 1]`. */
+
+        /**
+         * @brief The factor at a pixel.
+         * @param x Horizontal pixel position.
+         * @param y Vertical pixel position.
+         * @return The local blur factor, 1 meaning exactly `elevation_blend`.
+         */
+        double at(int x, int y) const { return values.at(x, y) * 2.0; }
+    };
+
+    /**
+     * @brief Builds the per-cell blur factor, from `noise_blend`.
+     *
+     * **Per cell, and that is the whole point.** The first version of this sampled
+     * a low-frequency field -- a wavelength of some twenty cells -- on the theory
+     * that smoothness should vary the way bedrock hardness does. It is a defensible
+     * idea and it produced nothing anyone could see: across any handful of
+     * neighbouring cells the factor was effectively constant, so the map came out
+     * uniformly blurred with the variation only visible by flying across the whole
+     * thing. What varies has to vary at the scale of the thing it varies.
+     *
+     * So each cell draws its own value, sampled at its site, and `noise_blend` runs
+     * at a frequency high enough that neighbours are uncorrelated -- some cells
+     * keep hard edges while the cell beside them is fully smoothed.
+     *
+     * The factor is `1 + variation * n` for a field value `n` in `[-1, 1]`,
+     * clamped to `[0, 2]`. Symmetric about 1 on purpose: the mean radius stays
+     * `elevation_blend`, so raising the variation makes a map *more varied* rather
+     * than uniformly softer or sharper, which is what a knob named "variation" has
+     * to mean.
+     *
+     * Sampled in grid units, not pixels, so the same config gives the same cells
+     * the same character at any render size.
+     *
+     * @param config Supplies the variation amount, the field and the render size.
+     * @param graph The map whose cells carry the factor.
+     * @param palette Passed through to the scratch buffer's allocation.
+     * @param geometry Shared cell outlines, or null to build them locally.
+     * @return The feathered factor raster, ready to sample.
+     */
+    static BlendField make_blend_field_(const MapConfig& config, const MapGraph& graph,
+                                        const BiomePalette& palette,
+                                        const CellGeometry* geometry) {
+        const double variation = std::clamp(config.elevation_blend_variation, 0.0, 1.0);
+        const Noise noise(config.noise_blend);
+
+        // Drawn through the ordinary polygon fill so the factor lands on exactly
+        // the pixels the cell was drawn on -- a separate point-in-cell test here
+        // could disagree with the rasteriser at a boundary, and a one-pixel
+        // disagreement is a one-pixel seam.
+        // Cleared to the neutral factor rather than to black: a pixel no cell
+        // covers should fall back to the base blur, not to no blur at all. Cleared
+        // by `reset()` rather than by a loop of `set_pixel()` -- at the default
+        // 4800 px render that loop was 23 million calls to write a constant.
+        (void)palette;
+        Image field;
+        field.reset(config.image_size, config.image_size, 3, height_grey_(0.5));
+        const RenderSlice whole{RowBand{}, geometry};
+        Outlines outlines(graph, config, whole);
+        for (const MapCenter& center : graph.centers) {
+            const std::vector<MapPoint>& outline = outlines.of(center, whole);
+            if (outline.empty()) {
+                continue;
+            }
+            const double sample = noise.sample(center.point.x, center.point.y);
+            const double factor = std::clamp(1.0 + variation * sample, 0.0, 2.0);
+            fill_polygon(field, outline, height_grey_(factor * 0.5), whole.band);
+        }
+
+        const double ceiling = pixels_per_grid_unit_(config) * k_factor_feather_max_cells;
+        const int feather =
+            std::clamp(blend_radius_(config), 1, std::max(1, static_cast<int>(ceiling)));
+
+        BlendField built;
+        built.values = smoothed_height_(field, feather);
+        return built;
+    }
+
+    /**
+     * @brief Smooths the finished flat raster, and cuts the rivers back into it.
+     *
+     * What `ElevationSurface::Blended` actually is. The first attempt decided a
+     * blend *per pixel per cell*, pulling the flat height toward the interpolated
+     * one near the cell's rim, and that cannot work however it is tuned: every cell
+     * independently ramps its own edge, so the map comes out as a field of tiles
+     * each wearing a bevel, with a soft halo tracing every outline. It drew the
+     * tessellation more clearly than the hard edges it was meant to soften.
+     *
+     * A blend is not a property of a cell. It is a property of the *image*, so it
+     * belongs here, after the rasteriser has put down one flat height per cell and
+     * there is a grid to smooth.
+     *
+     * Three stages, and the order is what makes the rivers survive:
+     *
+     * 1. `surface_height_()` has already drawn the cells flat and, under this mode
+     *    only, **uncut** -- no channel subtracted.
+     * 2. Blur the whole raster, the same separable box pass the hillshade uses.
+     * 3. Cut the channels in now. A half-cell blur costs an uncut river nothing and
+     *    a pre-cut one almost half its contrast -- 15.0 grey levels down to 8.0 --
+     *    because a channel a few pixels wide is exactly the feature a blur of that
+     *    radius destroys. Cutting afterwards gives back all 15.
+     *
+     * A radius of 0 returns without touching a pixel, so `elevation_blend = 0` is
+     * byte-identical to `ElevationSurface::Flat` rather than merely close to it.
+     *
+     * ### Varying the radius
+     *
+     * `elevation_blend_variation` makes stage 2 a *pyramid* instead of one blur:
+     * the untouched raster, a blur at the base radius, and a blur at twice it, with
+     * `make_blend_field_()` choosing **per cell** where between them to land -- so
+     * one cell keeps its hard edges while the cell beside it is fully smoothed.
+     *
+     * A box blur whose radius genuinely changed per pixel is not one filter but a
+     * different one at every pixel, and neighbouring pixels drawing from
+     * differently-sized boxes have no reason to agree. Three globally consistent
+     * blurs and a feathered weight cannot seam by construction, and cost two passes
+     * over the image rather than a different convolution per pixel.
+     *
+     * Three levels rather than two so the variation is symmetric: a pixel can land
+     * either side of the base radius, the mean stays where `elevation_blend` put
+     * it, and the knob adds variety rather than sharpening the whole map. At
+     * variation 0 the pyramid is not built at all and the single-blur path runs
+     * unchanged, byte for byte.
+     *
+     * @param image The finished elevation raster, smoothed in place.
+     * @param graph The map it was drawn from; supplies the cells and their channels.
+     * @param config Supplies the surface mode, the blend radius, the variation and
+     *        the scale.
+     * @param geometry Shared cell outlines, or null to build them locally.
+     */
+    static void smooth_elevation_raster_(Image& image, const MapGraph& graph,
+                                         const MapConfig& config, const BiomePalette& palette,
+                                         const CellGeometry* geometry) {
+        // `effective_surface()` has already turned a radius too small to see back
+        // into `Flat`, and the cells were then drawn *with* their channels -- so
+        // there is nothing here to do, and doing it would cost a grey level to
+        // double quantisation.
+        if (effective_surface(config) != ElevationSurface::Blended) {
+            return;
+        }
+
+        const int radius = blend_radius_(config);
+        const HeightField blurred = smoothed_height_(image, radius);
+        const double variation = std::clamp(config.elevation_blend_variation, 0.0, 1.0);
+
+        if (variation <= 0.0) {
+            for (int y = 0; y < image.height; ++y) {
+                for (int x = 0; x < image.width; ++x) {
+                    image.set_pixel(x, y, height_grey_(blurred.at(x, y)));
+                }
+            }
+        } else {
+            // The two ends of the pyramid. `sharp` is the raster as drawn, which is
+            // why it is taken at radius 0 rather than kept as the image: the image
+            // is about to be written over.
+            const HeightField sharp = smoothed_height_(image, 0);
+            const HeightField wide = smoothed_height_(image, radius * 2);
+            const BlendField factor = make_blend_field_(config, graph, palette, geometry);
+
+            for (int y = 0; y < image.height; ++y) {
+                for (int x = 0; x < image.width; ++x) {
+                    const double f = factor.at(x, y);
+                    const double height =
+                        f <= 1.0
+                            ? sharp.at(x, y) + (blurred.at(x, y) - sharp.at(x, y)) * f
+                            : blurred.at(x, y) + (wide.at(x, y) - blurred.at(x, y)) * (f - 1.0);
+                    image.set_pixel(x, y, height_grey_(height));
+                }
+            }
+        }
+
+        // Only the cells a river runs through are revisited. Rivers cover a
+        // fraction of a percent of a map, so this is a rounding error against the
+        // blur that precedes it -- and it is why the channel index is consulted
+        // before the outline is ever asked for.
+        const Noise terrain(config.noise_terrain);
+        const TerrainDetail detail = make_terrain_detail(config, terrain);
+        const RiverChannels channels = make_river_channels(graph, config, detail);
+        if (channels.empty()) {
+            return;
+        }
+
+        const double inverse_scale = 1.0 / pixels_per_grid_unit_(config);
+        const RenderSlice whole{RowBand{}, geometry};
+        Outlines outlines(graph, config, whole);
+        for (const MapCenter& center : graph.centers) {
+            const std::size_t index = static_cast<std::size_t>(center.index);
+            if (index >= channels.cells.size() || channels.cells[index].count == 0) {
+                continue;
+            }
+            const std::vector<MapPoint>& outline = outlines.of(center, whole);
+            if (outline.empty()) {
+                continue;
+            }
+            fill_polygon_shaded(image, outline,
+                [&graph, &center, &channels, &blurred, inverse_scale](double px, double py) {
+                    const double cut = graph.channel_cut(center, px * inverse_scale,
+                                                         py * inverse_scale, channels);
+                    const double height =
+                        blurred.at(static_cast<int>(px), static_cast<int>(py)) - cut;
+                    return height_grey_(height);
+                }, whole.band);
+        }
+    }
+
     static HeightField smoothed_height_(const Image& source, int radius) {
         HeightField field;
         field.width = source.width;
@@ -1114,8 +1674,23 @@ private:
                                  const BiomePalette& palette,
                                  const RowBand& band = RowBand{}) {
         const double scale = pixels_per_grid_unit_(config);
+        const double street_width = meters_to_grid(config, config.towns.street_width_m);
         std::vector<MapPoint> footprint(4);
         for (const MapTown& town : graph.towns) {
+            // Ground first, then what stands on it. The square and the streets are
+            // what the buildings were laid out around, and drawing them is the
+            // whole difference between a settlement and a scatter of specks --
+            // buildings can only be seen to line up if there is a line to see.
+            if (town.plaza.radius > 0.0) {
+                fill_polygon(image, disc_outline_(town.plaza.centre, town.plaza.radius, scale),
+                             palette.plaza_color, band);
+            }
+            for (const MapStreet& street : town.streets) {
+                draw_line(image, street.from.x * scale, street.from.y * scale,
+                          street.to.x * scale, street.to.y * scale,
+                          half_width_pixels_(street_width, scale), palette.street_color, band);
+            }
+
             // The rotated quad, not an axis-aligned blob: the yaw is part of what
             // the generator guarantees, and a square marker would hide whether
             // buildings actually line up along their street.
@@ -1124,12 +1699,27 @@ private:
                 for (std::size_t i = 0; i < 4; ++i) {
                     footprint[i] = {corners[i].x * scale, corners[i].y * scale};
                 }
-                fill_polygon(image, footprint, palette.building_color, band);
+                fill_polygon(image, footprint,
+                             is_civic_role(building.role) ? palette.civic_color
+                                                          : palette.building_color,
+                             band);
             }
         }
     }
 
-    /** @brief Draws a marker per settlement and per landmark. */
+    /**
+     * @brief Draws a marker per settlement, per landmark and per cave mouth.
+     *
+     * The one place surface markers are drawn, which is why both the composite and
+     * the landmarks overlay call it: the two cannot disagree about what is on the
+     * ground if they read the same function.
+     *
+     * A cave mouth belongs here even though the cave itself does not. A passage is
+     * underground and has no business on a surface render -- that is why the
+     * composite has never drawn one -- but a mouth is a hole in a hillside that
+     * anyone standing there would see, and leaving it off made caves invisible on
+     * the only layer most readers open.
+     */
     static void draw_markers_(Image& image, const MapGraph& graph, const MapConfig& config,
                               const BiomePalette& palette, const RowBand& band = RowBand{}) {
         const double scale = pixels_per_grid_unit_(config);
@@ -1140,6 +1730,90 @@ private:
         for (const MapLandmark& landmark : graph.landmarks) {
             draw_landmark_(image, landmark, scale, config, palette, band);
         }
+        // A ring, where a town is a filled square and a natural landmark a diamond.
+        // The shape has to carry the difference on a composite already crowded with
+        // markers, and a ring reads as an opening where a disc reads as a pin. It
+        // is also what the overview draws, so the two agree at a glance.
+        const int mouth = meters_to_pixels_(k_cave_mouth_marker_m, config);
+        for (const MapCave& cave : graph.caves) {
+            draw_ring_(image, cave.mouth, scale, mouth,
+                       static_cast<int>(mouth * k_cave_mouth_rim), palette.cave_mouth_color,
+                       band);
+        }
+    }
+
+    /**
+     * @brief A circle as a pixel-space polygon, for anything round that must fill.
+     *
+     * Approximated rather than rasterised directly so it goes through
+     * `fill_polygon()` and inherits its band clipping -- a banded render splits an
+     * image across threads by rows, and a shape that drew its own scanlines would
+     * have to re-derive that. Thirty-two sides is under a pixel of chord error at
+     * the plaza radii this is used for.
+     *
+     * @param centre Middle of the circle, in grid units.
+     * @param radius Radius in grid units.
+     * @param scale Pixels per grid unit.
+     * @return The outline, in pixel space, wound consistently.
+     */
+    static std::vector<MapPoint> disc_outline_(const MapPoint& centre, double radius,
+                                               double scale) {
+        static constexpr int k_sides = 32;
+        static constexpr double k_turn = 6.283185307179586;
+        std::vector<MapPoint> outline;
+        outline.reserve(k_sides);
+        for (int i = 0; i < k_sides; ++i) {
+            const double angle = k_turn * static_cast<double>(i) / static_cast<double>(k_sides);
+            outline.push_back({(centre.x + std::cos(angle) * radius) * scale,
+                               (centre.y + std::sin(angle) * radius) * scale});
+        }
+        return outline;
+    }
+
+    /**
+     * @brief One pixel's ground height, in whichever surface style the config asks for.
+     *
+     * The single place the choice is made, so the elevation layer and the
+     * composite's elevation shading cannot drift into drawing different terrain.
+     *
+     * `Flat` returns the cell's own stored height with the river channel cut out of
+     * it. The cut is a function of position, not of the interpolation, so nothing
+     * stops it being subtracted from a flat base, and it costs the rivers nothing.
+     *
+     * `Blended` returns the same height *without* the cut, because it is only the
+     * first of three stages -- the raster it produces is blurred and then re-cut by
+     * `smooth_elevation_raster_()` once the whole image exists. A blend cannot be
+     * decided per pixel per cell: doing that was the bug this replaced, and it drew
+     * a bevelled rim around every cell outline instead of smoothing anything.
+     *
+     * Terrain detail is left out of both, and that asymmetry is deliberate:
+     * roughness is surface *texture*, which a fill constant across a cell has no
+     * business carrying, while a river is a feature of the ground.
+     *
+     * @param graph The map being drawn.
+     * @param center The cell the pixel falls in.
+     * @param x Horizontal grid position.
+     * @param y Vertical grid position.
+     * @param detail The detail field, used by the interpolated style only.
+     * @param channels The river channels, cut by every style.
+     * @param surface The style to draw, already resolved by `effective_surface()`.
+     * @return The height to shade this pixel from.
+     */
+    static double surface_height_(const MapGraph& graph, const MapCenter& center, double x,
+                                  double y, const TerrainDetail& detail,
+                                  const RiverChannels& channels, ElevationSurface surface) {
+        if (surface == ElevationSurface::Blended) {
+            // Flat *and uncut*. The channels are cut back in by
+            // `smooth_elevation_raster_()` after the blur, because blurring a raster
+            // that already carried them would smear the rivers and then cutting
+            // again would subtract each one twice.
+            return center.elevation;
+        }
+        if (surface == ElevationSurface::Flat) {
+            const double cut = graph.channel_cut(center, x, y, channels);
+            return cut > 0.0 ? std::clamp(center.elevation - cut, 0.0, 1.0) : center.elevation;
+        }
+        return graph.elevation_at(center, x, y, detail, channels);
     }
 
     /** @brief Strokes one grid-space segment, converting to pixels on the way. */
@@ -1198,6 +1872,42 @@ private:
                     continue;
                 }
                 if (cy + y < band.begin || cy + y >= band.end) {
+                    continue;
+                }
+                image.set_pixel(cx + x, cy + y, color);
+            }
+        }
+    }
+
+    /**
+     * @brief Draws an unfilled ring centred on a grid-space point.
+     *
+     * The annulus is tested per pixel rather than stroked as a circle, for the
+     * same reason `draw_landmark_()` tests its diamond that way: the row guard a
+     * banded render needs is then one comparison in the outer loop, and a shape
+     * that walked its own circumference would have to re-derive it.
+     *
+     * @param image The target buffer.
+     * @param point Centre, in grid units.
+     * @param scale Pixels per grid unit.
+     * @param outer Outer radius, in pixels.
+     * @param inner Inner radius, in pixels; pixels nearer than this are left alone.
+     * @param color Colour to write.
+     * @param band Rows this call may touch.
+     */
+    static void draw_ring_(Image& image, const MapPoint& point, double scale, int outer,
+                           int inner, const glm::vec3& color, const RowBand& band = RowBand{}) {
+        const int cx = static_cast<int>(point.x * scale);
+        const int cy = static_cast<int>(point.y * scale);
+        const int outer_squared = outer * outer;
+        const int inner_squared = inner * inner;
+        for (int y = -outer; y <= outer; ++y) {
+            if (cy + y < band.begin || cy + y >= band.end) {
+                continue;
+            }
+            for (int x = -outer; x <= outer; ++x) {
+                const int distance_squared = x * x + y * y;
+                if (distance_squared > outer_squared || distance_squared < inner_squared) {
                     continue;
                 }
                 image.set_pixel(cx + x, cy + y, color);

@@ -11,12 +11,16 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <glm/glm.hpp>
 
 #include <coopa/maps/biome.h>
+#include <coopa/maps/building.h>
+#include <coopa/maps/cave.h>
 #include <coopa/maps/landmark.h>
 #include <coopa/maps/map_config.h>
 #include <coopa/maps/noise.h>
@@ -330,6 +334,79 @@ struct MapBuilding {
     double width = 0.0;    /**< @brief Footprint width, in grid units. */
     double height = 0.0;   /**< @brief Footprint height, in grid units. */
     double rotation = 0.0; /**< @brief Yaw in radians, for a consumer that renders oriented meshes. */
+    /**
+     * @brief What the building is for; `Dwelling` unless it is part of the civic core.
+     *
+     * Defaulted, so every reader written before roles existed -- and every map
+     * saved without them -- still means exactly what it used to.
+     */
+    BuildingRole role = BuildingRole::Dwelling;
+};
+
+/**
+ * @struct MapStreet
+ * @brief A lane inside a settlement, which its buildings front onto.
+ *
+ * The counterpart of `MapRoad`: a road joins settlements, a street is the inside
+ * of one. Each runs from a claimed cell's site outward to where it leaves the
+ * cell -- at a road entering across a Delaunay edge, at a river bank, or, failing
+ * both, toward the cell's farthest corners so that even an isolated hamlet has a
+ * lane rather than a scatter.
+ *
+ * This used to be private to the town pass, which is exactly why settlements read
+ * as random: the buildings were lined up along something nobody could see. Emitted
+ * as map data, a street is drawn, exported, and available to a consumer laying
+ * cobbles.
+ */
+struct MapStreet {
+    MapPoint from;        /**< @brief Inner end, at the cell's site. */
+    MapPoint to;          /**< @brief Outer end, where the street leaves the cell. */
+    double bearing = 0.0; /**< @brief Direction from `from` to `to`, in radians. */
+    double length = 0.0;  /**< @brief Distance between the ends, in grid units. */
+    /**
+     * @brief Extra setback before the first plot, in grid units.
+     *
+     * A river's half-width, so plots line the bank rather than the channel. Zero
+     * for a road, which buildings may front directly.
+     */
+    double clearance = 0.0;
+};
+
+/**
+ * @brief Builds a street between two points, deriving its bearing and length.
+ *
+ * The one place those two are computed. They are derived rather than stored on
+ * disk for the same reason: a bearing saved beside its endpoints is a number that
+ * can come back disagreeing with them.
+ *
+ * @param from Inner end, at the cell's site.
+ * @param to Outer end, where the street leaves the cell.
+ * @param clearance Extra setback before the first plot, in grid units.
+ * @return The street, ready to use.
+ */
+inline MapStreet make_street(const MapPoint& from, const MapPoint& to, double clearance = 0.0) {
+    MapStreet street;
+    street.from = from;
+    street.to = to;
+    street.bearing = std::atan2(to.y - from.y, to.x - from.x);
+    street.length = from.distance_to(to);
+    street.clearance = clearance;
+    return street;
+}
+
+/**
+ * @struct MapPlaza
+ * @brief The open ground at the heart of a settlement, kept clear of building.
+ *
+ * A disc rather than a polygon, deliberately: a disc is one comparison to test a
+ * footprint against, one circle to draw and two numbers to serialise, where a
+ * polygon would need clipping against the cell outline for nothing anyone can
+ * see. `radius` of zero means the settlement has no square -- which is most of
+ * them, because a village that could spare the ground for one would be a town.
+ */
+struct MapPlaza {
+    MapPoint centre;      /**< @brief Middle of the open ground, in grid units. */
+    double radius = 0.0;  /**< @brief Radius in grid units; 0 when there is no square. */
 };
 
 /**
@@ -373,6 +450,22 @@ struct MapTown {
     double prosperity = 0.0;
 
     std::vector<MapBuilding> buildings; /**< @brief Footprints that fit inside the cell polygon. */
+    /**
+     * @brief The lanes its buildings front onto, one fan per claimed cell.
+     *
+     * Derived from the roads and rivers touching each claimed cell, so a
+     * settlement's streets meet the network that reaches it rather than being
+     * invented beside it.
+     */
+    std::vector<MapStreet> streets;
+    /**
+     * @brief Its market square, or a zero radius when it has none.
+     *
+     * Granted by tier and by whether the ground is actually there -- see
+     * `TownConfig::plaza_radius_m`. The streets already converge on the primary
+     * cell's site, so siting the square there makes them radiate from it.
+     */
+    MapPlaza plaza;
 };
 
 /**
@@ -529,6 +622,121 @@ struct MapCountry {
 };
 
 /**
+ * @struct CaveNode
+ * @brief One station along a cave passage: where it is, and the rock it sits between.
+ *
+ * The first thing in this module that has a position *underground* rather than
+ * on the surface, and it says so by carrying two heights instead of one.
+ * `floor` and `roof` are in the same normalised `[0, 1]` field every other
+ * elevation in the graph uses, so they are directly comparable with
+ * `MapCenter::elevation`, with `water_level`, and with whatever
+ * `MapGraph::elevation_at()` returns overhead -- which is the comparison the
+ * whole feature rests on.
+ *
+ * `center` is the cell the node lies in, kept because `elevation_at()` wants a
+ * hint and re-deriving one per sample is the expensive way to ask.
+ */
+struct CaveNode {
+    MapPoint point;                 /**< @brief Plan position, in grid units. */
+    double floor = 0.0;             /**< @brief Height of the floor, normalised like all elevation. */
+    double roof = 0.0;              /**< @brief Height of the ceiling; always above `floor`. */
+    double radius = 0.0;            /**< @brief Half-width of the passage here, in grid units. */
+    CenterId center = k_invalid_id; /**< @brief The cell it sits in; the hint `elevation_at()` takes. */
+    CaveZone zone = CaveZone::Vadose;            /**< @brief Which regime cut it. */
+    CaveFeature feature = CaveFeature::Passage;  /**< @brief What kind of space it is. */
+    /**
+     * @brief Which of `MapCave::levels` the station belongs to; 0 is the shallowest.
+     *
+     * Recorded rather than derived from `floor`, for the reason `cave.h` gives for
+     * recording `CaveZone`: inference would have to re-derive the system's whole
+     * table sequence, which is a property of where the mouth opened and not of the
+     * station in hand. A shaft between two levels takes the level it descends
+     * *into*, so every level is its network plus the way down to it and no station
+     * belongs to two.
+     */
+    std::int32_t level = 0;
+    /** @brief Index of the node this one was grown from within `MapCave::nodes`; -1 at the mouth. */
+    std::int32_t parent = -1;
+};
+
+/**
+ * @struct CavePassage
+ * @brief One unbranched run of a cave, from a junction to the next junction or an end.
+ *
+ * Two representations of the same run, for the same reason `MapRiver` keeps two:
+ * `nodes` is the chain as it was grown and is what the geometry is *true* of,
+ * while the four parallel arrays are its corner-cut copy and are what gets drawn.
+ * Drawn straight between stations a passage is visibly faceted at every one, which
+ * is a shape no watercourse ever cut.
+ *
+ * `points`, `floors`, `roofs` and `radii` are always the same length: smoothing
+ * moves a station's position, its two heights and its width together, so a
+ * consumer can read any index across all four and get one coherent cross-section.
+ */
+struct CavePassage {
+    /**
+     * @brief Which of `MapCave::levels` this run was cut at; 0 is the shallowest.
+     *
+     * A run belongs to exactly one storey, because it is one growing head's work
+     * and a head never changes the table it is cutting to. Recorded here as well
+     * as on every station so a consumer can select a whole storey -- "give me the
+     * upper level of this system" -- without walking into `nodes` to ask.
+     *
+     * The chain's first entry is the station the run was grown from, which for a
+     * descent is on the level above; every other entry is on this one.
+     */
+    std::int32_t level = 0;
+    std::vector<std::int32_t> nodes;  /**< @brief The grown chain, indices into `MapCave::nodes`. */
+    std::vector<MapPoint> points;     /**< @brief Smoothed plan centreline. */
+    std::vector<double> floors;       /**< @brief Smoothed floor per point, re-clamped under the terrain. */
+    std::vector<double> roofs;        /**< @brief Smoothed ceiling per point, re-clamped likewise. */
+    std::vector<double> radii;        /**< @brief Smoothed half-width per point, in grid units. */
+};
+
+/**
+ * @struct MapCave
+ * @brief One cave system, from the slope it opens on to the deepest passage it reaches.
+ *
+ * A system is a tree rooted at its mouth, not a single line: `nodes` owns every
+ * station and each names its parent, while `passages` slices that tree into the
+ * unbranched runs a renderer or a mesher actually wants to walk.
+ *
+ * `levels` is recorded rather than recomputed because it is a property of the
+ * *system* -- fixed by where the mouth opened and how deep the configuration lets
+ * a cave reach -- and nothing about a passage in hand can recover it. It is also
+ * what explains the shape: around each table, water already at rest cut level,
+ * branching network, and between one table and the next, water falling under
+ * gravity cut the steep way down.
+ */
+struct MapCave {
+    EdgeId mouth_edge = k_invalid_id; /**< @brief The steep edge it opened on. */
+    MapPoint mouth;                   /**< @brief That edge's midpoint -- literally between two cells. */
+    double mouth_grade = 0.0;         /**< @brief Rise over run there; why this edge was chosen. */
+    double surface_at_mouth = 0.0;    /**< @brief Ground height at the mouth, for reference. */
+    double phreatic_level = 0.0;      /**< @brief Height at which the descent flattens out; `levels.front()`. */
+    /**
+     * @brief Every water table the system was cut at, shallowest first.
+     *
+     * A cave has more than one level because the valley it drains to cut down and
+     * took the water table with it: the phreatic network at the old level was left
+     * behind as dry passage, and a new one formed below. Each entry here is one
+     * such stage, so the size of this is how many storeys the system has.
+     *
+     * Derived from the relief beneath the mouth rather than configured, which is
+     * why a cave high in the hills has three levels and one near the coast has
+     * one -- there has to be something for the table to fall through.
+     */
+    std::vector<double> levels;
+    double deepest = 0.0;             /**< @brief Lowest floor anywhere in the system. */
+    double length_m = 0.0;            /**< @brief Total passage length, in metres. */
+    RegionId region = k_invalid_id;   /**< @brief The region it opens in; supplies its dialect. */
+    std::string name;                 /**< @brief Generated in that dialect. */
+
+    std::vector<CaveNode> nodes;      /**< @brief Every station, parent-linked into a tree. */
+    std::vector<CavePassage> passages;/**< @brief That tree sliced into unbranched runs. */
+};
+
+/**
  * @struct TerrainDetail
  * @brief A fractal field sampled on top of the control mesh, and how hard to apply it.
  *
@@ -574,7 +782,36 @@ struct ChannelSegment {
     MapPoint b;              /**< @brief The other end, in grid units. */
     double half_width = 0.0; /**< @brief Half the river's width here, in grid units. */
     double depth = 0.0;      /**< @brief Depth of the cut at the centreline, in height units. */
+    /**
+     * @brief Fraction of `half_width` held at full depth before the bed rises, 0 to 1.
+     *
+     * Zero upstream, where the bed is a plain concave channel. It opens toward 1 at
+     * an estuary, because a wider parabola does not help there: at 94% of the radius
+     * a parabolic bed has risen back to within 11% of the rim, so the edges of the
+     * drawn ribbon would still rest on the bank. A flat bed is what actually puts
+     * the whole mouth at the waterline.
+     */
+    double flat = 0.0;
 };
+
+/**
+ * @brief How far past the drawn ribbon an estuary is widened, as a multiple of its reach.
+ *
+ * The probe that decides the water's floor samples the stroke's corners, which lie
+ * about 1.4 reaches from the centreline, so a channel widened to exactly one reach
+ * still leaves them on the bank. One and a half covers them with a margin.
+ */
+inline constexpr double k_estuary_reach = 2.0;
+
+/**
+ * @brief How much of an estuary's width is flat bed at the mouth, 0 to 1.
+ *
+ * The probe that decides the water's floor samples the stroke's corners, which lie
+ * about 1.4 reaches out. At this fraction of a `k_estuary_reach`-wide channel the
+ * flat bed extends to 1.6 reaches, so those corners are over the bed rather than the
+ * bank, and the sheet can sit at the waterline across its whole width.
+ */
+inline constexpr double k_estuary_flat = 0.8;
 
 /**
  * @struct RiverChannels
@@ -651,6 +888,7 @@ public:
     std::vector<MapRegion> regions; /**< @brief Provinces carved by the region pass. */
     std::vector<MapCountry> countries; /**< @brief Nations carved by the region pass. */
     std::vector<MapLandmark> landmarks; /**< @brief Notable places found by the landmark pass. */
+    std::vector<MapCave> caves;     /**< @brief Cave systems opened by the cave pass. */
 
     /** @brief Drops every array, returning the graph to its freshly constructed state. */
     void clear() {
@@ -663,6 +901,7 @@ public:
         regions.clear();
         countries.clear();
         landmarks.clear();
+        caves.clear();
     }
 
     /**
@@ -782,12 +1021,17 @@ public:
     double elevation_at(const MapCenter& center, double x, double y, const TerrainDetail& detail,
                         const RiverChannels& channels) const {
         const double surface = elevation_at(center, x, y, detail);
-        const double cut = channel_cut_(center, x, y, channels);
+        const double cut = channel_cut(center, x, y, channels);
         return cut > 0.0 ? std::clamp(surface - cut, 0.0, 1.0) : surface;
     }
 
     /**
      * @brief How deep the river channel runs beneath a point, in height units.
+     *
+     * Public, and named without the trailing underscore this codebase gives its
+     * internal helpers, because the renderer reads it directly: the flat elevation
+     * surface has no interpolation to carry a channel, so it subtracts one from the
+     * cell's own height instead.
      *
      * Zero everywhere except within a river's own width of its centreline, which
      * is a very small part of a map -- hence the bounding-box test before the
@@ -811,7 +1055,7 @@ public:
      * @param channels The channel index.
      * @return The depth to subtract, or 0 away from any watercourse.
      */
-    double channel_cut_(const MapCenter& center, double x, double y,
+    double channel_cut(const MapCenter& center, double x, double y,
                         const RiverChannels& channels) const {
         const std::size_t index = static_cast<std::size_t>(center.index);
         if (index >= channels.cells.size()) {
@@ -831,7 +1075,15 @@ public:
                 continue;
             }
             const double t = distance / segment.half_width;
-            deepest = std::max(deepest, segment.depth * (1.0 - t * t));
+            if (t <= segment.flat) {
+                deepest = std::max(deepest, segment.depth);
+                continue;
+            }
+            // Beyond the flat bed the same concave rise as before, re-based so it
+            // still reaches exactly zero at the rim.
+            const double span = 1.0 - segment.flat;
+            const double u = span > 0.0 ? (t - segment.flat) / span : 1.0;
+            deepest = std::max(deepest, segment.depth * (1.0 - u * u));
         }
         return deepest;
     }
@@ -1064,6 +1316,44 @@ public:
 };
 
 /**
+ * @brief Steepness of the ground across an edge, as a dimensionless grade.
+ *
+ * The one definition of "how steep is it here", and until caves there was none.
+ * The renderer's `hillshade_()` takes a gradient, but off the *blurred eight-bit
+ * raster* and with a 600x exaggeration baked in, so it answers a question about
+ * a picture rather than about the ground. `RoadConfig::slope_cost` multiplies a
+ * bare height difference that is never divided by the distance it is spread
+ * over, so it is only comparable between edges of similar length. And
+ * `MapCorner::downslope` is a direction with no magnitude at all.
+ *
+ * Real metres both ways -- height through `height_to_meters()`, distance through
+ * `grid_to_meters()` -- so 0.25 means a one-in-four slope and goes on meaning it
+ * whatever `elevation_range_m` and `meters_per_grid_unit` are set to. A threshold
+ * written against this is a statement about terrain rather than about units.
+ *
+ * Measured between the two cell *sites*, not the two corners: the sites are what
+ * carry the smoothed heights the rest of the map is classified from, and an edge
+ * is the boundary between them.
+ *
+ * @param graph The generated graph; reads `centers`.
+ * @param edge The edge to measure across.
+ * @param config Supplies the horizontal and vertical scales.
+ * @return Rise over run, or 0 for a degenerate edge.
+ */
+inline double edge_grade(const MapGraph& graph, const MapEdge& edge, const MapConfig& config) {
+    if (edge.d0 == k_invalid_id || edge.d1 == k_invalid_id) {
+        return 0.0;
+    }
+    const MapCenter& a = graph.centers[static_cast<std::size_t>(edge.d0)];
+    const MapCenter& b = graph.centers[static_cast<std::size_t>(edge.d1)];
+    const double run = grid_to_meters(config, a.point.distance_to(b.point));
+    if (run <= 0.0) {
+        return 0.0;
+    }
+    return height_to_meters(config, std::abs(a.elevation - b.elevation)) / run;
+}
+
+/**
  * @brief Builds the channel index `MapGraph::elevation_at()` cuts the rivers with.
  *
  * Walks each river's smoothed centreline, pairing every segment with the volume
@@ -1085,7 +1375,8 @@ public:
  * @param config Supplies the channel depths, the river widths and the vertical scale.
  * @return The index, empty when no channel is cut.
  */
-inline RiverChannels make_river_channels(const MapGraph& graph, const MapConfig& config) {
+inline RiverChannels make_river_channels(const MapGraph& graph, const MapConfig& config,
+                                         const TerrainDetail& detail = TerrainDetail{}) {
     RiverChannels channels;
     if (config.river_channel_depth_m <= 0.0 && config.river_channel_depth_per_volume_m <= 0.0) {
         return channels;
@@ -1096,6 +1387,7 @@ inline RiverChannels make_river_channels(const MapGraph& graph, const MapConfig&
 
     const double base = meters_to_height(config, config.river_channel_depth_m);
     const double per_volume = meters_to_height(config, config.river_channel_depth_per_volume_m);
+    const double blend_length = meters_to_grid(config, config.river_mouth_blend_m);
 
     std::vector<std::vector<ChannelSegment>> grouped(graph.centers.size());
     // One stamp per cell, so a segment filed under a cell by two of its three
@@ -1110,6 +1402,25 @@ inline RiverChannels make_river_channels(const MapGraph& graph, const MapConfig&
             continue;
         }
         const std::size_t spans = river.points.size() - 1;
+
+        // Distance back to the mouth, and the level of the water waiting there.
+        std::vector<double> to_mouth(spans, 0.0);
+        double run = 0.0;
+        for (std::size_t i = spans; i-- > 0;) {
+            to_mouth[i] = run;
+            run += river.points[i].distance_to(river.points[i + 1]);
+        }
+        const MapCorner& mouth = graph.corners[static_cast<std::size_t>(river.corners.back())];
+        double target = 0.0;
+        bool has_target = false;
+        for (const CenterId center_id : mouth.touches) {
+            const MapCenter& center = graph.centers[static_cast<std::size_t>(center_id)];
+            if (center.water) {
+                target = center.water_level;
+                has_target = true;
+            }
+        }
+
         for (std::size_t i = 0; i < spans; ++i) {
             const std::size_t slot =
                 std::min(river.corners.size() - 1, i * river.corners.size() / spans);
@@ -1122,18 +1433,71 @@ inline RiverChannels make_river_channels(const MapGraph& graph, const MapConfig&
             segment.b = river.points[i + 1];
             segment.half_width = river_width(config, volume) * 0.5;
             segment.depth = base + per_volume * static_cast<double>(volume);
+
+            const double toward_mouth =
+                blend_length > 0.0 ? std::clamp(1.0 - to_mouth[i] / blend_length, 0.0, 1.0) : 0.0;
+            if (has_target && toward_mouth > 0.0 && !corner.touches.empty()) {
+                const MapCenter& here =
+                    graph.centers[static_cast<std::size_t>(corner.touches.front())];
+                const MapPoint middle{(segment.a.x + segment.b.x) * 0.5,
+                                      (segment.a.y + segment.b.y) * 0.5};
+                // Deep enough to put the bed at the waterline, and wide enough to
+                // carry the whole drawn ribbon -- the probe that decides the water's
+                // floor reaches past the stroke diagonally, so anything narrower
+                // leaves its edge up on the bank, which is the very thing this is
+                // trying to fix.
+                // To a freeboard *below* the waterline, not to it. Carved exactly
+                // to the target, the bed and the sheet resting on it are the same
+                // height, and eight-bit output rounds them into neighbouring greys --
+                // terrain showing through the water at the one place this is meant to
+                // be seamless. A river's own depth is the natural gap to leave.
+                const double freeboard =
+                    meters_to_height(config, config.river_depth_m
+                                                 + config.river_depth_per_volume_m
+                                                       * static_cast<double>(volume));
+                const double to_water =
+                    graph.elevation_at(here, middle.x, middle.y, detail) - (target - freeboard);
+                const double reach =
+                    (river_width(config, volume)
+                     + meters_to_grid(config, config.water_edge_overlap_m) * 2.0) * 0.5;
+                // Carved *to* the waterline, not merely deepened toward it. Taking
+                // the deeper of the two instead dug the bed straight past the sea --
+                // the ordinary channel is some 22 m deep and a mouth often needs far
+                // less than that, or none at all where the ground already lies below
+                // the waterline -- so the sheet resting on the bed ended under the
+                // water it was running into, which is the dark notch at every join.
+                segment.depth += (std::max(0.0, to_water) - segment.depth) * toward_mouth;
+                segment.half_width +=
+                    std::max(0.0, reach * k_estuary_reach - segment.half_width) * toward_mouth;
+                segment.flat = k_estuary_flat * toward_mouth;
+            }
+
             if (segment.half_width <= 0.0 || segment.depth <= 0.0) {
                 continue;
             }
 
             ++serial;
-            for (const CenterId center_id : corner.touches) {
+            const auto file = [&](CenterId center_id) {
                 const std::size_t index = static_cast<std::size_t>(center_id);
                 if (index >= grouped.size() || stamp[index] == serial) {
-                    continue;
+                    return;
                 }
                 stamp[index] = serial;
                 grouped[index].push_back(segment);
+            };
+            for (const CenterId center_id : corner.touches) {
+                file(center_id);
+                // An estuary is wide enough to reach ground the corner it came from
+                // does not touch, and a cell that does not carry the segment computes
+                // no cut for it -- which is a seam down the middle of every mouth.
+                // Ordinary channels stay filed under the three cells sharing their
+                // corner, which is all their width can reach.
+                if (segment.flat > 0.0) {
+                    for (const CenterId neighbor_id :
+                         graph.centers[static_cast<std::size_t>(center_id)].neighbors) {
+                        file(neighbor_id);
+                    }
+                }
             }
         }
     }
@@ -1174,54 +1538,63 @@ inline RiverChannels make_river_channels(const MapGraph& graph, const MapConfig&
 }
 
 /**
- * @brief The height a river's water surface takes over one segment of its course.
+ * @struct RiverSurfaces
+ * @brief The drawn water surface of every river, one height per segment.
  *
- * **The one definition of the ground under a river**, and it is a free function
- * rather than a step inside the renderer because it used not to be. The water
- * layer computed the sheet from `MapCorner::elevation` while the elevation layer
- * drew `elevation_at()`, and the two are not the same surface -- at a river corner
- * the blend of the surrounding cell sites sits some 22 m *above* that corner's own
- * height, because each cell averages in its non-river corners. Against a metre or
- * two of `river_depth_m` that put nearly half of every watercourse underneath the
- * terrain the other layer drew. Anything measuring the ground under a river should
- * come here rather than derive it again.
+ * **The one definition of the height a river's water is drawn at**, and it is a
+ * whole-network table rather than a function of one segment because none of the
+ * three things it has to guarantee are local:
  *
- * ### Why the surface is sampled uncut
+ * - a water surface only ever **falls** -- which needs the segments before it;
+ * - it **meets the body it empties into** -- which needs the distance to the mouth;
+ * - two rivers meeting **agree on a height** -- which needs the other river.
  *
- * Deliberately the four-argument `elevation_at()`, without `RiverChannels`, so the
- * height returned is the ground at the channel's *rim* rather than at its bed. The
- * water then fills the channel instead of lying as a trickle at the bottom of a
- * gorge, and the guarantee comes out trivially: inside the channel the drawn ground
- * is lower than this by the whole depth of the cut, and at the rim it is lower by
- * the freeboard.
+ * Computed per segment and independently, the surface did none of them: 48 of 55
+ * rivers flowed uphill somewhere, the median ocean mouth ended 10.9 m above the
+ * sea it ran into, and confluences disagreed by up to 30.8 m.
  *
- * ### Why the maximum over a footprint, and not the midpoint
- *
- * The renderer strokes one flat height across a whole segment, `river_width()` wide
- * plus the overlap either side, so a single sample at the centre can sit under the
- * ground somewhere else in that rectangle. Sampling the centreline and its two
- * offsets caught most of it and still left the *corners* of the swept rectangle
- * failing, which is where the ground is furthest from the point that was measured.
- *
- * So the probe is a grid over the whole footprint, widened by the same reach along
- * the segment as across it, since `draw_line` rounds its ends past the endpoints.
- * The surface is piecewise linear, so a grid this coarse over a rectangle a few
- * metres on a side finds the maximum to well within the freeboard.
- *
- * @param graph The generated graph; supplies corners, cells and the surface.
- * @param river The watercourse being drawn.
- * @param segment Index of the segment, `[0, river.points.size() - 1)`.
- * @param config Supplies the freeboard, the river widths and the vertical scale.
- * @param detail The detail field, so the sheet follows a roughened surface too.
- * @return The water surface height, clamped to `[0, 1]`.
+ * Build once per render, like `RiverChannels` and `TerrainDetail`; the renderer
+ * takes it by reference and never recomputes it.
  */
-inline double river_surface_at(const MapGraph& graph, const MapRiver& river,
-                               std::size_t segment, const MapConfig& config,
-                               const TerrainDetail& detail) {
-    if (river.points.size() < 2 || river.corners.empty()
-        || segment + 1 >= river.points.size()) {
-        return 0.0;
+struct RiverSurfaces {
+    /** @brief Indexed by river, then by segment; `points.size() - 1` entries each. */
+    std::vector<std::vector<double>> heights;
+
+    /**
+     * @brief The height a river is drawn at over one segment.
+     * @param river Index into `MapGraph::rivers`.
+     * @param segment Index into that river's segments.
+     * @return The surface height, or 0 when either index is out of range.
+     */
+    double at(std::size_t river, std::size_t segment) const {
+        if (river >= heights.size() || segment >= heights[river].size()) {
+            return 0.0;
+        }
+        return heights[river][segment];
     }
+};
+
+namespace detail {
+
+/**
+ * @brief The highest drawn ground under one segment's stroke, in height units.
+ *
+ * Sampled over the whole footprint the renderer paints -- both endpoints stepped
+ * past by the reach, the midpoint, and each offset to either side -- because a
+ * single sample at the centre can sit under the ground at an end or at the edge of
+ * the stroke.
+ *
+ * @param graph The map being measured.
+ * @param river The watercourse.
+ * @param segment Which segment of it.
+ * @param config Supplies the widths and the vertical scale.
+ * @param detail The detail field, so the sheet follows a roughened surface.
+ * @param channels The carved channels, or null to sample the ground uncut.
+ * @return The highest ground the stroke covers.
+ */
+inline double river_ground_under(const MapGraph& graph, const MapRiver& river,
+                                 std::size_t segment, const MapConfig& config,
+                                 const TerrainDetail& detail, const RiverChannels* channels) {
     const std::size_t spans = river.points.size() - 1;
     const std::size_t slot =
         std::min(river.corners.size() - 1, segment * river.corners.size() / spans);
@@ -1249,22 +1622,315 @@ inline double river_surface_at(const MapGraph& graph, const MapRiver& river,
     const double nx = length > 0.0 ? -dy / length * reach : 0.0;
     const double ny = length > 0.0 ? dx / length * reach : reach;
 
+    // Five stations along the stroke: past each end, at each end, and the middle.
+    // The stepped-past pair cover the rounded caps; the endpoints themselves matter
+    // because the channel varies along the course, so ground at the start of a
+    // segment is not the ground a reach before it.
+    const MapPoint stations[] = {{from.x - ax, from.y - ay},
+                                 from,
+                                 {(from.x + to.x) * 0.5, (from.y + to.y) * 0.5},
+                                 to,
+                                 {to.x + ax, to.y + ay}};
     double ground = 0.0;
-    for (int along = -1; along <= 1; ++along) {
-        // -1 and 1 step *past* the endpoints by the reach, because the stroke's
-        // ends are rounded and cover ground the segment itself does not.
-        const double base_x = (along < 0 ? from.x - ax : (along > 0 ? to.x + ax : (from.x + to.x) * 0.5));
-        const double base_y = (along < 0 ? from.y - ay : (along > 0 ? to.y + ay : (from.y + to.y) * 0.5));
-        for (int across = -1; across <= 1; ++across) {
-            const double x = base_x + nx * static_cast<double>(across);
-            const double y = base_y + ny * static_cast<double>(across);
-            ground = std::max(ground, graph.elevation_at(center, x, y, detail));
+    for (const MapPoint& station : stations) {
+        // Five steps across as well as five along. The renderer paints every pixel
+        // of the stroke and this samples a grid over it, so a coarser grid lets a
+        // ridge between two probes escape -- and the sheet then settles a hair under
+        // it, which at eight-bit output is a whole grey level of terrain showing
+        // through the water.
+        for (double across = -1.0; across <= 1.0; across += 0.5) {
+            const double x = station.x + nx * across;
+            const double y = station.y + ny * across;
+            ground = std::max(ground, channels == nullptr
+                                          ? graph.elevation_at(center, x, y, detail)
+                                          : graph.elevation_at(center, x, y, detail, *channels));
+        }
+    }
+    return ground;
+}
+
+/** @brief Freeboard of the sheet above the bed over one segment, in height units. */
+inline double river_freeboard(const MapGraph& graph, const MapRiver& river, std::size_t segment,
+                              const MapConfig& config) {
+    const std::size_t spans = river.points.size() - 1;
+    const std::size_t slot =
+        std::min(river.corners.size() - 1, segment * river.corners.size() / spans);
+    const int volume = graph.corners[static_cast<std::size_t>(river.corners[slot])].river;
+    return meters_to_height(config, config.river_depth_m
+                                        + config.river_depth_per_volume_m
+                                              * static_cast<double>(volume));
+}
+
+/**
+ * @brief Forces one river's profile to fall, and to clear the ground beneath it.
+ *
+ * Both at once, which is why the floor is taken as a *suffix* maximum first: to be
+ * non-increasing and still above the ground everywhere, a segment has to clear not
+ * only its own ground but every piece of ground downstream of it. Applying the two
+ * rules in turn instead makes them fight -- lowering for monotonicity pushes the
+ * sheet into a hillside, raising it off the hillside breaks monotonicity.
+ *
+ * Holding the water up behind high ground is also the right picture: that is what a
+ * natural weir does, rather than the river cutting through it.
+ *
+ * @param floors The ground plus freeboard each segment must clear.
+ * @param surface The profile to settle, in place.
+ */
+inline std::vector<double> river_binding(const std::vector<double>& floors) {
+    std::vector<double> binding(floors.size());
+    double running = 0.0;
+    for (std::size_t i = floors.size(); i-- > 0;) {
+        running = std::max(running, floors[i]);
+        binding[i] = running;
+    }
+    return binding;
+}
+
+/**
+ * @brief Forces one river's profile to fall, given the bound it may not go under.
+ * @param binding The suffix-maximum floor, from `river_binding()`.
+ * @param surface The profile to settle, in place.
+ */
+inline void settle_river_profile(const std::vector<double>& binding,
+                                 std::vector<double>& surface) {
+    if (surface.empty()) {
+        return;
+    }
+    double previous = std::numeric_limits<double>::max();
+    for (std::size_t i = 0; i < surface.size(); ++i) {
+        surface[i] = std::max(binding[i], std::min(previous, surface[i]));
+        previous = surface[i];
+    }
+}
+
+} // namespace detail
+
+/**
+ * @brief Computes the height every river's water is drawn at.
+ *
+ * Four stages, in order, each fixing something the stage before cannot.
+ *
+ * **The floor** is the ground under the stroke plus the freeboard, but sampled from
+ * two different surfaces and blended between them as the mouth approaches. Upstream
+ * it is the *uncut* ground, so the water fills its channel to the rim -- a river
+ * brim-full in its valley. At the mouth it is the *cut* ground, the bed itself,
+ * because the uncut surface holds the water up on the bank: measured at the coast,
+ * the uncut ground sits at 158 m against a sea at 150, while the cut channel is
+ * already down at 129. Sampling the rim is what left every river ending above the
+ * sea it ran into.
+ *
+ * **The target** is the surface of the body the river empties into, and the blend
+ * toward it is taken with a `min`, so it only ever pulls the river *down*. A river
+ * entering a lake whose level stands above it -- the lake surface is the highest bed
+ * in its body, which can be a hundred metres over the shore -- keeps its own height
+ * and lets the lake sheet, drawn afterwards, cover its end. Water does not climb.
+ *
+ * **Settling** makes each profile fall and clear the ground; see
+ * `detail::settle_river_profile()`.
+ *
+ * **Reconciling** gives every corner shared by two rivers one height: the lowest
+ * claimed there, but never below the highest ground claimed there. Settling is then
+ * re-run, because moving a corner can break the descent that was just established.
+ *
+ * @param graph The generated graph.
+ * @param config Supplies the depths, the widths, the blend length and the scale.
+ * @param detail The detail field, so the sheet follows a roughened surface.
+ * @param channels The carved channels, so the water can settle into its bed.
+ * @return One height per segment of every river.
+ */
+inline RiverSurfaces make_river_surfaces(const MapGraph& graph, const MapConfig& config,
+                                         const TerrainDetail& detail,
+                                         const RiverChannels& channels) {
+    RiverSurfaces surfaces;
+    surfaces.heights.resize(graph.rivers.size());
+    const double blend_length = meters_to_grid(config, config.river_mouth_blend_m);
+
+    std::vector<std::vector<double>> floors(graph.rivers.size());
+    std::vector<double> targets(graph.rivers.size(), -1.0);
+    std::vector<std::vector<double>> mouth_weights(graph.rivers.size());
+
+    for (std::size_t r = 0; r < graph.rivers.size(); ++r) {
+        const MapRiver& river = graph.rivers[r];
+        if (river.points.size() < 2 || river.corners.empty()) {
+            continue;
+        }
+        const std::size_t spans = river.points.size() - 1;
+
+        // Distance from each segment back to the mouth, for the blend.
+        std::vector<double> to_mouth(spans, 0.0);
+        double run = 0.0;
+        for (std::size_t i = spans; i-- > 0;) {
+            to_mouth[i] = run;
+            run += river.points[i].distance_to(river.points[i + 1]);
+        }
+
+        // The body it empties into, if any.
+        const MapCorner& mouth = graph.corners[static_cast<std::size_t>(river.corners.back())];
+        double target = 0.0;
+        bool has_target = false;
+        for (const CenterId center_id : mouth.touches) {
+            const MapCenter& center = graph.centers[static_cast<std::size_t>(center_id)];
+            if (center.water) {
+                target = center.water_level;
+                has_target = true;
+            }
+        }
+
+        floors[r].resize(spans);
+        surfaces.heights[r].resize(spans);
+        for (std::size_t i = 0; i < spans; ++i) {
+            const double freeboard = detail::river_freeboard(graph, river, i, config);
+            const double uncut =
+                detail::river_ground_under(graph, river, i, config, detail, nullptr);
+            const double cut =
+                detail::river_ground_under(graph, river, i, config, detail, &channels);
+            const double toward_mouth =
+                blend_length > 0.0 ? std::clamp(1.0 - to_mouth[i] / blend_length, 0.0, 1.0) : 0.0;
+
+            floors[r][i] = (uncut + (cut - uncut) * toward_mouth) + freeboard;
+            double height = floors[r][i];
+            if (has_target) {
+                // Down only. Where the target stands above the river, this keeps the
+                // river's own height.
+                height = std::min(height, height + (target - height) * toward_mouth);
+            }
+            surfaces.heights[r][i] = height;
+        }
+
+        // Kept for the final pass, which runs after settling: raising a mouth is
+        // exactly the thing monotone descent would undo.
+        targets[r] = has_target ? target : -1.0;
+        mouth_weights[r] = std::move(to_mouth);
+    }
+
+    // The bound each river may not sink below, which is what a confluence has to be
+    // reconciled against. Using the raw floor at the shared corner instead leaves the
+    // two disagreeing by up to 15 m: settling afterwards lifts whichever river has
+    // high ground *downstream* of the corner back above the level just agreed, and no
+    // number of rounds converges because the constraint was never the one applied.
+    std::vector<std::vector<double>> bindings(graph.rivers.size());
+    for (std::size_t r = 0; r < graph.rivers.size(); ++r) {
+        bindings[r] = detail::river_binding(floors[r]);
+        detail::settle_river_profile(bindings[r], surfaces.heights[r]);
+    }
+
+    // Reconcile confluences, then settle again: a corner pulled down by the river it
+    // shares can leave the profile around it no longer falling.
+    for (int round = 0; round < 2; ++round) {
+        std::unordered_map<std::int64_t, double> lowest;
+        std::unordered_map<std::int64_t, double> highest_floor;
+        const auto visit = [&](auto&& record) {
+            for (std::size_t r = 0; r < graph.rivers.size(); ++r) {
+                const MapRiver& river = graph.rivers[r];
+                if (surfaces.heights[r].empty()) {
+                    continue;
+                }
+                const std::size_t spans = surfaces.heights[r].size();
+                for (std::size_t k = 0; k < river.corners.size(); ++k) {
+                    const std::size_t segment =
+                        std::min(spans - 1, k * spans / std::max<std::size_t>(1, river.corners.size() - 1));
+                    record(static_cast<std::int64_t>(river.corners[k]), r, segment);
+                }
+            }
+        };
+        visit([&](std::int64_t corner, std::size_t r, std::size_t segment) {
+            const double height = surfaces.heights[r][segment];
+            auto found = lowest.find(corner);
+            if (found == lowest.end()) {
+                lowest.emplace(corner, height);
+                highest_floor.emplace(corner, bindings[r][segment]);
+            } else {
+                found->second = std::min(found->second, height);
+                auto& floor = highest_floor[corner];
+                floor = std::max(floor, bindings[r][segment]);
+            }
+        });
+        visit([&](std::int64_t corner, std::size_t r, std::size_t segment) {
+            const double agreed = std::max(lowest[corner], highest_floor[corner]);
+            surfaces.heights[r][segment] = agreed;
+            // Recorded as a floor, not merely written. Agreeing a confluence can put
+            // it *above* what its own river holds upstream, and settling then pulls
+            // it straight back down -- which is why simply assigning the level and
+            // re-settling never converged. A level a river must hold at a confluence
+            // is a level it must hold everywhere above it too: water pools behind an
+            // obstruction rather than thinning out over it, and `river_binding()`'s
+            // suffix maximum carries exactly that upstream.
+            floors[r][segment] = std::max(floors[r][segment], agreed);
+        });
+        for (std::size_t r = 0; r < graph.rivers.size(); ++r) {
+            bindings[r] = detail::river_binding(floors[r]);
+            detail::settle_river_profile(bindings[r], surfaces.heights[r]);
         }
     }
 
-    const double depth = config.river_depth_m
-                       + config.river_depth_per_volume_m * static_cast<double>(corner.river);
-    return std::clamp(ground + meters_to_height(config, depth), 0.0, 1.0);
+    // Last of all: a river ends at the level of what it feeds, never below it.
+    //
+    // This has to come after settling rather than before, and the reason is the
+    // whole difficulty of the join. The blend upstream only ever pulls a river
+    // *down*, which is right where a lake stands over it -- water does not climb a
+    // hillside. But a mouth that finishes under the sea is the dark notch at every
+    // join, and raising it is precisely what monotone descent exists to undo: the
+    // settle pass sees a segment higher than the one above it and pulls it back.
+    //
+    // So the rise is applied at the end and confined to the blend, weighted so the
+    // river meets the body exactly at the join and the correction fades out
+    // upstream. The profile still falls everywhere else; where a body stands above
+    // its own inflow, the last stretch is that body backed up into the valley, which
+    // is what a drowned inlet is.
+    for (std::size_t r = 0; r < graph.rivers.size(); ++r) {
+        if (targets[r] < 0.0 || surfaces.heights[r].empty()) {
+            continue;
+        }
+        for (std::size_t i = 0; i < surfaces.heights[r].size(); ++i) {
+            const double toward_mouth =
+                blend_length > 0.0
+                    ? std::clamp(1.0 - mouth_weights[r][i] / blend_length, 0.0, 1.0)
+                    : 0.0;
+            double& height = surfaces.heights[r][i];
+            height = std::max(height, height + (targets[r] - height) * toward_mouth);
+        }
+    }
+
+    // Raising a mouth can lift one side of a confluence and not the other, so the
+    // shared corners are agreed once more -- this time upward, which is the only
+    // direction that keeps every river at or above the body it feeds. No settling
+    // follows, because settling is what would undo the rise.
+    {
+        std::unordered_map<std::int64_t, double> highest;
+        const auto visit = [&](auto&& record) {
+            for (std::size_t r = 0; r < graph.rivers.size(); ++r) {
+                const MapRiver& river = graph.rivers[r];
+                const std::size_t spans = surfaces.heights[r].size();
+                if (spans == 0) {
+                    continue;
+                }
+                for (std::size_t k = 0; k < river.corners.size(); ++k) {
+                    const std::size_t segment = std::min(
+                        spans - 1, k * spans / std::max<std::size_t>(1, river.corners.size() - 1));
+                    record(static_cast<std::int64_t>(river.corners[k]), r, segment);
+                }
+            }
+        };
+        visit([&](std::int64_t corner, std::size_t r, std::size_t segment) {
+            auto found = highest.find(corner);
+            const double height = surfaces.heights[r][segment];
+            if (found == highest.end()) {
+                highest.emplace(corner, height);
+            } else {
+                found->second = std::max(found->second, height);
+            }
+        });
+        visit([&](std::int64_t corner, std::size_t r, std::size_t segment) {
+            surfaces.heights[r][segment] = highest[corner];
+        });
+    }
+
+    for (std::vector<double>& profile : surfaces.heights) {
+        for (double& height : profile) {
+            height = std::clamp(height, 0.0, 1.0);
+        }
+    }
+    return surfaces;
 }
 
 } // namespace maps

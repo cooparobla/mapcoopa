@@ -550,28 +550,21 @@ static void test_buildings_front_their_streets() {
     std::size_t fronting = 0;
 
     for (const MapTown& town : graph.towns) {
-        // One street set per claimed cell: the pass derives streets per cell, so
-        // a building in an outlying cell fronts that cell's streets, not the
-        // primary cell's.
-        std::vector<std::pair<MapPoint, MapPoint>> streets;
-        for (const CenterId cell_id : town.cells) {
-            const MapCenter& cell = graph.centers[static_cast<std::size_t>(cell_id)];
-            for (const EdgeId edge_id : cell.borders) {
-                const MapEdge& edge = graph.edges[static_cast<std::size_t>(edge_id)];
-                if (edge.road || edge.river > 0) {
-                    streets.emplace_back(cell.point, edge.midpoint);
-                }
-            }
-        }
-        if (streets.empty()) {
+        // The settlement's own streets, not a second set re-derived here. This
+        // used to rebuild them from the road and river edges, which silently
+        // missed the fallback lanes a cell with neither is given -- so it scored
+        // every building fronting one of those as fronting nothing, and measured
+        // 62% where the layout was actually at 72%. A test that recomputes what it
+        // is checking measures its own copy.
+        if (town.streets.empty()) {
             continue;
         }
 
         for (const MapBuilding& building : town.buildings) {
             ++total;
-            for (const auto& street : streets) {
-                const MapPoint& from = street.first;
-                const MapPoint& end = street.second;
+            for (const MapStreet& street : town.streets) {
+                const MapPoint& from = street.from;
+                const MapPoint& end = street.to;
                 const double dx = end.x - from.x;
                 const double dy = end.y - from.y;
                 const double length_squared = dx * dx + dy * dy;
@@ -601,10 +594,13 @@ static void test_buildings_front_their_streets() {
     }
 
     ASSERT_TRUE(total > 0);
-    // Measured at 51%. Uniformly random yaw would put only ~8% of buildings
-    // within rotation_jitter of a street, so this separates a road-aware layout
-    // from merely jittered noise. The remainder is deliberate interior infill.
-    ASSERT_TRUE(fronting * 100 >= total * 30);
+    // Measured at 72%: 51% before the interior infill stopped drawing its yaw from
+    // a full turn, 83% after, and back to 72% once plots were set back far enough
+    // to clear the carriageway -- a building held off the lane by its own size is
+    // further from the centreline than one standing on it. Uniformly random yaw
+    // would put only ~8% within `rotation_jitter` of a street, so this still
+    // separates a street-aware layout from jittered noise by a wide margin.
+    ASSERT_TRUE(fronting * 100 >= total * 65);
 }
 
 static void test_cell_outline_is_closed_and_ordered() {
@@ -713,6 +709,327 @@ static MapConfig world_config(int seed = 251) {
     config.regions.country_count = 4;
     config.regions.regions_per_country = 2;
     return config;
+}
+
+/**
+ * @brief A polar extent of zero leaves a world with no ice caps.
+ *
+ * The point of the knob, and the thing no value of `temperature_falloff` could
+ * ever express: the exponent shapes how fast the cold arrives, never whether it
+ * arrives at all.
+ *
+ * Asserted on frozen *water*, which is the cleanest witness available. A lake or
+ * sea surface sits at the waterline, so the altitude lapse has almost nothing to
+ * bite on, and `Ice` is chosen on temperature alone (`biome.h`). Frozen ground
+ * deliberately survives an extent of zero -- the lapse rate can still freeze a
+ * summit at any latitude, which is what should happen to a mountain.
+ */
+static void test_polar_extent_controls_the_ice() {
+    const auto frozen = [](const MapGraph& graph) {
+        std::size_t count = 0;
+        for (const MapCenter& center : graph.centers) {
+            if (center.biome == Biome::Ice || center.biome == Biome::Glacier) {
+                ++count;
+            }
+        }
+        return count;
+    };
+
+    MapConfig none = world_config(251);
+    none.polar_extent_north = 0.0;
+    none.polar_extent_south = 0.0;
+    MapGenerator without(none, maps_logger());
+    without.generate();
+    ASSERT_TRUE(frozen(without.graph()) == 0);
+
+    MapConfig wide = world_config(251);
+    wide.polar_extent_north = 0.25;
+    wide.polar_extent_south = 0.25;
+    MapGenerator with(wide, maps_logger());
+    with.generate();
+    ASSERT_TRUE(frozen(with.graph()) > 0);
+
+    // And the caps are where they were asked for, not merely present somewhere.
+    std::size_t polar = 0;
+    std::size_t temperate = 0;
+    const double grid = static_cast<double>(wide.grid_size);
+    for (const MapCenter& center : with.graph().centers) {
+        if (center.biome != Biome::Ice && center.biome != Biome::Glacier) {
+            continue;
+        }
+        const double latitude = center.point.y / grid;
+        if (latitude < 0.25 || latitude > 0.75) {
+            ++polar;
+        } else {
+            ++temperate;
+        }
+    }
+    ASSERT_TRUE(polar > temperate);
+}
+
+/**
+ * @brief The two poles are independent: ice at one end, none at the other.
+ *
+ * Which hemisphere a point belongs to is decided by one comparison, and getting
+ * it backwards would swap the caps without changing anything a symmetric test
+ * could see. This is that test.
+ */
+static void test_polar_extents_are_independent() {
+    MapConfig config = world_config(251);
+    config.polar_extent_north = 0.25;
+    config.polar_extent_south = 0.0;
+    MapGenerator generator(config, maps_logger());
+    generator.generate();
+
+    const double grid = static_cast<double>(config.grid_size);
+    double north = 0.0;
+    double south = 0.0;
+    std::size_t north_count = 0;
+    std::size_t south_count = 0;
+    for (const MapCenter& center : generator.graph().centers) {
+        const double latitude = center.point.y / grid;
+        if (latitude < 0.10) {
+            north += center.temperature;
+            ++north_count;
+        } else if (latitude > 0.90) {
+            south += center.temperature;
+            ++south_count;
+        }
+    }
+    ASSERT_TRUE(north_count > 0 && south_count > 0);
+    // `y = 0` is the north edge, so the cap belongs there and the far edge is left
+    // temperate. Measured 0.004 against 0.253.
+    ASSERT_TRUE(north / static_cast<double>(north_count) < k_biome_frigid);
+    ASSERT_TRUE(south / static_cast<double>(south_count) > k_biome_frigid);
+}
+
+/**
+ * @brief The global offset moves the whole world, and zero moves nothing.
+ *
+ * Zero has to be exact rather than approximate: it is the setting every map made
+ * before the knob existed was generated at.
+ */
+static void test_temperature_offset_shifts_the_world() {
+    const auto mean_temperature = [](double offset) {
+        MapConfig config = world_config(251);
+        config.temperature_offset = offset;
+        MapGenerator generator(config, maps_logger());
+        generator.generate();
+        double sum = 0.0;
+        std::size_t count = 0;
+        for (const MapCenter& center : generator.graph().centers) {
+            sum += center.temperature;
+            ++count;
+        }
+        return sum / static_cast<double>(count);
+    };
+
+    const double cold = mean_temperature(-0.25);
+    const double neutral = mean_temperature(0.0);
+    const double warm = mean_temperature(0.25);
+    ASSERT_TRUE(cold < neutral);
+    ASSERT_TRUE(neutral < warm);
+
+    // Zero is the untouched field, corner for corner.
+    MapConfig plain = world_config(251);
+    MapGenerator reference(plain, maps_logger());
+    reference.generate();
+    MapConfig zeroed = plain;
+    zeroed.temperature_offset = 0.0;
+    MapGenerator zero(zeroed, maps_logger());
+    zero.generate();
+    ASSERT_EQ(reference.graph().corners.size(), zero.graph().corners.size());
+    for (std::size_t i = 0; i < reference.graph().corners.size(); ++i) {
+        ASSERT_TRUE(reference.graph().corners[i].temperature
+                    == zero.graph().corners[i].temperature);
+    }
+}
+
+/**
+ * @brief A settlement emits the streets its buildings were laid out along.
+ *
+ * They used to be private to the pass: real enough to place plots against, and
+ * invisible to everyone else. A settlement whose streets nobody can see reads as
+ * a scatter no matter how carefully it was arranged, so emitting them is the
+ * change, not a side effect of it.
+ */
+static void test_towns_emit_their_streets() {
+    MapConfig config = world_config(251);
+    MapGenerator generator(config, maps_logger());
+    generator.generate();
+    const MapGraph& graph = generator.graph();
+    ASSERT_TRUE(!graph.towns.empty());
+
+    std::size_t checked = 0;
+    for (const MapTown& town : graph.towns) {
+        // Every settlement gets streets: the pass falls back to lanes toward the
+        // cell's farthest corners when no road or river reaches it.
+        ASSERT_TRUE(!town.streets.empty());
+        for (const MapStreet& street : town.streets) {
+            ASSERT_TRUE(street.length > 0.0);
+            ASSERT_TRUE(std::abs(street.length - street.from.distance_to(street.to)) < 1e-9);
+            ASSERT_TRUE(std::abs(street.bearing
+                                 - std::atan2(street.to.y - street.from.y,
+                                              street.to.x - street.from.x)) < 1e-9);
+            // The inner end is a claimed cell's own site, which is what makes the
+            // fans of a multi-cell settlement meet rather than merely overlap.
+            bool from_a_claimed_site = false;
+            for (const CenterId cell_id : town.cells) {
+                const MapPoint& site = graph.centers[static_cast<std::size_t>(cell_id)].point;
+                from_a_claimed_site = from_a_claimed_site
+                                   || street.from.distance_to(site) < 1e-9;
+            }
+            ASSERT_TRUE(from_a_claimed_site);
+            ++checked;
+        }
+    }
+    ASSERT_TRUE(checked > 0);
+}
+
+/**
+ * @brief Nothing is built on a street or a road.
+ *
+ * The test this needed and did not have. `can_place_()` kept buildings inside
+ * their cell, clear of water and clear of each other -- and said nothing at all
+ * about the roadways, so **37% of buildings stood on a lane and 18% on a road**
+ * while every layout test passed.
+ *
+ * Tested against the *whole footprint* rather than its corners, because that was
+ * the second half of the same bug: a corner test misses a street crossing the
+ * middle of a large plot, where all four corners are further from the centreline
+ * than the clearance, and misses a short road segment lying wholly inside one.
+ */
+static void test_nothing_is_built_on_a_roadway() {
+    MapConfig config = world_config(251);
+    MapGenerator generator(config, maps_logger());
+    generator.generate();
+    const MapGraph& graph = generator.graph();
+    ASSERT_TRUE(!graph.towns.empty());
+
+    // The drawn corridor as a rotated box, which is what the packer tests against.
+    const auto corridor = [](const MapPoint& from, const MapPoint& to, double half_width) {
+        MapBuilding box;
+        box.point = {(from.x + to.x) * 0.5, (from.y + to.y) * 0.5};
+        box.width = std::max(from.distance_to(to), 1e-9);
+        box.height = std::max(half_width * 2.0, 1e-9);
+        box.rotation = std::atan2(to.y - from.y, to.x - from.x);
+        return box;
+    };
+
+    const double lane = meters_to_grid(config, config.towns.street_width_m) * 0.5;
+    std::size_t checked = 0;
+    for (const MapTown& town : graph.towns) {
+        for (const MapBuilding& building : town.buildings) {
+            for (const MapStreet& street : town.streets) {
+                ASSERT_TRUE(!buildings_overlap(corridor(street.from, street.to, lane), building));
+            }
+            for (const MapRoad& road : graph.roads) {
+                const double half = road_width_for(config, road.road_class) * 0.5;
+                for (std::size_t i = 0; i + 1 < road.points.size(); ++i) {
+                    ASSERT_TRUE(!buildings_overlap(
+                        corridor(road.points[i], road.points[i + 1], half), building));
+                }
+            }
+            ++checked;
+        }
+    }
+    ASSERT_TRUE(checked > 0);
+}
+
+/**
+ * @brief Nothing is built in the market square.
+ *
+ * The square is open ground or it is not a square. Tested against the *rotated*
+ * footprint, because a building tested by its centre can still lean into the
+ * plaza with a corner.
+ */
+static void test_nothing_is_built_in_the_square() {
+    MapConfig config = world_config(251);
+    MapGenerator generator(config, maps_logger());
+    generator.generate();
+    const MapGraph& graph = generator.graph();
+
+    std::size_t with_plaza = 0;
+    for (const MapTown& town : graph.towns) {
+        if (town.plaza.radius <= 0.0) {
+            continue;
+        }
+        ++with_plaza;
+        for (const MapBuilding& building : town.buildings) {
+            for (const MapPoint& corner : building_corners(building)) {
+                ASSERT_TRUE(town.plaza.centre.distance_to(corner) >= town.plaza.radius);
+            }
+        }
+    }
+    // And squares exist at all -- an assertion over an empty set proves nothing.
+    ASSERT_TRUE(with_plaza > 0);
+}
+
+/**
+ * @brief A settlement has a civic core, sized to what it is.
+ *
+ * Every building used to be the same object, so a capital was a village with more
+ * squares in it. Roles are what make the tiers different in kind rather than only
+ * in count -- and the core sits at the heart, not scattered through the outskirts.
+ */
+static void test_settlements_have_a_civic_core() {
+    MapConfig config = world_config(251);
+    MapGenerator generator(config, maps_logger());
+    generator.generate();
+    const MapGraph& graph = generator.graph();
+    ASSERT_TRUE(!graph.towns.empty());
+
+    std::size_t capitals = 0;
+    for (const MapTown& town : graph.towns) {
+        std::vector<std::size_t> per_role(k_building_role_count, 0);
+        for (const MapBuilding& building : town.buildings) {
+            ASSERT_TRUE(static_cast<std::size_t>(building.role) < k_building_role_count);
+            ++per_role[static_cast<std::size_t>(building.role)];
+        }
+        // A settlement has one hall and one market, never two.
+        for (const BuildingRole role : {BuildingRole::Hall, BuildingRole::Market,
+                                        BuildingRole::Temple, BuildingRole::Well}) {
+            ASSERT_TRUE(per_role[static_cast<std::size_t>(role)] <= 1);
+        }
+        if (town.tier == TownTier::Capital && !town.buildings.empty()) {
+            ++capitals;
+            ASSERT_TRUE(per_role[static_cast<std::size_t>(BuildingRole::Hall)] == 1);
+            ASSERT_TRUE(per_role[static_cast<std::size_t>(BuildingRole::Market)] == 1);
+        }
+        // Most of a settlement is homes, whatever else it has.
+        ASSERT_TRUE(per_role[static_cast<std::size_t>(BuildingRole::Dwelling)] * 2
+                    >= town.buildings.size());
+
+        // The core is central: every civic building is nearer the heart than the
+        // furthest dwelling is.
+        const MapPoint heart = town.plaza.radius > 0.0 ? town.plaza.centre : town.point;
+        double furthest_dwelling = 0.0;
+        for (const MapBuilding& building : town.buildings) {
+            if (!is_civic_role(building.role)) {
+                furthest_dwelling =
+                    std::max(furthest_dwelling, heart.distance_to(building.point));
+            }
+        }
+        for (const MapBuilding& building : town.buildings) {
+            if (is_civic_role(building.role)) {
+                ASSERT_TRUE(heart.distance_to(building.point) <= furthest_dwelling);
+            }
+        }
+    }
+    ASSERT_TRUE(capitals > 0);
+}
+
+/** @brief Every role names itself, and an unknown name falls back to a dwelling. */
+static void test_building_role_names_round_trip() {
+    for (std::size_t i = 0; i < k_building_role_count; ++i) {
+        const BuildingRole role = static_cast<BuildingRole>(i);
+        ASSERT_TRUE(building_role_from_name(building_role_name(role)) == role);
+    }
+    ASSERT_TRUE(building_role_from_name("dwelling") == BuildingRole::Dwelling);
+    ASSERT_TRUE(building_role_from_name("not_a_role") == BuildingRole::Dwelling);
+    // Only a dwelling is not part of the civic core.
+    ASSERT_TRUE(!is_civic_role(BuildingRole::Dwelling));
+    ASSERT_TRUE(is_civic_role(BuildingRole::Hall));
 }
 
 static void test_buildings_avoid_rivers() {
@@ -1037,6 +1354,41 @@ static void test_yaml_round_trip_preserves_the_graph() {
         ASSERT_TRUE(original.towns[i].tier == loaded.towns[i].tier);
         ASSERT_EQ(original.towns[i].buildings.size(), loaded.towns[i].buildings.size());
     }
+
+    // Caves are written in full -- stations and smoothed passages both -- because
+    // per-cave identity lives here and nowhere else. The exported raster layers are
+    // keyed by depth, so "give me cave 7" is a question only the document answers.
+    ASSERT_EQ(original.caves.size(), loaded.caves.size());
+    ASSERT_TRUE(!original.caves.empty());
+    std::size_t stations = 0;
+    for (std::size_t i = 0; i < original.caves.size(); ++i) {
+        const MapCave& a = original.caves[i];
+        const MapCave& b = loaded.caves[i];
+        ASSERT_TRUE(a.name == b.name);
+        ASSERT_EQ(a.mouth_edge, b.mouth_edge);
+        ASSERT_TRUE(std::abs(a.phreatic_level - b.phreatic_level) < 1e-5);
+        ASSERT_TRUE(std::abs(a.deepest - b.deepest) < 1e-5);
+        ASSERT_EQ(a.nodes.size(), b.nodes.size());
+        ASSERT_EQ(a.passages.size(), b.passages.size());
+        for (std::size_t j = 0; j < a.nodes.size(); ++j) {
+            ASSERT_TRUE(a.nodes[j].zone == b.nodes[j].zone);
+            ASSERT_TRUE(a.nodes[j].feature == b.nodes[j].feature);
+            ASSERT_EQ(a.nodes[j].parent, b.nodes[j].parent);
+            ASSERT_TRUE(std::abs(a.nodes[j].floor - b.nodes[j].floor) < 1e-5);
+            ASSERT_TRUE(std::abs(a.nodes[j].roof - b.nodes[j].roof) < 1e-5);
+            ++stations;
+        }
+        for (std::size_t j = 0; j < a.passages.size(); ++j) {
+            ASSERT_EQ(a.passages[j].points.size(), b.passages[j].points.size());
+            ASSERT_EQ(a.passages[j].floors.size(), b.passages[j].floors.size());
+            ASSERT_EQ(a.passages[j].radii.size(), b.passages[j].radii.size());
+            for (std::size_t k = 0; k < a.passages[j].floors.size(); ++k) {
+                ASSERT_TRUE(std::abs(a.passages[j].floors[k] - b.passages[j].floors[k]) < 1e-5);
+                ASSERT_TRUE(std::abs(a.passages[j].roofs[k] - b.passages[j].roofs[k]) < 1e-5);
+            }
+        }
+    }
+    ASSERT_TRUE(stations > 20);
 }
 
 /**
@@ -1521,6 +1873,10 @@ static void test_readme_legend_matches_the_palette() {
         {"landmark-natural", palette.landmark_natural_color},
         {"landmark-built", palette.landmark_built_color},
         {"background", palette.background_color},
+        {"cave-shallow", palette.cave_shallow_color},
+        {"cave-deep", palette.cave_deep_color},
+        {"cave-chamber", palette.cave_chamber_color},
+        {"cave-mouth", palette.cave_mouth_color},
     };
     for (const auto& overlay : overlays) {
         const std::string hex = hex_of(overlay.second);
@@ -1579,6 +1935,7 @@ static MapConfig perturbed_config() {
     config.river_depth_per_volume_m = 0.6;
     config.river_channel_depth_m = 23.0;
     config.river_channel_depth_per_volume_m = 7.0;
+    config.river_mouth_blend_m = 175.0;
     config.river_incision_m = 88.0;
     config.river_incision_per_volume_m = 17.0;
     config.river_valley_width = 4;
@@ -1594,11 +1951,18 @@ static MapConfig perturbed_config() {
                     555.0, 6, 0.41, 0.22, 0.19};
     config.noise_shape = {66, 0.22, FastNoiseLite::NoiseType_Perlin,
                           FastNoiseLite::FractalType_FBm, 2, 2.3, 0.35, 0.25};
+    config.noise_cave = {77, 0.61, FastNoiseLite::NoiseType_Perlin,
+                         FastNoiseLite::FractalType_FBm, 3, 2.2, 0.4, 0.35};
     config.show_regions = false;
     config.composite_shading = CompositeShading::Hillshade;
+    config.elevation_surface = ElevationSurface::Flat;
+    config.elevation_blend = 0.37;
     config.region_tint = 0.42f;
     config.temperature_lapse_rate = 0.31;
     config.temperature_falloff = 2.4;
+    config.temperature_offset = -0.18;
+    config.polar_extent_north = 0.31;
+    config.polar_extent_south = 0.07;
     config.elevation_smoothing_iterations = 9;
     config.elevation_smoothing_strength = 0.66;
     config.threshold_water = 0.44;
@@ -1616,12 +1980,21 @@ static MapConfig perturbed_config() {
     config.noise_temperature = {22, 0.456, FastNoiseLite::NoiseType_Perlin,
                                 FastNoiseLite::FractalType_PingPong, 7, 1.5, 0.4, 0.2};
 
+    // Positional, and therefore only correct while it covers *every* field in
+    // declaration order: a knob added mid-struct silently shifts everything after
+    // it, and a knob added at the end is silently left at its default and never
+    // round-tripped. Six were, which is how they reached `assets/config.yaml`
+    // without anything reading them back.
     config.towns = {13, 555.5, 2, 6, 0.55, 3.5, 0.15, 0.25, 0.3, 0.75, 0.05,
-                    9, 5, 2, 41, 8.5, 17.5, 0.8, 0.5, 4.5,
-                    2, 9, 1.9, 1.4, 9.5, 16.5, 2.5, 0.5, 123};
+                    9, 5, 2, 41, 8.5, 17.5, 0.8, 0.5, 4.5, 1.25,
+                    2, 9, 1.9, 1.4, 9.5, 16.5, 2.5, 0.5, 123,
+                    21.5, 3, 6, 5, 1, 3.5};
     config.roads = {19, 444.5, 4.5, 2.5, 3.5, 1.25, 0.95, 44.0, 3, 0.65, 0.5, 0.2, 4};
     config.regions = {7, 4, 9.5, 3.25, 31.0};
     config.landmarks = {29, 31, 0.71, 0.088, 0.52, 12, 3.75, 2, 7, 5, 4};
+    config.caves = {11, 0.55, 410.5, 33.5, 11.5, 27.5, 315.0, 0.72, 44.5, 3, 0.66,
+                    41.5, 1250.0, 0.24, 0.45, 0.35, 0.09, 0.31, 0.62, 4, 275, 7.5,
+                    21.5, 0.17, 55.5, 3};
 
     config.enable_water = false;
     config.enable_coast = false;
@@ -1635,6 +2008,7 @@ static MapConfig perturbed_config() {
     config.enable_regions = false;
     config.enable_towns = false;
     config.enable_landmarks = false;
+    config.enable_caves = false;
     config.enable_noisy_edges = false;
 
     // Derived last, from the grid and the scale above, so this fixture satisfies
@@ -1716,6 +2090,7 @@ static void test_config_round_trips_every_field() {
     ASSERT_TRUE(std::abs(loaded.river_channel_depth_m - original.river_channel_depth_m) < 1e-9);
     ASSERT_TRUE(std::abs(loaded.river_channel_depth_per_volume_m
                          - original.river_channel_depth_per_volume_m) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.river_mouth_blend_m - original.river_mouth_blend_m) < 1e-9);
     ASSERT_TRUE(std::abs(loaded.river_incision_m - original.river_incision_m) < 1e-9);
     ASSERT_TRUE(std::abs(loaded.river_incision_per_volume_m
                          - original.river_incision_per_volume_m) < 1e-9);
@@ -1724,6 +2099,37 @@ static void test_config_round_trips_every_field() {
     ASSERT_TRUE(std::abs(loaded.water_edge_overlap_m - original.water_edge_overlap_m) < 1e-9);
     ASSERT_TRUE(std::abs(loaded.terrain_relief - original.terrain_relief) < 1e-9);
     ASSERT_TRUE(std::abs(loaded.terrain_roughness - original.terrain_roughness) < 1e-9);
+    ASSERT_EQ(loaded.caves.cave_count, original.caves.cave_count);
+    ASSERT_TRUE(std::abs(loaded.caves.min_grade - original.caves.min_grade) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.caves.min_spacing_m - original.caves.min_spacing_m) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.caves.roof_clearance_m - original.caves.roof_clearance_m) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.caves.passage_height_m - original.caves.passage_height_m) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.caves.chamber_height_m - original.caves.chamber_height_m) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.caves.max_depth_m - original.caves.max_depth_m) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.caves.vadose_share - original.caves.vadose_share) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.caves.level_spacing_m - original.caves.level_spacing_m) < 1e-9);
+    ASSERT_EQ(loaded.caves.max_levels, original.caves.max_levels);
+    ASSERT_TRUE(std::abs(loaded.caves.level_budget - original.caves.level_budget) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.caves.step_m - original.caves.step_m) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.caves.passage_length_m - original.caves.passage_length_m) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.caves.descent_grade - original.caves.descent_grade) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.caves.massif_bias - original.caves.massif_bias) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.caves.meander - original.caves.meander) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.caves.branch_chance_vadose
+                         - original.caves.branch_chance_vadose) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.caves.branch_chance_phreatic
+                         - original.caves.branch_chance_phreatic) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.caves.branch_budget - original.caves.branch_budget) < 1e-9);
+    ASSERT_EQ(loaded.caves.max_branches, original.caves.max_branches);
+    ASSERT_EQ(loaded.caves.max_nodes, original.caves.max_nodes);
+    ASSERT_TRUE(std::abs(loaded.caves.passage_width_m - original.caves.passage_width_m) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.caves.chamber_radius_m - original.caves.chamber_radius_m) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.caves.shaft_chance - original.caves.shaft_chance) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.caves.shaft_drop_m - original.caves.shaft_drop_m) < 1e-9);
+    ASSERT_EQ(loaded.caves.smoothing_iterations, original.caves.smoothing_iterations);
+    ASSERT_TRUE(loaded.enable_caves == original.enable_caves);
+    ASSERT_EQ(loaded.noise_cave.seed, original.noise_cave.seed);
+    ASSERT_TRUE(std::abs(loaded.noise_cave.frequency - original.noise_cave.frequency) < 1e-9);
     ASSERT_TRUE(loaded.shape.shape == original.shape.shape);
     ASSERT_TRUE(std::abs(loaded.shape.width_m - original.shape.width_m) < 1e-9);
     ASSERT_TRUE(std::abs(loaded.shape.height_m - original.shape.height_m) < 1e-9);
@@ -1740,9 +2146,14 @@ static void test_config_round_trips_every_field() {
     ASSERT_TRUE(loaded.noise_shape.type == original.noise_shape.type);
     ASSERT_TRUE(loaded.show_regions == original.show_regions);
     ASSERT_TRUE(loaded.composite_shading == original.composite_shading);
+    ASSERT_TRUE(loaded.elevation_surface == original.elevation_surface);
+    ASSERT_TRUE(std::abs(loaded.elevation_blend - original.elevation_blend) < 1e-9);
     ASSERT_TRUE(std::abs(loaded.region_tint - original.region_tint) < 1e-6f);
     ASSERT_TRUE(std::abs(loaded.temperature_lapse_rate - original.temperature_lapse_rate) < 1e-9);
     ASSERT_TRUE(std::abs(loaded.temperature_falloff - original.temperature_falloff) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.temperature_offset - original.temperature_offset) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.polar_extent_north - original.polar_extent_north) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.polar_extent_south - original.polar_extent_south) < 1e-9);
     ASSERT_EQ(loaded.elevation_smoothing_iterations, original.elevation_smoothing_iterations);
     ASSERT_TRUE(std::abs(loaded.elevation_smoothing_strength
                          - original.elevation_smoothing_strength) < 1e-9);
@@ -1783,6 +2194,13 @@ static void test_config_round_trips_every_field() {
     ASSERT_TRUE(std::abs(loaded.towns.building_size_min_m - original.towns.building_size_min_m) < 1e-9);
     ASSERT_TRUE(std::abs(loaded.towns.building_size_max_m - original.towns.building_size_max_m) < 1e-9);
     ASSERT_TRUE(std::abs(loaded.towns.water_clearance_m - original.towns.water_clearance_m) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.towns.street_clearance_m - original.towns.street_clearance_m) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.towns.street_width_m - original.towns.street_width_m) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.towns.plaza_radius_m - original.towns.plaza_radius_m) < 1e-9);
+    ASSERT_EQ(loaded.towns.plaza_min_cells, original.towns.plaza_min_cells);
+    ASSERT_EQ(loaded.towns.capital_civic_count, original.towns.capital_civic_count);
+    ASSERT_EQ(loaded.towns.town_civic_count, original.towns.town_civic_count);
+    ASSERT_EQ(loaded.towns.village_civic_count, original.towns.village_civic_count);
     ASSERT_EQ(loaded.towns.household_size_min, original.towns.household_size_min);
     ASSERT_EQ(loaded.towns.household_size_max, original.towns.household_size_max);
     ASSERT_EQ(loaded.towns.infill_attempts, original.towns.infill_attempts);
@@ -1893,6 +2311,15 @@ static void test_shipped_config_matches_the_documented_defaults() {
     ASSERT_TRUE(config.enable_valleys);
     ASSERT_TRUE(config.enable_biomes && config.enable_roads && config.enable_regions);
     ASSERT_TRUE(config.enable_towns && config.enable_landmarks && config.enable_noisy_edges);
+    ASSERT_TRUE(config.enable_caves);
+    ASSERT_EQ(config.caves.cave_count, 18);
+    ASSERT_TRUE(std::abs(config.caves.min_grade - 0.25) < 1e-9);
+    ASSERT_TRUE(std::abs(config.caves.roof_clearance_m - 25.0) < 1e-9);
+    ASSERT_TRUE(std::abs(config.caves.vadose_share - 0.6) < 1e-9);
+    ASSERT_TRUE(std::abs(config.caves.level_spacing_m - 38.0) < 1e-9);
+    ASSERT_EQ(config.caves.max_levels, 4);
+    ASSERT_TRUE(std::abs(config.caves.level_budget - 0.7) < 1e-9);
+    ASSERT_EQ(config.caves.max_nodes, 900);
 }
 
 
@@ -1986,6 +2413,467 @@ static void test_config_image_size_sets_the_scale() {
         const Image b = MapLayers::render(layer, generator.graph(), by_scale);
         ASSERT_EQ(a.pixels.size(), b.pixels.size());
         ASSERT_TRUE(a.pixels == b.pixels);
+    }
+}
+
+/**
+ * @brief Builds a map whose terrain is steep enough to bear caves.
+ *
+ * `small_config()` is a 16-cell grid, which has too few land edges clearing
+ * `min_grade` for a spacing rule to place many mouths on. This is the smallest
+ * map that reliably opens several systems, so the cave cases assert on a
+ * population rather than on one lucky cave.
+ */
+static MapConfig cave_config(int seed = 251) {
+    MapConfig config = world_config(seed);
+    config.caves.cave_count = 8;
+    return config;
+}
+
+/** @brief Samples the ground exactly as the cave pass and the renderer do. */
+class SurfaceProbe {
+public:
+    SurfaceProbe(const MapGraph& graph, const MapConfig& config)
+        : graph_(graph), terrain_(config.noise_terrain),
+          detail_(make_terrain_detail(config, terrain_)),
+          channels_(make_river_channels(graph, config, detail_)) {}
+
+    double at(const MapPoint& point) const {
+        // The nearest site is the cell, which is what `elevation_at()` wants as a
+        // hint. Linear here rather than the pass's graph walk on purpose: a test
+        // that reuses the machinery it is checking can agree with a bug.
+        std::size_t best = 0;
+        double nearest = std::numeric_limits<double>::max();
+        for (std::size_t i = 0; i < graph_.centers.size(); ++i) {
+            const double distance = graph_.centers[i].point.distance_to(point);
+            if (distance < nearest) {
+                nearest = distance;
+                best = i;
+            }
+        }
+        return graph_.elevation_at(graph_.centers[best], point.x, point.y, detail_, channels_);
+    }
+
+private:
+    const MapGraph& graph_;
+    Noise terrain_;
+    TerrainDetail detail_;
+    RiverChannels channels_;
+};
+
+/**
+ * @brief The headline invariant: no cave anywhere ever breaks the surface.
+ *
+ * Checked on the *smoothed* passages as well as on the grown stations, and that
+ * is the point of the case rather than a thoroughness flourish. Corner-cutting
+ * moves points, so a smoothed midpoint over concave ground can rise above a
+ * surface both its neighbours sat safely beneath -- and the smoothed path is
+ * what the layers draw and export, so it is the geometry the guarantee has to
+ * hold on.
+ *
+ * Run against `--channel`-equivalent settings too, because those cut the drawn
+ * surface below the control mesh: a clamp taken against the mesh passes at the
+ * defaults and fails here.
+ */
+static void test_caves_stay_under_the_terrain() {
+    for (const double channel_depth : {0.0, 18.0, 60.0}) {
+        MapConfig config = cave_config(7);
+        config.river_channel_depth_m = channel_depth;
+        config.river_channel_depth_per_volume_m = channel_depth * 0.22;
+        config.terrain_roughness = channel_depth > 0.0 ? 1.0 : 0.0;
+
+        MapGenerator generator(config, maps_logger());
+        generator.generate();
+        const MapGraph& graph = generator.graph();
+        ASSERT_TRUE(!graph.caves.empty());
+
+        const SurfaceProbe probe(graph, config);
+        // The guarantee is not merely "under the ground" -- it is
+        // `roof_clearance_m` of rock left above every ceiling, and that is what is
+        // asserted. Testing only against the surface itself leaves the whole
+        // clearance as slack, which is enough to hide a missing clamp entirely.
+        const double clearance = meters_to_height(config, config.caves.roof_clearance_m);
+        const double slack = 1e-9;
+
+        std::size_t checked = 0;
+        for (const MapCave& cave : graph.caves) {
+            for (const CaveNode& node : cave.nodes) {
+                ASSERT_TRUE(node.roof + clearance <= probe.at(node.point) + slack);
+                ASSERT_TRUE(node.roof >= node.floor);
+                ++checked;
+            }
+            for (const CavePassage& passage : cave.passages) {
+                ASSERT_EQ(passage.floors.size(), passage.points.size());
+                ASSERT_EQ(passage.roofs.size(), passage.points.size());
+                ASSERT_EQ(passage.radii.size(), passage.points.size());
+                for (std::size_t i = 0; i < passage.points.size(); ++i) {
+                    ASSERT_TRUE(passage.roofs[i] + clearance
+                                <= probe.at(passage.points[i]) + slack);
+                    ASSERT_TRUE(passage.roofs[i] >= passage.floors[i]);
+                    ++checked;
+                }
+            }
+        }
+        ASSERT_TRUE(checked > 100);
+    }
+}
+
+/**
+ * @brief Caves open on sharp slopes, and demonstrably the sharpest ones.
+ *
+ * Two claims, because only the second says the ranking works. That every mouth
+ * clears `min_grade` would also be true of a pass that took the first qualifying
+ * edge it found; that the mouths are far steeper than a typical qualifying edge
+ * is what says they were chosen.
+ */
+static void test_caves_open_on_the_steepest_slopes() {
+    MapConfig config = cave_config(19);
+    MapGenerator generator(config, maps_logger());
+    generator.generate();
+    const MapGraph& graph = generator.graph();
+    ASSERT_TRUE(!graph.caves.empty());
+
+    double candidate_total = 0.0;
+    std::size_t candidates = 0;
+    for (const MapEdge& edge : graph.edges) {
+        if (edge.d0 == k_invalid_id || edge.d1 == k_invalid_id) {
+            continue;
+        }
+        const MapCenter& a = graph.centers[static_cast<std::size_t>(edge.d0)];
+        const MapCenter& b = graph.centers[static_cast<std::size_t>(edge.d1)];
+        if (a.water || a.ocean || a.border || b.water || b.ocean || b.border) {
+            continue;
+        }
+        const double grade = edge_grade(graph, edge, config);
+        if (grade < config.caves.min_grade) {
+            continue;
+        }
+        candidate_total += grade;
+        ++candidates;
+    }
+    ASSERT_TRUE(candidates > graph.caves.size());
+
+    double chosen_total = 0.0;
+    for (const MapCave& cave : graph.caves) {
+        ASSERT_TRUE(cave.mouth_edge != k_invalid_id);
+        const MapEdge& edge = graph.edges[static_cast<std::size_t>(cave.mouth_edge)];
+        // The mouth is the edge midpoint -- between two cells, which is where a
+        // slope is in a Voronoi map.
+        ASSERT_TRUE(std::abs(cave.mouth.x - edge.midpoint.x) < 1e-9);
+        ASSERT_TRUE(std::abs(cave.mouth.y - edge.midpoint.y) < 1e-9);
+        ASSERT_TRUE(cave.mouth_grade >= config.caves.min_grade);
+        chosen_total += cave.mouth_grade;
+    }
+
+    const double chosen_mean = chosen_total / static_cast<double>(graph.caves.size());
+    const double candidate_mean = candidate_total / static_cast<double>(candidates);
+    ASSERT_TRUE(chosen_mean > candidate_mean * 1.5);
+
+    // And they are spread, rather than all opening on one cliff.
+    const double spacing = meters_to_grid(config, config.caves.min_spacing_m);
+    for (std::size_t i = 0; i < graph.caves.size(); ++i) {
+        for (std::size_t j = i + 1; j < graph.caves.size(); ++j) {
+            ASSERT_TRUE(graph.caves[i].mouth.distance_to(graph.caves[j].mouth) >= spacing);
+        }
+    }
+}
+
+/** @brief `cave_count` is a cap that is honoured at both ends. */
+static void test_cave_count_is_respected() {
+    MapConfig none = cave_config(31);
+    none.caves.cave_count = 0;
+    MapGenerator without(none, maps_logger());
+    without.generate();
+    ASSERT_TRUE(without.graph().caves.empty());
+
+    MapConfig few = cave_config(31);
+    few.caves.cave_count = 3;
+    MapGenerator some(few, maps_logger());
+    some.generate();
+    ASSERT_EQ(static_cast<int>(some.graph().caves.size()), 3);
+
+    // More than the terrain can space out: fewer caves, and no crash or hang.
+    MapConfig many = cave_config(31);
+    many.caves.cave_count = 4000;
+    MapGenerator lots(many, maps_logger());
+    lots.generate();
+    ASSERT_TRUE(static_cast<int>(lots.graph().caves.size()) < many.caves.cave_count);
+    ASSERT_TRUE(!lots.graph().caves.empty());
+}
+
+/**
+ * @brief A cave only ever expands downwards, and never past its own floor.
+ *
+ * Non-increasing rather than strictly decreasing, because the half of a system at
+ * a water table is deliberately level -- "expands downwards" is a statement about
+ * what a passage may never do, which is climb. It holds across storeys too: a
+ * descent to the next table only ever falls, so the whole system stays monotone
+ * from the mouth down however many levels it has.
+ */
+static void test_caves_descend_from_their_mouths() {
+    MapConfig config = cave_config(23);
+    MapGenerator generator(config, maps_logger());
+    generator.generate();
+    const MapGraph& graph = generator.graph();
+    ASSERT_TRUE(!graph.caves.empty());
+
+    const double depth_limit = meters_to_height(config, config.caves.max_depth_m);
+    for (const MapCave& cave : graph.caves) {
+        ASSERT_TRUE(!cave.nodes.empty());
+        ASSERT_TRUE(cave.nodes.front().parent == -1);
+        for (const CaveNode& node : cave.nodes) {
+            ASSERT_TRUE(node.floor >= 0.0);
+            ASSERT_TRUE(node.floor <= cave.nodes.front().floor);
+            ASSERT_TRUE(cave.surface_at_mouth - node.floor <= depth_limit + 1e-9);
+            if (node.parent >= 0) {
+                const CaveNode& parent = cave.nodes[static_cast<std::size_t>(node.parent)];
+                ASSERT_TRUE(node.floor <= parent.floor + 1e-9);
+            }
+            // The zone a station records has to agree with where it actually is,
+            // or the two halves of the model are decoration. Measured against the
+            // station's *own* table and not the system's first: a run descending to
+            // the second storey is below the first table and still vadose, because
+            // it is water falling toward the level it has not reached yet.
+            ASSERT_TRUE(node.level >= 0);
+            ASSERT_TRUE(static_cast<std::size_t>(node.level) < cave.levels.size());
+            const double table = cave.levels[static_cast<std::size_t>(node.level)];
+            const bool below = node.floor <= table + 1e-6;
+            ASSERT_TRUE((node.zone == CaveZone::Phreatic) == below);
+        }
+        ASSERT_TRUE(cave.deepest <= cave.nodes.front().floor);
+        ASSERT_TRUE(cave.deepest >= 0.0);
+    }
+}
+
+/**
+ * @brief A cave grows more than one storey.
+ *
+ * The regression guard for the bug the level model exists to fix. Before it, a
+ * system was one near-planar sheet -- an entrance series down to a single water
+ * table and a network spread along it -- so "multi-level cave" was a phrase the
+ * documentation used and the geometry did not support.
+ *
+ * Checked on a population rather than on one lucky cave, because how many storeys
+ * a system gets is derived from the relief beneath its mouth: a map where only the
+ * single highest mouth managed a second table would satisfy a weaker claim and
+ * still be the old behaviour in all but name.
+ */
+static void test_caves_grow_more_than_one_storey() {
+    MapConfig config = cave_config(11);
+    MapGenerator generator(config, maps_logger());
+    generator.generate();
+    const MapGraph& graph = generator.graph();
+    ASSERT_TRUE(!graph.caves.empty());
+
+    std::size_t multi = 0;
+    std::size_t deepest = 0;
+    for (const MapCave& cave : graph.caves) {
+        ASSERT_TRUE(!cave.levels.empty());
+        // `phreatic_level` is the shallowest table, which is where the entrance
+        // series stops falling -- the meaning it had before there were storeys.
+        ASSERT_TRUE(std::abs(cave.phreatic_level - cave.levels.front()) < 1e-12);
+        if (cave.levels.size() > 1) {
+            ++multi;
+        }
+        deepest = std::max(deepest, cave.levels.size());
+    }
+    ASSERT_TRUE(deepest >= 2);
+    ASSERT_TRUE(multi * 4 >= graph.caves.size());
+
+    // Stations are spread across those storeys rather than piled on the first,
+    // which is what says the lower levels were actually dug and not merely
+    // planned. A system that listed four tables and put every station on the top
+    // one would pass every claim above.
+    std::size_t on_lower = 0;
+    std::size_t stations = 0;
+    for (const MapCave& cave : graph.caves) {
+        for (const CaveNode& node : cave.nodes) {
+            ASSERT_TRUE(node.level >= 0);
+            ASSERT_TRUE(static_cast<std::size_t>(node.level) < cave.levels.size());
+            ++stations;
+            if (node.level > 0) {
+                ++on_lower;
+            }
+        }
+    }
+    ASSERT_TRUE(on_lower * 10 >= stations);
+
+    // Every passage agrees with the stations it is made of, so a consumer can
+    // select a storey from either and get the same answer.
+    for (const MapCave& cave : graph.caves) {
+        for (const CavePassage& passage : cave.passages) {
+            ASSERT_TRUE(!passage.nodes.empty());
+            const CaveNode& tail = cave.nodes[static_cast<std::size_t>(passage.nodes.back())];
+            ASSERT_TRUE(passage.level == tail.level);
+        }
+    }
+}
+
+/**
+ * @brief Two storeys of a system never intersect.
+ *
+ * `level_spacing_m` is load bearing and nothing else in the suite would notice if
+ * it were wrong. Set it under `chamber_height_m` and a chamber cut at one table
+ * reaches through the rock into the level below: the system still reports several
+ * storeys and still draws plausibly from above, but there is no floor between them
+ * and it is one malformed cave rather than a multi-level one. The gap is checked
+ * against the tallest space the configuration can cut, which is a chamber.
+ */
+static void test_cave_storeys_are_further_apart_than_a_chamber_is_tall() {
+    MapConfig config = cave_config(11);
+    MapGenerator generator(config, maps_logger());
+    generator.generate();
+    const MapGraph& graph = generator.graph();
+    ASSERT_TRUE(!graph.caves.empty());
+
+    const double chamber = meters_to_height(config, config.caves.chamber_height_m);
+    std::size_t checked = 0;
+    for (const MapCave& cave : graph.caves) {
+        for (std::size_t i = 0; i + 1 < cave.levels.size(); ++i) {
+            // Shallowest first, so each table stands above the next.
+            ASSERT_TRUE(cave.levels[i] > cave.levels[i + 1]);
+            ASSERT_TRUE(cave.levels[i] - cave.levels[i + 1] > chamber);
+            ++checked;
+        }
+    }
+    ASSERT_TRUE(checked > 0);
+}
+
+/**
+ * @brief Only a cave's mouth reaches the surface layers.
+ *
+ * Two claims, and the second is the one that needs a test. A passage is
+ * underground, so no surface layer may show it -- the composite is assembled by
+ * hand rather than from a list of participating layers, so the only thing keeping
+ * passages out of it is that nobody added the call. A mouth is a hole in a
+ * hillside, so the composite *must* show it.
+ *
+ * Those pull in opposite directions, and byte-identity alone can no longer express
+ * the first now that the second exists. So the differing pixels are bounded
+ * instead: every pixel the caves change on the composite has to lie within a mouth
+ * marker's reach of an actual mouth. Draw a passage there by accident and the
+ * pixels land hundreds of metres from any mouth and this fails, which is exactly
+ * the guarantee the old identity check was protecting.
+ */
+static void test_only_cave_mouths_reach_the_surface_layers() {
+    MapConfig with = cave_config(3);
+    set_render_size(with, 192);
+    MapGenerator generator(with, maps_logger());
+    generator.generate();
+    ASSERT_TRUE(!generator.graph().caves.empty());
+
+    MapConfig without = with;
+    without.enable_caves = false;
+    MapGenerator bare(without, maps_logger());
+    bare.generate();
+    ASSERT_TRUE(bare.graph().caves.empty());
+
+    // Untouched entirely: the cave pass writes only `MapGraph::caves`, and none of
+    // these layers draws a marker of any kind.
+    for (const MapLayer layer : {MapLayer::Elevation, MapLayer::Water, MapLayer::Biomes,
+                                 MapLayer::Roads, MapLayer::Structures, MapLayer::Regions}) {
+        const Image lit = MapLayers::render(layer, generator.graph(), with);
+        const Image plain = MapLayers::render(layer, bare.graph(), without);
+        ASSERT_TRUE(lit.pixels == plain.pixels);
+    }
+
+    // The three that must differ. `Caves` differing also says the comparison below
+    // is not passing because nothing was rendered either way.
+    for (const MapLayer layer : {MapLayer::Composite, MapLayer::Landmarks, MapLayer::Caves}) {
+        const Image lit = MapLayers::render(layer, generator.graph(), with);
+        const Image plain = MapLayers::render(layer, bare.graph(), without);
+        ASSERT_TRUE(lit.pixels != plain.pixels);
+    }
+
+    // And every changed pixel of the composite is at a mouth. The marker size
+    // mirrors `MapLayers::k_cave_mouth_marker_m`, which is private -- if the two
+    // drift the ring outgrows this bound and the test says so, which is the right
+    // moment to look at it again.
+    static constexpr double k_mouth_marker_m = 8.0;
+    const Image lit = MapLayers::render(MapLayer::Composite, generator.graph(), with);
+    const Image plain = MapLayers::render(MapLayer::Composite, bare.graph(), without);
+    const double scale =
+        static_cast<double>(with.image_size) / static_cast<double>(with.grid_size);
+    const int marker =
+        std::max(1, static_cast<int>(meters_to_grid(with, k_mouth_marker_m) * scale));
+    // The marker's own radius, plus two pixels: one for the truncation to integer
+    // pixels that `draw_ring_()` does to the centre, and one of slack.
+    const double reach = static_cast<double>(marker) + 2.0;
+
+    std::size_t changed = 0;
+    for (int y = 0; y < with.image_size; ++y) {
+        for (int x = 0; x < with.image_size; ++x) {
+            if (lit.color_at(x, y) == plain.color_at(x, y)) {
+                continue;
+            }
+            ++changed;
+            bool at_a_mouth = false;
+            for (const MapCave& cave : generator.graph().caves) {
+                const double dx = static_cast<double>(x) - cave.mouth.x * scale;
+                const double dy = static_cast<double>(y) - cave.mouth.y * scale;
+                if (dx * dx + dy * dy <= reach * reach) {
+                    at_a_mouth = true;
+                    break;
+                }
+            }
+            ASSERT_TRUE(at_a_mouth);
+        }
+    }
+    ASSERT_TRUE(changed > 0);
+}
+
+/** @brief The cave vocabulary's on-disk names survive a round trip. */
+static void test_cave_zone_and_feature_names_round_trip() {
+    for (std::size_t i = 0; i < k_cave_zone_count; ++i) {
+        const CaveZone zone = static_cast<CaveZone>(i);
+        ASSERT_TRUE(cave_zone_from_name(cave_zone_name(zone)) == zone);
+    }
+    for (std::size_t i = 0; i < k_cave_feature_count; ++i) {
+        const CaveFeature feature = static_cast<CaveFeature>(i);
+        ASSERT_TRUE(cave_feature_from_name(cave_feature_name(feature)) == feature);
+    }
+    ASSERT_TRUE(cave_zone_from_name("nonsense") == CaveZone::Vadose);
+    ASSERT_TRUE(cave_feature_from_name("nonsense") == CaveFeature::Passage);
+    ASSERT_TRUE(is_open_feature(CaveFeature::Chamber));
+    ASSERT_TRUE(!is_open_feature(CaveFeature::Passage));
+}
+
+/** @brief `edge_grade()` is a real grade: rise over run, in metres, both ways. */
+static void test_edge_grade_is_a_real_grade() {
+    MapConfig config = world_config(5);
+    MapGenerator generator(config, maps_logger());
+    generator.generate();
+    const MapGraph& graph = generator.graph();
+
+    bool measured = false;
+    for (const MapEdge& edge : graph.edges) {
+        if (edge.d0 == k_invalid_id || edge.d1 == k_invalid_id) {
+            continue;
+        }
+        const MapCenter& a = graph.centers[static_cast<std::size_t>(edge.d0)];
+        const MapCenter& b = graph.centers[static_cast<std::size_t>(edge.d1)];
+        const double rise = height_to_meters(config, std::abs(a.elevation - b.elevation));
+        const double run = grid_to_meters(config, a.point.distance_to(b.point));
+        if (run <= 0.0) {
+            continue;
+        }
+        ASSERT_TRUE(std::abs(edge_grade(graph, edge, config) - rise / run) < 1e-9);
+        measured = true;
+    }
+    ASSERT_TRUE(measured);
+
+    // Doubling the vertical scale doubles every grade, and doubling the
+    // horizontal scale halves it. That is what makes a threshold written against
+    // this a statement about terrain rather than about units.
+    MapConfig taller = config;
+    taller.elevation_range_m *= 2.0;
+    MapConfig wider = config;
+    wider.meters_per_grid_unit *= 2.0;
+    const MapEdge& sample = graph.edges[graph.edges.size() / 2];
+    if (sample.d0 != k_invalid_id && sample.d1 != k_invalid_id) {
+        const double base = edge_grade(graph, sample, config);
+        ASSERT_TRUE(std::abs(edge_grade(graph, sample, taller) - base * 2.0) < 1e-9);
+        ASSERT_TRUE(std::abs(edge_grade(graph, sample, wider) - base * 0.5) < 1e-9);
     }
 }
 
@@ -2275,10 +3163,19 @@ static void test_layers_separate_their_concerns() {
     ASSERT_TRUE(only_colors(MapLayers::roads(graph, config),
                             {palette.trail_color, palette.road_color, palette.highway_color,
                              palette.bridge_color}));
-    ASSERT_TRUE(only_colors(MapLayers::structures(graph, config), {palette.building_color}));
+    // The structures layer carries a settlement entire, not only its houses: the
+    // square it is built around, the streets its buildings front, and the civic
+    // core picked out from the dwellings. Still one layer's own subject -- none of
+    // these is a road, a river or a marker.
+    ASSERT_TRUE(only_colors(MapLayers::structures(graph, config),
+                            {palette.building_color, palette.civic_color, palette.street_color,
+                             palette.plaza_color}));
+    // Cave mouths are markers too, and belong here for the same reason the others
+    // do: a mouth is on the surface. The passages behind them are not, and would
+    // show up as `cave_shallow_color` or `cave_deep_color` if one ever leaked in.
     ASSERT_TRUE(only_colors(MapLayers::landmarks(graph, config),
                             {palette.town_color, palette.landmark_natural_color,
-                             palette.landmark_built_color}));
+                             palette.landmark_built_color, palette.cave_mouth_color}));
 }
 
 
@@ -2291,6 +3188,621 @@ static void test_layers_separate_their_concerns() {
  * the relief but cannot distinguish a slope at sea level from the same slope on
  * a summit.
  */
+static void test_elevation_surface_modes_round_trip() {
+    ASSERT_TRUE(MapConfig{}.elevation_surface == ElevationSurface::Interpolated);
+    for (std::size_t i = 0; i < k_elevation_surface_count; ++i) {
+        const ElevationSurface mode = static_cast<ElevationSurface>(i);
+        ASSERT_TRUE(elevation_surface_from_name(elevation_surface_name(mode)) == mode);
+    }
+    ASSERT_TRUE(elevation_surface_from_name("blended") == ElevationSurface::Blended);
+    ASSERT_TRUE(elevation_surface_from_name("stepped") == ElevationSurface::Interpolated);
+}
+
+/**
+ * @brief Flat shading draws one height per cell, with a hard edge at every boundary.
+ *
+ * What turning the smoothing off was expected to produce and could not: those knobs
+ * relax the stored heights, while the drawn surface is interpolated between them
+ * regardless. This is the setting that shows the field as it is actually held --
+ * `MapCenter::elevation`, one value per cell.
+ *
+ * Sampled at each cell's own site, which is the one point guaranteed to lie inside
+ * its polygon. Probing further out has to contend with a neighbour's outline
+ * bulging over the sample once the edges are subdivided, which measures the
+ * rasteriser rather than the fill. Rendered larger than `small_config` for the same
+ * reason -- at eight pixels to a cell the site itself rounds into a neighbour.
+ *
+ * Both halves are asserted. That every site matches its own stored height would
+ * pass just as well on a uniform grey image, so the second half requires that
+ * neighbouring cells of different stored height actually come out different *in the
+ * image* -- which is what a hard edge means.
+ *
+ * The expectation includes the river channel, because a flat cell is its own height
+ * *minus* whatever channel crosses it. On this very config one non-border site lands
+ * inside a channel; it survives today only because the cut there is 0.1 m and rounds
+ * to the same grey, which is luck rather than correctness and would not hold for
+ * another seed.
+ */
+static void test_flat_surface_draws_one_height_per_cell() {
+    MapConfig config = small_config(12);
+    set_render_size(config, 512);
+    config.elevation_surface = ElevationSurface::Flat;
+    MapGenerator generator(config, maps_logger());
+    generator.generate();
+    const MapGraph& graph = generator.graph();
+    const Image image = MapLayers::elevation(graph, config);
+    // Mirrors MapLayers::pixels_per_grid_unit_, which is private to the renderer.
+    const double scale = static_cast<double>(config.image_size) / config.grid_size;
+
+    const Noise terrain(config.noise_terrain);
+    const TerrainDetail detail = make_terrain_detail(config, terrain);
+    const RiverChannels channels = make_river_channels(graph, config, detail);
+
+    const auto expected_grey = [](double elevation) {
+        return static_cast<int>(static_cast<float>(std::clamp(elevation, 0.0, 1.0) * 255.0));
+    };
+    // The height the renderer should produce at a cell's site: its own, less any
+    // channel crossing that pixel.
+    const auto expected_at_site = [&](const MapCenter& center) {
+        const double x = static_cast<int>(center.point.x * scale) / scale;
+        const double y = static_cast<int>(center.point.y * scale) / scale;
+        const double cut = graph.channel_cut(center, x, y, channels);
+        return expected_grey(std::clamp(center.elevation - cut, 0.0, 1.0));
+    };
+    const auto grey_at_site = [&](const MapCenter& center) {
+        const int x = static_cast<int>(center.point.x * scale);
+        const int y = static_cast<int>(center.point.y * scale);
+        if (x < 0 || y < 0 || x >= image.width || y >= image.height) {
+            return -1;
+        }
+        return static_cast<int>(image.color_at(x, y).r);
+    };
+
+    std::size_t checked = 0;
+    for (const MapCenter& center : graph.centers) {
+        if (center.corners.size() < 3 || center.border) {
+            continue;
+        }
+        const int found = grey_at_site(center);
+        if (found < 0) {
+            continue;
+        }
+        ASSERT_TRUE(found == expected_at_site(center));
+        ++checked;
+    }
+    ASSERT_TRUE(checked > 0);
+
+    // The edges are hard: where two neighbours differ in stored height, the pixels
+    // differ too. A fill that interpolated would blur them toward each other.
+    std::size_t contrasting = 0;
+    for (const MapCenter& center : graph.centers) {
+        if (center.border) {
+            continue;
+        }
+        for (const CenterId neighbor_id : center.neighbors) {
+            const MapCenter& neighbor = graph.centers[static_cast<std::size_t>(neighbor_id)];
+            if (neighbor.border) {
+                continue;
+            }
+            const int here = expected_at_site(center);
+            const int there = expected_at_site(neighbor);
+            if (std::abs(here - there) < 4) {
+                continue;
+            }
+            const int drawn_here = grey_at_site(center);
+            const int drawn_there = grey_at_site(neighbor);
+            if (drawn_here < 0 || drawn_there < 0) {
+                continue;
+            }
+            ASSERT_TRUE(drawn_here != drawn_there);
+            ++contrasting;
+        }
+    }
+    ASSERT_TRUE(contrasting > 0);
+}
+
+/**
+ * @brief The flat surface shows the rivers too.
+ *
+ * A flat fill was said to have nowhere to put a river channel, since a channel is
+ * far narrower than the cell it crosses. That was wrong: the cut is a function of
+ * position, not of the interpolation, so it subtracts from a constant just as
+ * readily as from a gradient. Measured against a uniform cell the rivers come out
+ * at 11.6 grey levels of contrast, where the interpolated surface manages 12.3.
+ *
+ * Asserted the way the interpolated version is -- the bed against the ground half a
+ * cell to either side, on the same surface at the same moment -- because that is
+ * local contrast, and local contrast is the thing a reader can actually see. A
+ * deeper channel that took its banks down with it would satisfy "lower than before"
+ * and still be invisible.
+ */
+static void test_flat_surface_shows_the_rivers() {
+    MapConfig config = world_config(67);
+    config.elevation_surface = ElevationSurface::Flat;
+    MapGenerator generator(config, maps_logger());
+    generator.generate();
+    const MapGraph& graph = generator.graph();
+    ASSERT_TRUE(!graph.rivers.empty());
+
+    const Noise terrain(config.noise_terrain);
+    const TerrainDetail detail = make_terrain_detail(config, terrain);
+    const RiverChannels channels = make_river_channels(graph, config, detail);
+
+    // The flat surface, as the renderer draws it: the cell's own height less any
+    // channel crossing the point.
+    const auto flat_at = [&](const MapCenter& center, double x, double y) {
+        const double cut = graph.channel_cut(center, x, y, channels);
+        return cut > 0.0 ? std::clamp(center.elevation - cut, 0.0, 1.0) : center.elevation;
+    };
+
+    const double offset = 0.5;
+    double total = 0.0;
+    std::size_t sampled = 0;
+    for (const MapRiver& river : graph.rivers) {
+        for (std::size_t i = 2; i + 2 < river.points.size(); ++i) {
+            const std::size_t spans = river.points.size() - 1;
+            const std::size_t slot =
+                std::min(river.corners.size() - 1, i * river.corners.size() / spans);
+            const MapCorner& corner =
+                graph.corners[static_cast<std::size_t>(river.corners[slot])];
+            if (corner.touches.empty()) {
+                continue;
+            }
+            const MapCenter& center =
+                graph.centers[static_cast<std::size_t>(corner.touches.front())];
+            const double dx = river.points[i + 2].x - river.points[i - 2].x;
+            const double dy = river.points[i + 2].y - river.points[i - 2].y;
+            const double length = std::hypot(dx, dy);
+            if (length < 1e-9) {
+                continue;
+            }
+            const double nx = -dy / length;
+            const double ny = dx / length;
+            const MapPoint& point = river.points[i];
+            const double bed = flat_at(center, point.x, point.y);
+            const double left = flat_at(center, point.x + nx * offset, point.y + ny * offset);
+            const double right = flat_at(center, point.x - nx * offset, point.y - ny * offset);
+            if (bed <= config.sea_level || left <= config.sea_level
+                || right <= config.sea_level) {
+                continue;
+            }
+            total += (left + right) * 0.5 - bed;
+            ++sampled;
+        }
+    }
+    ASSERT_TRUE(sampled > 0);
+    // Ten metres, the same bar the interpolated surface is held to: below about
+    // eight the channel is under four grey levels and stops being pickable out.
+    ASSERT_TRUE(height_to_meters(config, total / static_cast<double>(sampled)) > 10.0);
+}
+
+/**
+ * @brief Blending at zero is flat, exactly.
+ *
+ * The knob is a continuum between two styles that already exist, so its lower end
+ * has to *be* the lower style rather than merely resemble it. It did not, at first:
+ * a zero reach fell through to the interpolated return, so a blend of 0 came out
+ * fully interpolated -- the opposite of what the knob says, and invisible to any
+ * test that only checked the middle of the range.
+ */
+static void test_blended_at_zero_is_flat() {
+    MapConfig flat = small_config(12);
+    set_render_size(flat, 512);
+    flat.elevation_surface = ElevationSurface::Flat;
+
+    MapConfig blended = flat;
+    blended.elevation_surface = ElevationSurface::Blended;
+    blended.elevation_blend = 0.0;
+
+    MapGenerator generator(flat, maps_logger());
+    generator.generate();
+
+    const Image hard = MapLayers::elevation(generator.graph(), flat);
+    const Image none = MapLayers::elevation(generator.graph(), blended);
+    ASSERT_EQ(hard.pixels.size(), none.pixels.size());
+    ASSERT_TRUE(hard.pixels == none.pixels);
+
+    // And the knob does something above zero, or the equality above is vacuous.
+    MapConfig some = blended;
+    some.elevation_blend = 0.6;
+    const Image soft = MapLayers::elevation(generator.graph(), some);
+    ASSERT_TRUE(soft.pixels != hard.pixels);
+}
+
+/**
+ * @brief Blending smooths the whole raster, not the rim of each cell.
+ *
+ * This replaces a test that asserted the mechanism it was written for, and the two
+ * disagree on purpose. `blended` was first built as a per-pixel term evaluated
+ * *inside each cell*: pull the flat height toward the interpolated one near the
+ * cell's own rim. The old test pinned exactly that -- core untouched, rim moved --
+ * and it passed while the mode was visibly broken, because a map where every cell
+ * ramps its own edge is a field of bevelled tiles with a halo tracing each outline.
+ * It drew the tessellation more sharply than the hard edges it was meant to hide.
+ *
+ * So the property is now stated over the image. A blend is a pass over the
+ * rasterised grid, and both halves matter:
+ *
+ * - **Steps fall.** The 99th percentile adjacent-pixel step goes 34 grey levels on
+ *   `flat` to 12, 8 and 6 as the knob climbs -- measured, and barred well clear.
+ * - **Cores move.** 82.9% of cell sites no longer read their stored height. Under
+ *   the mechanism this replaced that figure was 0 by construction, so this is the
+ *   half that would have caught the halo.
+ *
+ * The *worst* step is deliberately not asserted: it stays near 75 at every blend,
+ * and it is the river cut-bank, which is re-cut after the blur and is supposed to
+ * be an edge. Turn the channels off and the same render's worst step is 12.
+ */
+static void test_blended_smooths_the_whole_raster() {
+    MapConfig flat = small_config(12);
+    set_render_size(flat, 512);
+    flat.elevation_surface = ElevationSurface::Flat;
+    MapGenerator generator(flat, maps_logger());
+    generator.generate();
+    const MapGraph& graph = generator.graph();
+
+    // The 99th percentile of the absolute step between horizontally adjacent
+    // pixels. A percentile rather than the maximum, which the river banks own.
+    const auto step_p99 = [](const Image& image) {
+        std::vector<int> steps;
+        steps.reserve(static_cast<std::size_t>(image.width) * image.height);
+        for (int y = 0; y < image.height; ++y) {
+            for (int x = 1; x < image.width; ++x) {
+                steps.push_back(std::abs(static_cast<int>(image.color_at(x, y).r)
+                                         - static_cast<int>(image.color_at(x - 1, y).r)));
+            }
+        }
+        std::sort(steps.begin(), steps.end());
+        return steps[static_cast<std::size_t>(static_cast<double>(steps.size()) * 0.99)];
+    };
+
+    const Image hard = MapLayers::elevation(graph, flat);
+    const int hard_step = step_p99(hard);
+    ASSERT_TRUE(hard_step >= 25);  // 34 measured; the thing being improved on.
+
+    int previous = hard_step;
+    for (const double knob : {0.25, 0.5, 1.0}) {
+        MapConfig config = flat;
+        config.elevation_surface = ElevationSurface::Blended;
+        config.elevation_blend = knob;
+        const Image soft = MapLayers::elevation(graph, config);
+
+        // Monotone in the knob, which is what makes it a knob and not a switch.
+        const int step = step_p99(soft);
+        ASSERT_TRUE(step <= previous);
+        previous = step;
+
+        // And a quarter turn already more than halves the step. 12 measured
+        // against 34, so the bar is nowhere near tight.
+        ASSERT_TRUE(step * 2 < hard_step);
+    }
+
+    MapConfig half = flat;
+    half.elevation_surface = ElevationSurface::Blended;
+    half.elevation_blend = 0.5;
+    const Image soft = MapLayers::elevation(graph, half);
+    const double scale = static_cast<double>(half.image_size) / half.grid_size;
+
+    std::size_t cores = 0;
+    std::size_t moved = 0;
+    for (const MapCenter& center : graph.centers) {
+        if (center.corners.size() < 3 || center.border) {
+            continue;
+        }
+        const int px = static_cast<int>(center.point.x * scale);
+        const int py = static_cast<int>(center.point.y * scale);
+        if (px < 0 || py < 0 || px >= soft.width || py >= soft.height) {
+            continue;
+        }
+        ++cores;
+        const int stored =
+            static_cast<int>(static_cast<float>(std::clamp(center.elevation, 0.0, 1.0) * 255.0));
+        if (static_cast<int>(soft.color_at(px, py).r) != stored) {
+            ++moved;
+        }
+    }
+    ASSERT_TRUE(cores > 0);
+    // 82.9% measured. The broken mechanism scored 0% here by construction.
+    ASSERT_TRUE(moved * 2 > cores);
+}
+
+/**
+ * @brief Blend variation is picked per *cell*, so neighbours can differ.
+ *
+ * This replaces a test that measured high-frequency detail averaged over 32 px
+ * tiles, and the two disagree about the scale on purpose. That metric was written
+ * for a field varying over some twenty cells; it passed while the feature was
+ * visibly broken, because a 32 px tile spans about three cells and per-cell
+ * variation partly averages out inside one. Measuring at the wrong scale is how
+ * "the elevation is blurred pretty much consistently across cells" got shipped.
+ *
+ * So the measurement is now per cell, and normalised against the *same* cell in an
+ * unvaried render. A cell's edge sharpness depends mostly on how much its height
+ * differs from its neighbours', which has nothing to do with this knob -- taking
+ * the ratio against `variation = 0` divides that out and leaves only what the knob
+ * did. Above 1 means the cell came out sharper than a uniform blur left it, below
+ * 1 smoother.
+ *
+ * Both halves are asserted, and the second is the one that matters:
+ *
+ * - **The spread rises with the knob.** Zero has every ratio at exactly 1.
+ * - **Adjacent cells land on opposite sides of 1.** A cell noticeably sharper than
+ *   uniform, sharing an edge with one noticeably smoother. No low-frequency field
+ *   can do that at any amplitude, which is precisely the defect this catches.
+ */
+static void test_blend_variation_is_per_cell() {
+    MapConfig base = world_config(12);
+    set_render_size(base, 512);
+    base.elevation_surface = ElevationSurface::Blended;
+    base.elevation_blend = 0.5;
+    base.noise_blend.seed = base.seed + 2;
+    MapGenerator generator(base, maps_logger());
+    generator.generate();
+    const MapGraph& graph = generator.graph();
+
+    const CellGeometry geometry = MapLayers::build_cell_geometry(graph, base);
+
+    // How hard a cell's own boundary is: the step across it, sampled just inside
+    // and just outside along the outward direction from the site. A facet gives
+    // the full height difference over a few pixels; a smoothed edge spreads it.
+    const auto edge_step = [&](const Image& image, const MapCenter& center) {
+        const std::vector<MapPoint>& outline =
+            geometry.outlines[static_cast<std::size_t>(center.index)];
+        const double scale = static_cast<double>(base.image_size) / base.grid_size;
+        const double site_x = center.point.x * scale;
+        const double site_y = center.point.y * scale;
+        const auto grey = [&](double x, double y) {
+            const int px = static_cast<int>(x);
+            const int py = static_cast<int>(y);
+            if (px < 0 || py < 0 || px >= image.width || py >= image.height) {
+                return -1;
+            }
+            return static_cast<int>(image.color_at(px, py).r);
+        };
+        double total = 0.0;
+        std::size_t sampled = 0;
+        for (const MapPoint& point : outline) {
+            const double dx = point.x - site_x;
+            const double dy = point.y - site_y;
+            const double length = std::hypot(dx, dy);
+            if (length < 1e-6) {
+                continue;
+            }
+            const double reach = 2.0;
+            const double nx = dx / length * reach;
+            const double ny = dy / length * reach;
+            const int inside = grey(point.x - nx, point.y - ny);
+            const int outside = grey(point.x + nx, point.y + ny);
+            if (inside < 0 || outside < 0) {
+                continue;
+            }
+            total += std::abs(inside - outside);
+            ++sampled;
+        }
+        return sampled > 0 ? total / static_cast<double>(sampled) : -1.0;
+    };
+
+    MapConfig uniform = base;
+    uniform.elevation_blend_variation = 0.0;
+    const Image plain = MapLayers::elevation(graph, uniform);
+
+    // Zero means the field is never consulted, and the way to say that without
+    // writing a vacuous assertion is to move the field and require the image not
+    // to. Comparing an explicit 0 against the *default* 0 -- which is what this
+    // first checked -- compares a value with itself and passes whatever the code
+    // does.
+    MapConfig elsewhere = uniform;
+    elsewhere.noise_blend.seed += 9999;
+    elsewhere.noise_blend.frequency *= 2.0;
+    ASSERT_TRUE(MapLayers::elevation(graph, elsewhere).pixels == plain.pixels);
+
+    // And above zero it must be consulted, or the line above is satisfied by a
+    // knob wired to nothing at all.
+    MapConfig moved = elsewhere;
+    moved.elevation_blend_variation = 0.5;
+    MapConfig stayed = uniform;
+    stayed.elevation_blend_variation = 0.5;
+    ASSERT_TRUE(MapLayers::elevation(graph, moved).pixels
+                != MapLayers::elevation(graph, stayed).pixels);
+
+    std::vector<double> plain_steps(graph.centers.size(), -1.0);
+    for (const MapCenter& center : graph.centers) {
+        plain_steps[static_cast<std::size_t>(center.index)] = edge_step(plain, center);
+    }
+
+    double previous_spread = 0.0;
+    for (const double variation : {0.5, 1.0}) {
+        MapConfig varied = base;
+        varied.elevation_blend_variation = variation;
+        const Image image = MapLayers::elevation(graph, varied);
+        ASSERT_TRUE(image.pixels != plain.pixels);
+
+        std::vector<double> ratios(graph.centers.size(), -1.0);
+        std::vector<double> present;
+        for (const MapCenter& center : graph.centers) {
+            const std::size_t index = static_cast<std::size_t>(center.index);
+            // A cell whose edges barely step at all in the reference has no signal
+            // to take a ratio of; dividing by it measures rounding, not the knob.
+            if (center.border || plain_steps[index] < 2.0) {
+                continue;
+            }
+            const double step = edge_step(image, center);
+            if (step < 0.0) {
+                continue;
+            }
+            ratios[index] = step / plain_steps[index];
+            present.push_back(ratios[index]);
+        }
+        ASSERT_TRUE(present.size() > 100);
+
+        double mean = 0.0;
+        for (const double value : present) {
+            mean += value;
+        }
+        mean /= static_cast<double>(present.size());
+        double total = 0.0;
+        for (const double value : present) {
+            total += (value - mean) * (value - mean);
+        }
+        const double spread = std::sqrt(total / static_cast<double>(present.size()));
+        ASSERT_TRUE(spread > previous_spread);
+        previous_spread = spread;
+
+        // The per-cell property: somewhere on this map a cell drawn sharper than a
+        // uniform blur shares an edge with one drawn smoother.
+        std::size_t opposed = 0;
+        for (const MapCenter& center : graph.centers) {
+            const double mine = ratios[static_cast<std::size_t>(center.index)];
+            if (mine < 0.0) {
+                continue;
+            }
+            for (const CenterId neighbor_id : center.neighbors) {
+                const double theirs = ratios[static_cast<std::size_t>(neighbor_id)];
+                if (theirs < 0.0) {
+                    continue;
+                }
+                if (mine > 1.1 && theirs < 0.9) {
+                    ++opposed;
+                }
+            }
+        }
+        ASSERT_TRUE(opposed > 0);
+    }
+}
+
+/**
+ * @brief Varying the radius still leaves one image, whoever drew it.
+ *
+ * The pyramid is built inside the whole-image pass, so it is subject to the same
+ * rule as the blur it generalises: run per band it would sample a field built from
+ * that band's rows. Cheap to state, and the one way a spatially varying filter
+ * quietly becomes band-dependent.
+ */
+static void test_blend_variation_is_not_band_dependent() {
+    MapConfig config = world_config(21);
+    set_render_size(config, 96);
+    config.elevation_surface = ElevationSurface::Blended;
+    config.elevation_blend = 0.5;
+    config.elevation_blend_variation = 0.8;
+    MapGenerator generator(config, maps_logger());
+    generator.generate();
+    const MapGraph& graph = generator.graph();
+
+    const CellGeometry geometry = MapLayers::build_cell_geometry(graph, config);
+    const RenderSlice whole{RowBand{}, &geometry};
+    const Image reference = MapLayers::render(MapLayer::Elevation, graph, config,
+                                              BiomePalette{}, whole);
+    for (const int bands : {2, 5, 96}) {
+        Image banded = MapLayers::allocate(MapLayer::Elevation, config, BiomePalette{});
+        for (int b = 0; b < bands; ++b) {
+            const int from = config.image_size * b / bands;
+            const int to = config.image_size * (b + 1) / bands;
+            MapLayers::render_into(banded, MapLayer::Elevation, graph, config, BiomePalette{},
+                                   RenderSlice{RowBand{from, to}, &geometry});
+        }
+        MapLayers::finish(banded, MapLayer::Elevation, graph, config, BiomePalette{}, whole);
+        ASSERT_TRUE(reference.pixels == banded.pixels);
+    }
+}
+
+/**
+ * @brief The blur does not wash the rivers out, because they are cut in after it.
+ *
+ * The reason the three stages run in the order they do. A river is a few pixels
+ * across and a half-cell blur is exactly the radius that erases a feature that
+ * size: blurring a raster that already carried the channels drops their contrast
+ * from 15.0 grey levels to 8.0. Drawing the cells *uncut* and subtracting the
+ * channel from the blurred result instead gives back all of it.
+ *
+ * Measured here at 6.42 grey on `flat` against 6.63 blended -- slightly better,
+ * because the blur lifts the banks a shade while the cut holds the bed. The bar is
+ * that blending must not cost the rivers anything against `flat`.
+ */
+static void test_blended_keeps_the_rivers_crisp() {
+    MapConfig flat = small_config(12);
+    set_render_size(flat, 512);
+    flat.elevation_surface = ElevationSurface::Flat;
+    MapGenerator generator(flat, maps_logger());
+    generator.generate();
+    const MapGraph& graph = generator.graph();
+    ASSERT_TRUE(!graph.rivers.empty());
+
+    MapConfig blended = flat;
+    blended.elevation_surface = ElevationSurface::Blended;
+    blended.elevation_blend = 0.5;
+
+    const double scale = static_cast<double>(flat.image_size) / flat.grid_size;
+    const double offset = meters_to_grid(flat, flat.river_width_base_m * 2.0);
+
+    // Mean drop from the banks to the bed, in grey levels, sampled across every
+    // river of the map.
+    const auto contrast = [&](const Image& image) {
+        const auto grey = [&](double x, double y) {
+            const int px = static_cast<int>(x * scale);
+            const int py = static_cast<int>(y * scale);
+            if (px < 0 || py < 0 || px >= image.width || py >= image.height) {
+                return -1;
+            }
+            return static_cast<int>(image.color_at(px, py).r);
+        };
+        double total = 0.0;
+        std::size_t sampled = 0;
+        for (const MapRiver& river : graph.rivers) {
+            for (std::size_t i = 2; i + 2 < river.points.size(); ++i) {
+                const double dx = river.points[i + 2].x - river.points[i - 2].x;
+                const double dy = river.points[i + 2].y - river.points[i - 2].y;
+                const double length = std::hypot(dx, dy);
+                if (length < 1e-9) {
+                    continue;
+                }
+                const double nx = -dy / length;
+                const double ny = dx / length;
+                const MapPoint& point = river.points[i];
+                const int bed = grey(point.x, point.y);
+                const int left = grey(point.x + nx * offset, point.y + ny * offset);
+                const int right = grey(point.x - nx * offset, point.y - ny * offset);
+                if (bed < 0 || left < 0 || right < 0) {
+                    continue;
+                }
+                total += (left + right) * 0.5 - bed;
+                ++sampled;
+            }
+        }
+        ASSERT_TRUE(sampled > 0);
+        return total / static_cast<double>(sampled);
+    };
+
+    const double hard = contrast(MapLayers::elevation(graph, flat));
+    const double soft = contrast(MapLayers::elevation(graph, blended));
+    ASSERT_TRUE(hard > 4.0);        // 6.42 measured; the reference is not vacuous.
+    ASSERT_TRUE(soft >= hard - 0.5);  // 6.63 measured, i.e. no loss at all.
+}
+
+/**
+ * @brief The interpolated surface is the default, and is what it always was.
+ *
+ * The surface style is an addition, not a change: a map generated without asking
+ * for one has to come out exactly as it did before the setting existed.
+ */
+static void test_interpolated_surface_is_the_default() {
+    MapConfig config = small_config(12);
+    MapGenerator generator(config, maps_logger());
+    generator.generate();
+
+    MapConfig spelled_out = config;
+    spelled_out.elevation_surface = ElevationSurface::Interpolated;
+
+    const Image implied = MapLayers::elevation(generator.graph(), config);
+    const Image explicit_mode = MapLayers::elevation(generator.graph(), spelled_out);
+    ASSERT_TRUE(implied.pixels == explicit_mode.pixels);
+
+    MapConfig flat = config;
+    flat.elevation_surface = ElevationSurface::Flat;
+    const Image stepped = MapLayers::elevation(generator.graph(), flat);
+    ASSERT_EQ(stepped.pixels.size(), implied.pixels.size());
+    ASSERT_TRUE(stepped.pixels != implied.pixels);
+}
+
 static void test_composite_shading_modes() {
     ASSERT_TRUE(MapConfig{}.composite_shading == CompositeShading::Elevation);
     for (std::size_t i = 0; i < k_composite_shading_count; ++i) {
@@ -2516,10 +4028,21 @@ static void test_parallel_export_matches_serial() {
  * The test that would catch an off-by-one at a band seam, which is the bug this
  * design most invites. Run down to one-row bands, where every seam there could
  * be is exercised at once.
+ *
+ * Swept over `ElevationSurface::Blended` as well, because that mode is the one
+ * with a whole-image pass behind it: the blur reads well outside whatever band is
+ * being drawn, so it lives in `MapLayers::finish()` rather than in `render_into()`,
+ * and the banded arm here calls it exactly where a real caller has to -- once,
+ * after the last band. Run per band instead it would blur each band from its own
+ * rows; run twice it would blur twice; and either way this comparison fails.
  */
 static void test_band_rendering_matches_whole_image() {
     MapConfig config = small_config(21);
     set_render_size(config, 96);
+    for (const ElevationSurface surface : {ElevationSurface::Interpolated,
+                                           ElevationSurface::Blended}) {
+    config.elevation_surface = surface;
+    config.elevation_blend = 0.5;
     for (const CompositeShading shading : {CompositeShading::Elevation,
                                            CompositeShading::Hillshade}) {
         config.composite_shading = shading;
@@ -2532,6 +4055,9 @@ static void test_band_rendering_matches_whole_image() {
         const HeightField* height_ptr = nullptr;
         if (shading == CompositeShading::Hillshade) {
             height = MapLayers::build_height_field(graph, config, BiomePalette{}, &geometry);
+            height_ptr = &height;
+        } else if (surface == ElevationSurface::Blended) {
+            height = MapLayers::build_height_field(graph, config, BiomePalette{}, &geometry, 0.0);
             height_ptr = &height;
         }
 
@@ -2547,10 +4073,13 @@ static void test_band_rendering_matches_whole_image() {
                     MapLayers::render_into(banded, layer, graph, config, BiomePalette{},
                                            RenderSlice{RowBand{from, to}, &geometry, height_ptr});
                 }
+                MapLayers::finish(banded, layer, graph, config, BiomePalette{},
+                                  RenderSlice{RowBand{}, &geometry, height_ptr});
                 ASSERT_EQ(whole.pixels.size(), banded.pixels.size());
                 ASSERT_TRUE(whole.pixels == banded.pixels);
             }
         }
+    }
     }
 }
 
@@ -3681,15 +5210,13 @@ static void test_valleys_are_visible_in_the_height_field() {
  * The invariant a consumer meshing the two layers together depends on, and it was
  * broken for a long time without this test noticing -- because the test used to
  * compute the surface *itself*, from `corner.elevation`, and then assert it was
- * above `corner.elevation`. Trivially true, and about the wrong surface: the
- * elevation layer draws `elevation_at()`, the blend of cell heights, which sits
- * some 22 m higher at a river corner. Nearly half of every watercourse was drawn
- * beneath the ground while this passed.
+ * above `corner.elevation`. Trivially true, and about the wrong surface.
  *
- * So it asks `river_surface_at()` -- the one definition, the same call the renderer
- * makes -- and compares it against the ground the elevation layer actually draws,
- * cut channel and all, sampled across the whole width of the stroke rather than on
- * the centreline. Anything else measures a surface nobody draws.
+ * It now reads `RiverSurfaces`, the same table the renderer strokes from, and
+ * compares against the ground the elevation layer actually draws, cut channel and
+ * all, sampled across the whole width of the stroke. This is the invariant most at
+ * risk from settling the profile downward to meet the sea, which is why it is
+ * checked over the footprint rather than along the centreline.
  */
 static void test_river_surface_sits_above_the_ground() {
     MapConfig config = world_config(67);
@@ -3701,9 +5228,11 @@ static void test_river_surface_sits_above_the_ground() {
     const Noise terrain(config.noise_terrain);
     const TerrainDetail detail = make_terrain_detail(config, terrain);
     const RiverChannels channels = make_river_channels(graph, config);
+    const RiverSurfaces surfaces = make_river_surfaces(graph, config, detail, channels);
 
     std::size_t checked = 0;
-    for (const MapRiver& river : graph.rivers) {
+    for (std::size_t r = 0; r < graph.rivers.size(); ++r) {
+        const MapRiver& river = graph.rivers[r];
         const std::size_t spans = river.points.size() - 1;
         for (std::size_t i = 0; i < spans; ++i) {
             const std::size_t slot =
@@ -3715,7 +5244,7 @@ static void test_river_surface_sits_above_the_ground() {
             }
             const MapCenter& center =
                 graph.centers[static_cast<std::size_t>(corner.touches.front())];
-            const double surface = river_surface_at(graph, river, i, config, detail);
+            const double surface = surfaces.at(r, i);
 
             const MapPoint& from = river.points[i];
             const MapPoint& to = river.points[i + 1];
@@ -3732,12 +5261,11 @@ static void test_river_surface_sits_above_the_ground() {
                 for (double across = -1.0; across <= 1.0; across += 1.0) {
                     const double x = from.x + dx * along + nx * across;
                     const double y = from.y + dy * along + ny * across;
-                    const double ground =
-                        graph.elevation_at(center, x, y, detail, channels);
-                    // A tenth of a metre of slack: the surface is piecewise linear,
-                    // so a triangle vertex inside the stroke can poke a hair above
-                    // every point the probe grid samples. Far below the 2.35 m a
-                    // single grey level covers, so it can never reach a pixel.
+                    const double ground = graph.elevation_at(center, x, y, detail, channels);
+                    // Half a metre of slack: the surface is piecewise linear, so a
+                    // triangle vertex inside the stroke can poke a hair above every
+                    // point the probe grid samples. Far below the 2.35 m a single
+                    // grey level covers, so it can never reach a pixel.
                     ASSERT_TRUE(ground <= surface + meters_to_height(config, 0.5));
                     ++checked;
                 }
@@ -3757,6 +5285,175 @@ static void test_river_surface_sits_above_the_ground() {
             ASSERT_TRUE(corner.elevation <= previous.elevation);
         }
     }
+}
+
+/**
+ * @brief A river's surface falls, except where it backs up into what it feeds.
+ *
+ * Water does not flow uphill, and the surface computed per segment in isolation
+ * did: the highest ground under the stroke set the height, so a bank beside the
+ * course lifted the sheet over it. **48 of 55 rivers rose somewhere downstream**,
+ * by up to 21.6 m, and nothing caught it.
+ *
+ * The one place a rise is allowed is the last stretch into a body standing above
+ * the river -- a lake's level is the highest bed in its body and can be a hundred
+ * metres over its own shore -- because the alternative is ending below the water it
+ * feeds, which is a visible notch at the join. That is a drowned inlet, and it is
+ * bounded twice over: it may only happen within `river_mouth_blend_m` of the mouth,
+ * and it may never carry the surface above the body's own level. Both bounds are
+ * asserted, not assumed.
+ */
+static void test_river_surface_only_falls() {
+    for (int seed : {67, 31, 101}) {
+        MapConfig config = world_config(seed);
+        MapGenerator generator(config, maps_logger());
+        generator.generate();
+        const MapGraph& graph = generator.graph();
+        ASSERT_TRUE(!graph.rivers.empty());
+
+        const Noise terrain(config.noise_terrain);
+        const TerrainDetail detail = make_terrain_detail(config, terrain);
+        const RiverChannels channels = make_river_channels(graph, config, detail);
+        const RiverSurfaces surfaces = make_river_surfaces(graph, config, detail, channels);
+        const double blend = meters_to_grid(config, config.river_mouth_blend_m);
+
+        std::size_t checked = 0;
+        for (std::size_t r = 0; r < graph.rivers.size(); ++r) {
+            const MapRiver& river = graph.rivers[r];
+            const std::size_t spans = surfaces.heights[r].size();
+            if (spans < 2) {
+                continue;
+            }
+            const MapCorner& mouth =
+                graph.corners[static_cast<std::size_t>(river.corners.back())];
+            double target = -1.0;
+            for (const CenterId center_id : mouth.touches) {
+                const MapCenter& center = graph.centers[static_cast<std::size_t>(center_id)];
+                if (center.water) {
+                    target = center.water_level;
+                }
+            }
+
+            std::vector<double> to_mouth(spans, 0.0);
+            double run = 0.0;
+            for (std::size_t i = spans; i-- > 0;) {
+                to_mouth[i] = run;
+                run += river.points[i].distance_to(river.points[i + 1]);
+            }
+
+            for (std::size_t i = 1; i < spans; ++i) {
+                ++checked;
+                if (surfaces.at(r, i) <= surfaces.at(r, i - 1) + 1e-12) {
+                    continue;
+                }
+                // A rise, so both bounds must hold.
+                ASSERT_TRUE(to_mouth[i] <= blend + 1e-9);
+                ASSERT_TRUE(target >= 0.0);
+                ASSERT_TRUE(surfaces.at(r, i) <= std::max(surfaces.at(r, i - 1), target) + 1e-9);
+            }
+        }
+        ASSERT_TRUE(checked > 0);
+    }
+}
+
+/**
+ * @brief A river ends at or above the water it feeds -- never below it.
+ *
+ * The join, stated as the invariant a reader actually notices: where a river met a
+ * larger body its ribbon was drawn *darker* than the body, because it ended lower.
+ * At the ocean that came from the channel carve, which took the deeper of its
+ * ordinary depth and the depth needed to reach the waterline -- so a mouth needing
+ * 2 m of cut got 22 m and finished a clear 20 m under the sea. The median ocean
+ * mouth sat 13.3 m below sea level.
+ *
+ * Bounded from above as well, or "ends high enough" would be satisfied by ending
+ * anywhere at all. A river arrives at the body's level, or rests on its own bed
+ * where the ground never gets down to that level, and never more than its freeboard
+ * above whichever of the two is higher.
+ */
+static void test_rivers_end_at_or_above_the_water_they_feed() {
+    for (int seed : {67, 31, 101}) {
+        MapConfig config = world_config(seed);
+        MapGenerator generator(config, maps_logger());
+        generator.generate();
+        const MapGraph& graph = generator.graph();
+
+        const Noise terrain(config.noise_terrain);
+        const TerrainDetail detail = make_terrain_detail(config, terrain);
+        const RiverChannels channels = make_river_channels(graph, config, detail);
+        const RiverSurfaces surfaces = make_river_surfaces(graph, config, detail, channels);
+        const double slack = meters_to_height(config, 1.0);
+
+        std::size_t checked = 0;
+        for (std::size_t r = 0; r < graph.rivers.size(); ++r) {
+            const MapRiver& river = graph.rivers[r];
+            if (surfaces.heights[r].empty()) {
+                continue;
+            }
+            const MapCorner& mouth =
+                graph.corners[static_cast<std::size_t>(river.corners.back())];
+            double target = -1.0;
+            for (const CenterId center_id : mouth.touches) {
+                const MapCenter& center = graph.centers[static_cast<std::size_t>(center_id)];
+                if (center.water) {
+                    target = center.water_level;
+                }
+            }
+            if (target < 0.0) {
+                continue;
+            }
+
+            const std::size_t last = surfaces.heights[r].size() - 1;
+            const double surface = surfaces.at(r, last);
+            ASSERT_TRUE(surface >= target - 1e-9);
+
+            const double bed =
+                detail::river_ground_under(graph, river, last, config, detail, &channels);
+            const double freeboard = detail::river_freeboard(graph, river, last, config);
+            ASSERT_TRUE(surface <= std::max(target, bed) + freeboard + slack);
+            ++checked;
+        }
+        ASSERT_TRUE(checked > 0);
+    }
+}
+
+/** @brief Two rivers meeting at a corner are drawn at the same height. */
+static void test_rivers_agree_where_they_meet() {
+    MapConfig config = world_config(67);
+    MapGenerator generator(config, maps_logger());
+    generator.generate();
+    const MapGraph& graph = generator.graph();
+
+    const Noise terrain(config.noise_terrain);
+    const TerrainDetail detail = make_terrain_detail(config, terrain);
+    const RiverChannels channels = make_river_channels(graph, config);
+    const RiverSurfaces surfaces = make_river_surfaces(graph, config, detail, channels);
+
+    std::map<CornerId, std::vector<double>> claimed;
+    for (std::size_t r = 0; r < graph.rivers.size(); ++r) {
+        const MapRiver& river = graph.rivers[r];
+        const std::size_t spans = surfaces.heights[r].size();
+        if (spans == 0) {
+            continue;
+        }
+        for (std::size_t k = 0; k < river.corners.size(); ++k) {
+            const std::size_t segment = std::min(
+                spans - 1, k * spans / std::max<std::size_t>(1, river.corners.size() - 1));
+            claimed[river.corners[k]].push_back(surfaces.at(r, segment));
+        }
+    }
+
+    std::size_t confluences = 0;
+    for (const auto& entry : claimed) {
+        if (entry.second.size() < 2) {
+            continue;
+        }
+        ++confluences;
+        const auto range = std::minmax_element(entry.second.begin(), entry.second.end());
+        // Under a metre, against 30.8 m when each river decided its own height.
+        ASSERT_TRUE(height_to_meters(config, *range.second - *range.first) < 1.0);
+    }
+    ASSERT_TRUE(confluences > 0);
 }
 
 /**
@@ -3893,6 +5590,9 @@ int main() {
     RUN_TEST(maps_test::test_biome_name_round_trips);
     RUN_TEST(maps_test::test_classify_biome_table);
     RUN_TEST(maps_test::test_temperature_follows_latitude);
+    RUN_TEST(maps_test::test_polar_extent_controls_the_ice);
+    RUN_TEST(maps_test::test_polar_extents_are_independent);
+    RUN_TEST(maps_test::test_temperature_offset_shifts_the_world);
     RUN_TEST(maps_test::test_biome_diversity);
     RUN_TEST(maps_test::test_generate_is_deterministic);
     RUN_TEST(maps_test::test_different_seeds_differ);
@@ -3908,6 +5608,11 @@ int main() {
     RUN_TEST(maps_test::test_buildings_do_not_overlap);
     RUN_TEST(maps_test::test_building_layout_is_not_a_lattice);
     RUN_TEST(maps_test::test_buildings_front_their_streets);
+    RUN_TEST(maps_test::test_towns_emit_their_streets);
+    RUN_TEST(maps_test::test_nothing_is_built_on_a_roadway);
+    RUN_TEST(maps_test::test_nothing_is_built_in_the_square);
+    RUN_TEST(maps_test::test_settlements_have_a_civic_core);
+    RUN_TEST(maps_test::test_building_role_names_round_trip);
     RUN_TEST(maps_test::test_buildings_avoid_rivers);
     RUN_TEST(maps_test::test_elevation_is_smoothed);
     RUN_TEST(maps_test::test_building_sizes_span_the_range);
@@ -3942,6 +5647,15 @@ int main() {
     RUN_TEST(maps_test::test_rivers_are_long_and_smooth);
     RUN_TEST(maps_test::test_settlements_claim_cells_by_tier);
     RUN_TEST(maps_test::test_layers_separate_their_concerns);
+    RUN_TEST(maps_test::test_elevation_surface_modes_round_trip);
+    RUN_TEST(maps_test::test_flat_surface_draws_one_height_per_cell);
+    RUN_TEST(maps_test::test_flat_surface_shows_the_rivers);
+    RUN_TEST(maps_test::test_blended_at_zero_is_flat);
+    RUN_TEST(maps_test::test_blended_smooths_the_whole_raster);
+    RUN_TEST(maps_test::test_blended_keeps_the_rivers_crisp);
+    RUN_TEST(maps_test::test_blend_variation_is_per_cell);
+    RUN_TEST(maps_test::test_blend_variation_is_not_band_dependent);
+    RUN_TEST(maps_test::test_interpolated_surface_is_the_default);
     RUN_TEST(maps_test::test_composite_shading_modes);
     RUN_TEST(maps_test::test_async_generation_matches_serial);
     RUN_TEST(maps_test::test_task_progress_is_monotonic);
@@ -3974,8 +5688,20 @@ int main() {
     RUN_TEST(maps_test::test_incision_never_breaches_sea_level);
     RUN_TEST(maps_test::test_valleys_are_visible_in_the_height_field);
     RUN_TEST(maps_test::test_river_surface_sits_above_the_ground);
+    RUN_TEST(maps_test::test_river_surface_only_falls);
+    RUN_TEST(maps_test::test_rivers_end_at_or_above_the_water_they_feed);
+    RUN_TEST(maps_test::test_rivers_agree_where_they_meet);
     RUN_TEST(maps_test::test_water_bodies_cover_their_interiors);
     RUN_TEST(maps_test::test_water_bodies_win_inside_and_overhang_their_edge);
+    RUN_TEST(maps_test::test_edge_grade_is_a_real_grade);
+    RUN_TEST(maps_test::test_cave_zone_and_feature_names_round_trip);
+    RUN_TEST(maps_test::test_caves_open_on_the_steepest_slopes);
+    RUN_TEST(maps_test::test_caves_descend_from_their_mouths);
+    RUN_TEST(maps_test::test_caves_stay_under_the_terrain);
+    RUN_TEST(maps_test::test_cave_count_is_respected);
+    RUN_TEST(maps_test::test_caves_grow_more_than_one_storey);
+    RUN_TEST(maps_test::test_cave_storeys_are_further_apart_than_a_chamber_is_tall);
+    RUN_TEST(maps_test::test_only_cave_mouths_reach_the_surface_layers);
 
     std::cout << "===========================================" << std::endl;
     std::cout << "Test Summary: " << g_tests_run - g_tests_failed << " / " << g_tests_run << " Passed." << std::endl;

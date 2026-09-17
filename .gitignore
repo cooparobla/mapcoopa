@@ -14,6 +14,9 @@ CMakeUserPresets.json
 .docs
 build
 
+# Generated screenshots / captured frames (mapcoopa_viewer's SCREENSHOT_NAME)
+output/
+
 # CLion
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
 #  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore

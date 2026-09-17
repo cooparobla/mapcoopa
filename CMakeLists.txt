@@ -65,7 +65,13 @@ target_link_libraries(mapcoopa_lib INTERFACE coopa::lib)
 # a second `mapcoopa`/`mapcoopa_tests` binary or ctest entry mixed into its own
 # build. Standalone builds (CMAKE_SOURCE_DIR == CMAKE_CURRENT_SOURCE_DIR, i.e.
 # cbuild/cplay/ctest run from this repo directly) are completely unaffected.
-# Same guard sfxcoopa/CMakeLists.txt and uicoopa/CMakeLists.txt already use. ---
+# Same guard sfxcoopa/CMakeLists.txt and uicoopa/CMakeLists.txt already use.
+#
+# NOTE on the coopa::maps claim above ("nothing here touches Vulkan, GLFW or any
+# sibling repo other than libcoopa"): that is still true of the LIBRARY, which is
+# what a consumer gets. It is no longer true of this repo built as an application
+# -- mapcoopa_viewer below is a uicoopa/gfxcoopa GUI and therefore a Vulkan binary.
+# Everything about it lives inside this guard precisely so the distinction holds. ---
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     # The map generator owns the bare project name so `cplay` *is* the generate
     # command: `cbuild && cplay --seed=42 --out=world`. cplay forwards its
@@ -80,4 +86,37 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 
     enable_testing()
     add_test(NAME mapcoopa_tests COMMAND mapcoopa_tests)
+
+    # --- Optional GUI map viewer (uicoopa) ---
+    # Degrades to "not built" rather than a configure failure when ../uicoopa simply
+    # isn't checked out, mirroring how uicoopa's own UICOOPA_WITH_AUDIO handles a
+    # missing sfxcoopa. Nothing here touches the mapcoopa_lib INTERFACE target.
+    set(UICOOPA_DIR "${ROOT_DIR_PARENT}/uicoopa")
+    option(MAPCOOPA_WITH_VIEWER "Build the uicoopa-based GUI map viewer" ON)
+    if(MAPCOOPA_WITH_VIEWER AND EXISTS "${UICOOPA_DIR}/CMakeLists.txt")
+        if(NOT TARGET coopa::ui)
+            add_subdirectory(${UICOOPA_DIR} ${CMAKE_CURRENT_BINARY_DIR}/uicoopa-build)
+        endif()
+
+        # Two TUs on purpose: map_viewer_export.cpp is the only one that may include
+        # mapcoopa's image_writer.h/map_export.h, because those compile stb_image_write's
+        # body and gfxcoopa carries its own copy of the same header. See
+        # examples/map_viewer_export.h for the full reasoning.
+        add_executable(mapcoopa_viewer examples/map_viewer.cpp examples/map_viewer_export.cpp)
+        # coopa::ui LAST: uicoopa's includes/ also carries stb_image.h / stb_image_write.h
+        # whose implementations live in gfxcoopa_impl, so coopa::gfx must win the include
+        # search -- the same ordering note toyengine/CMakeLists.txt carries.
+        target_link_libraries(mapcoopa_viewer PRIVATE coopa::maps coopa::gfx coopa::ui)
+
+        # gfx_add_shader_target() compiles .spv NEXT TO the source .vert/.frag rather than
+        # into the build tree (see gfxcoopa/cmake/GfxShaders.cmake), so the runtime shader
+        # path is uicoopa's own assets dir -- which is also where its fonts, themes and
+        # icon sheets live. ROOT_DIR (configuration/root_directory.h) points at mapcoopa,
+        # so the viewer needs this second root as well; it has no other way to find them.
+        add_dependencies(mapcoopa_viewer uicoopa_shaders)
+        target_compile_definitions(mapcoopa_viewer PRIVATE
+            UICOOPA_ASSET_DIR="${UICOOPA_DIR}/assets")
+    elseif(MAPCOOPA_WITH_VIEWER)
+        message(STATUS "mapcoopa: ${UICOOPA_DIR} not found -- skipping mapcoopa_viewer.")
+    endif()
 endif()

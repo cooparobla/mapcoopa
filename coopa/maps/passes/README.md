@@ -18,7 +18,7 @@ The graph's geometry is built before any pass runs and none of them change it; a
 annotates cells, corners and edges.
 
 That single fixed signature is also why `generate_async()` checks for cancellation
-*between* passes rather than inside one: threading a token through thirteen `execute()`
+*between* passes rather than inside one: threading a token through fourteen `execute()`
 methods would change the contract every pass is written to, to shave at most one pass off
 the latency — and the longest pass is roughly 50 ms. Nothing in here runs in parallel
 either. Generation is about 140 ms against some 10 s of export, so there is nothing to win,
@@ -44,7 +44,8 @@ over ground the earlier ones already claimed. Every pass that draws randomness s
 | 10 | [`pass_regions.h`](./pass_regions.h) | `MapGraph::regions`, `countries`; cell `region`/`country` | passes 6 and 8 |
 | 11 | [`pass_towns.h`](./pass_towns.h) | `MapGraph::towns` | passes 8, 9 and 10 |
 | 12 | [`pass_landmarks.h`](./pass_landmarks.h) | `MapGraph::landmarks` | passes 8, 10 and 11 |
-| 13 | [`pass_noisy_edges.h`](./pass_noisy_edges.h) | `noisy_points0`, `noisy_points1` | pass 8 |
+| 13 | [`pass_caves.h`](./pass_caves.h) | `MapGraph::caves` | passes 6 and 10 |
+| 14 | [`pass_noisy_edges.h`](./pass_noisy_edges.h) | `noisy_points0`, `noisy_points1` | pass 8 |
 
 ---
 
@@ -117,10 +118,23 @@ its own surface. It has to happen here rather than in the water pass, which is w
 lake are told apart but which runs first and has no heights to level against.
 
 ### 4. Temperature ([`pass_temperature.h`](./pass_temperature.h))
-Latitude band, minus an altitude lapse rate, plus a noise field. Without it biomes are
-classified on elevation and moisture alone, which leaves a third of the table unreachable
-and puts deserts at the pole. Latitude runs along **y**, so a map reads as a north-south
-slice of a globe.
+Latitude band, minus an altitude lapse rate, plus a noise field, plus a global offset.
+Without it biomes are classified on elevation and moisture alone, which leaves a third of
+the table unreachable and puts deserts at the pole. Latitude runs along **y**, so a map
+reads as a north-south slice of a globe.
+
+The band names its polar caps rather than implying them. It used to be `1 - d^falloff`,
+which does produce caps — at the default exponent the ground froze beyond 87% of the way to
+the pole, the outer 6.5% of the map — but nothing in the configuration said 6.5%, and no
+value of the exponent says *zero*. `polar_extent_north` and `polar_extent_south` say it
+outright, one per pole, anchored to `k_biome_frigid` so the number means the fraction that
+actually classifies as frozen. Set one to 0 and that cap vanishes; the curve then spans
+freezing to equatorial across the whole hemisphere, so latitude alone never picks ice.
+Altitude still can, which is what should happen to a mountain.
+
+`temperature_offset` shifts every sample, so an ice age and a hothouse are one number apart
+on the same map. `temperature_falloff` survives, now shaping only the temperate half of the
+curve.
 
 ### 5. Rivers ([`pass_rivers.h`](./pass_rivers.h))
 Sample sources uniformly, reject any outside the source elevation band, and walk
@@ -150,6 +164,11 @@ pass). Drawn straight between Voronoi corners a river is visibly angular at ever
 which is the one shape moving water never has; corner-cutting rounds the joints without
 straightening the course, because it never moves a point more than a quarter of a segment.
 The meander is the downslope chain itself and survives intact.
+
+The water *surface* a river is drawn at is not decided here — it is
+`make_river_surfaces()` in [`../map_data.h`](../map_data.h), computed for the whole network
+after generation, because "only ever falls", "meets the sea" and "agrees at a confluence" are
+none of them properties a single segment can check.
 
 ### 6. Valleys ([`pass_valleys.h`](./pass_valleys.h))
 The only pass that rewrites `elevation` after pass 3, and it has to be: rivers erode, but
@@ -281,13 +300,40 @@ shore instead of reaching across the water. The packer then runs per claimed cel
 the growing building list forward so `buildings_overlap()` still rejects a footprint that
 would cross a boundary into ground already built on.
 
-Each accepted cell is then laid out. The roads and rivers bordering it become *streets*
+Each accepted cell is then laid out. The roads and rivers bordering it become **streets**
 running from the cell's site out to those edges — a road is drawn along the Delaunay edge,
-so a road-flagged border means one enters the cell and heads for its centre. Buildings are
-placed in pairs flanking each street, walking outward, jittered in position and yaw so the
-rows read as built over time rather than surveyed. Whatever budget remains is spent on
-rejection sampling across the cell, filling the interior without falling back into a grid.
-A cell with no road or river gets fallback lanes toward its farthest corners.
+so a road-flagged border means one enters the cell and heads for its centre. A cell with
+neither gets fallback lanes toward its farthest corners, so even an isolated hamlet has a
+lane rather than a scatter. Buildings are placed in pairs flanking each street, walking
+outward, jittered in position and yaw so the rows read as built over time rather than
+surveyed. Whatever budget remains is spent on rejection sampling across the cell, filling
+the interior without falling back into a grid.
+
+Three things make that read as a settlement rather than as noise, and the first is the one
+that matters:
+
+- **The streets are emitted.** They were private to this pass — real enough to place plots
+  against and invisible to everyone else — so buildings lined up along something nobody
+  could see, and a settlement read as scatter however carefully it had been arranged. They
+  are now `MapTown::streets`, drawn on the structures layer and written to the map file.
+- **Interior infill takes the bearing of the nearest street** instead of a yaw drawn
+  uniformly from a full turn. That alone moved the fraction of buildings fronting a street
+  from **51% to 83%**; a row is only legible if its neighbours agree with it. Position stays
+  jittered, which is what keeps the layout off a lattice — that is a property of where
+  buildings sit, not of which way they face.
+- **Buildings are kept off the carriageway.** `can_place_()` tests every candidate against
+  the cell's streets and the road polylines passing through it, at half the roadway's width
+  plus `street_clearance_m`, and frontage plots are set back by their own rotated size rather
+  than a flat `street_offset_m` — which a `building_size_max_m` plot overran by a metre. Both
+  halves were needed: 37% of buildings stood on a lane and 18% on a road, and a keep-out alone
+  would have rejected the rows rather than placing them. A corridor is tested as a rotated box
+  through `buildings_overlap()`, because a corner-distance test misses a lane crossing the
+  middle of a plot.
+- **A market square, and roles.** A settlement claiming at least `plaza_min_cells` gets a
+  `MapPlaza` at its primary site — a disc, trimmed to fit the cell and skipped when there is
+  no room — which the packer keeps clear of building. The buildings nearest it are then given
+  civic roles from one roster shared by every tier, so a town reads as a smaller capital
+  rather than a different kind of place. Everything else is a `Dwelling`.
 
 Every candidate must have all four of its **rotated** corners inside the cell polygon and
 must clear every building already placed, by separating-axis test. That is what makes
@@ -311,7 +357,94 @@ the world a past. Every kind is checked against `landmark_suits_biome()`, and no
 may take more than a fifth of the budget: ranking alone lets whichever signature happens to
 be commonest swallow every slot, and the result is forty hot springs and no coastline.
 
-### 13. Noisy Edges ([`pass_noisy_edges.h`](./pass_noisy_edges.h))
+### 13. Caves ([`pass_caves.h`](./pass_caves.h))
+The only feature that exists *below* the map rather than on it, and the first thing in the
+module that has two heights at one position rather than one.
+
+**Mouths are ranked, not scattered.** A cave opens in a face of rock, so it belongs on the
+steepest ground there is — which in a Voronoi map is a `MapEdge` with a large height
+difference across it, already the object that sits *between* two cells. `edge_grade()`
+([`../map_data.h`](../map_data.h)) measures rise over run in real metres, and the pass takes
+the steepest edges subject to `min_spacing_m`, the same score-sort-accept shape `PassTowns`
+and `PassRoads::choose_hubs_()` use. `min_grade` is a floor beneath that ranking rather than
+the selection itself: a default map has thousands of qualifying edges and the eighteen that
+get mouths are far steeper than the threshold. The mouth sits at the edge midpoint and the
+first passage heads from the *lower* cell toward the higher one, because a cave mouth is
+something you walk into the hill through.
+
+`edge_grade()` had to be written — nothing here computed slope. `hillshade_()` takes a
+gradient off the blurred 8-bit raster with a 600× exaggeration baked in, so it answers a
+question about a picture; `RoadConfig::slope_cost` uses a height difference never divided by
+the distance it spreads over; and `downslope` is a direction with no magnitude.
+
+**Two regimes, which is what limestone does.** Above the water table water falls under
+gravity: steep descent at `descent_grade`, narrow, rare branches, the occasional vertical
+pitch. At and below it the water moves sideways through rock already full of it and attacks
+every joint it meets: level passage, wider, branching several times as often, chambers at
+the junctions. One system therefore reads as an entrance series leading to a level network.
+
+The water table is `vadose_share` of the relief between the mouth and the sea, capped by
+`max_depth_m` — a subdued replica of the surface rather than a flat sheet, because rain
+falls on the hill and drains to the valleys either side. That is not decoration: measured
+against sea level alone a cave 400 m up needs 250 m of descent before it can level out,
+further than its budget reaches, so every system came out pure entrance series and the
+phreatic half never appeared on a map.
+
+**Storeys, because the table moved.** The valley a system drains to cuts down over time and
+the water table follows it, abandoning the network standing at the old level — left as dry
+passage — and starting a new one below. `level_tables_()` returns that sequence, and growth
+runs the same two-regime model once per table, joining each to the next with the descent that
+*is* a shaft between levels. Nothing about the model is special-cased for it: a descent head
+is an ordinary head whose table happens to be the next one down.
+
+The sequence is anchored at the bottom. The deepest table sits exactly where the single table
+used to, so `vadose_share` and `max_depth_m` still say how deep a cave may go, and the
+abandoned levels are stacked upward from it at `level_spacing_m`. Anchoring at the top would
+have split one budget of relief between the entrance series and the storeys, so raising the
+spacing would have made caves shallower — two knobs pulling on one number.
+
+`level_spacing_m` also decides how many storeys a map gets, and not gently: a system needs
+that much relief to spend per extra table, so doubling it roughly halves the count. It has to
+clear `chamber_height_m` or two storeys intersect where they cross, leaving no rock between
+the levels. A descent is given `level_budget` of a trunk *plus* what the climb down
+costs, because the climb is overhead rather than network — charged against the same budget it
+spends `level_spacing_m / descent_grade` before reaching the level it was sent to dig, and
+the lower storeys come out as stubs.
+
+**`massif_bias` is what makes a system reach anywhere.** Each station probes the surface a
+step ahead to either side and leans toward the higher one — but *only when the rock ahead is
+thinning*. Under a massif every direction has depth to spare and the passage is left to the
+meander. Leaning unconditionally makes a head orbit the nearest summit, and a cave drawn as
+a spiral is not a cave. Held by the roof clamp alone it wanders out from under its own hill
+within a few hundred metres and has to stop, which is stubs.
+
+`noise_cave`'s frequency is set against `step_m`, not against the landforms the other noise
+fields shape. A station advances half a grid unit; sampled at a landform frequency the field
+barely changes over that, so every station turns by nearly the same amount as the last —
+which is a circle.
+
+**It never breaks the surface**, and the clamp runs **twice**: once as a station is grown,
+and again on every point of the smoothed passage. Corner-cutting is a convex combination, so
+it moves points, and over concave ground a smoothed midpoint can rise above a surface both
+its neighbours sat safely beneath. The smoothed path is what gets drawn and exported, so it
+is the geometry the guarantee has to hold on — remove the second clamp and
+`test_caves_stay_under_the_terrain` fails on the smoothed points alone.
+
+The surface it clamps against is `elevation_at()` **with** `TerrainDetail` and
+`RiverChannels` applied, not the control mesh. `river_channel_depth_m` cuts 18 m out of the
+drawn surface at its default, so a cave given 25 m of clearance against the mesh has 7 m of
+rock over it where it crosses under a river, and daylights outright at a higher `--channel`.
+
+A head that cannot be settled without breaking the system's own floor ends in a `Sump`
+rather than being allowed to surface. `Sump` means *cut short by the rock*; a run that
+simply spent its budget ends in a `Chamber`, because those are different places and
+deserve different names.
+
+**Why it runs here.** It needs the *finished* height field, so after `PassValleys` — the one
+pass that rewrites elevation after pass 3 — and it wants regions, so it can name itself in
+the local dialect the way `PassTowns` does. Nothing reads caves, so nothing needs it earlier.
+
+### 14. Noisy Edges ([`pass_noisy_edges.h`](./pass_noisy_edges.h))
 Redraw each cell boundary as a path that wanders inside the quadrilateral formed by the
 Voronoi edge and the two cell sites, recursively, to a depth of three. Both neighbouring
 cells read the same edge, so they can never disagree about where their shared border runs.

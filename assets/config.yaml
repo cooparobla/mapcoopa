@@ -83,6 +83,66 @@ composite_shading: elevation  # how the composite layer lights the biome colours
                           # Only the composite is affected; the elevation layer is the raw
                           # height field either way. --shading=MODE overrides for one run.
 
+elevation_surface: blended  # how the height field is drawn BETWEEN the cells it is
+                          # stored at, which is what decides how smooth a map looks:
+                          #   interpolated — barycentric over the Delaunay triangle, the
+                          #                  piecewise-linear surface through the cell sites.
+                          #                  Continuous by construction, so a map reads smooth
+                          #                  however rough the field is: at 1 px/m a 60 m cell
+                          #                  spans 60 px and a step between two cells is spread
+                          #                  over all of them.
+                          #   flat         — one height per cell, hard edge at every boundary.
+                          #                  The stored field with nothing interpolated over
+                          #                  it, Voronoi tessellation and all.
+                          #   blended      — flat, then BLURRED: the cells are drawn flat and
+                          #                  the finished raster is smoothed by a box blur
+                          #                  elevation_blend cells wide, with the river
+                          #                  channels cut back in afterwards so they keep
+                          #                  their contrast. A pass over the image, not a
+                          #                  sampling rule — blending each cell's own rim
+                          #                  instead just draws a bevel round every cell.
+                          # Rivers show under flat as well: the channel cut is a function of
+                          # position, not of the interpolation, so it subtracts from a flat
+                          # cell just as readily. Measured, 11.6 grey levels of contrast half a
+                          # cell from a centreline against 12.3 interpolated. River valleys are
+                          # there too, carved into the cell heights themselves, as stepped
+                          # cells rather than a smooth trough. Terrain roughness is the one
+                          # thing flat drops — that is surface texture, not a landform.
+                          # Affects the elevation layer and the composite's elevation shading
+                          # (and so hillshade, which is derived from the raster).
+                          # --surface=MODE overrides for one run.
+
+elevation_blend: 0.1      # `blended`'s blur radius, as a fraction of a cell — so 0.5 is half a
+                          # cell whatever the render size, and one number means the same at
+                          # 512 px as at 4800. 0 is flat byte for byte; 1 is the ceiling,
+                          # past which the blur is wider than the tessellation and erases
+                          # landforms along with facets. Measured at 512 px, the 99th-pct
+                          # adjacent-pixel step falls 34 → 12 → 8 → 6 grey levels at 0 /
+                          # 0.25 / 0.5 / 1. Unused by the other two modes.
+                          # NOT one of the elevation_smoothing_* knobs: those relax the heights
+                          # the graph STORES, this only changes how the drawn surface gets from
+                          # one stored height to the next. --blend=F overrides for one run.
+
+elevation_blend_variation: 0.5  # how much that radius VARIES from cell to cell, 0 to 1. A
+                          # single radius smooths everywhere equally, which is the one thing
+                          # real ground never does. This gives EVERY CELL ITS OWN radius,
+                          # drawn from noise_blend at that cell's site, so one cell keeps hard
+                          # edges while the cell beside it is fully smoothed. The factor is
+                          # `1 + variation × n` for n in [-1,1] — symmetric, so the MEAN
+                          # radius stays elevation_blend and turning this up makes a map more
+                          # varied rather than uniformly softer or sharper.
+                          # noise_blend.frequency below controls how soft and hard cells are
+                          # DISTRIBUTED — per-cell random through to broad patches.
+                          # 0 ignores the field entirely and is byte-identical to a single
+                          # blur. 1 is nominally a factor of 0 to 2, though an FBm field
+                          # seldom reaches its extremes — measured over a whole map it spans
+                          # about 0.35 to 1.8. The top of that can exceed the one-cell ceiling
+                          # elevation_blend is capped at, on purpose: clamping would
+                          # quietly make the knob one-sided. Costs one extra blur of the
+                          # raster whatever it is set to, and does nothing when
+                          # elevation_blend is 0, since there is no radius left to vary.
+                          # --blend-variation=F overrides for one run.
+
 png_compression_level: 8  # deflate effort when encoding a layer, 1-9. stb's own default
                           # is 8. Lower is faster and larger; the difference is modest once
                           # the export is threaded (level 1 is ~17% faster for ~2% bigger)
@@ -133,6 +193,46 @@ noise_terrain:            # the detail field terrain_roughness displaces the sur
   type: 0
   fractal_type: 1
   octaves: 5
+  lacunarity: 2.0
+  gain: 0.5
+  weighted_strength: 0.45
+
+noise_blend:              # gives each cell its own blur radius under
+                          # elevation_surface: blended. Read only when
+                          # elevation_blend_variation is above 0.
+  # seed: overridden from the master seed by the generator, as +2.
+  seed: 3571
+  frequency: 0.5          # sampled ONCE PER CELL, at the cell's site — and since sites sit one
+                          # grid unit apart and a grid unit IS a cell, this field's wavelength
+                          # (1 / frequency) is the patch size in cells. So this is the knob for
+                          # how the variation is DISTRIBUTED, where elevation_blend_variation
+                          # is how strong it is. Measured as the correlation between the
+                          # factors of two cells sharing an edge:
+                          #   0.5   → 2 cells,  r = -0.01 : every cell independent (default)
+                          #   0.33  → 3 cells,  r = 0.14  : mostly independent
+                          #   0.25  → 4 cells,  r = 0.35  : loose clumps
+                          #   0.2   → 5 cells,  r = 0.51  : clear patches
+                          #   0.125 → 8 cells,  r = 0.78  : broad regions
+                          #   0.045 → 22 cells, r = 0.97  : the old behaviour — no visible
+                          #                                 variation at all
+                          # Note the knee: at or above 0.5 the field is already fully
+                          # decorrelated, so raising it further buys nothing. The useful range
+                          # is 0.5 down to 0.125.
+                          # That last row is where this started — at r = 0.97 every cell in a
+                          # neighbourhood gets the same factor, so the map came out uniformly
+                          # blurred. What varies has to vary at the scale of the thing it
+                          # varies.
+                          # Not rescaled by grid_size, unlike noise_island: a patch measured in
+                          # cells should be that many cells on any map.
+  type: 0
+  fractal_type: 1
+  octaves: 1              # not the usual 5, and it matters twice. Octaves above the first sit
+                          # below cell size, so point-sampling one value per cell picks up
+                          # near-white noise from them whatever the base frequency says. And
+                          # FBm's gain leaves the base octave only ~2/3 of the amplitude, so
+                          # dropping the rest widens the effect measurably: per-cell edge
+                          # sharpness spread 0.213 → 0.294, and adjacent cells land on opposite
+                          # sides of the uniform blur 2.3% → 3.5% of the time.
   lacunarity: 2.0
   gain: 0.5
   weighted_strength: 0.45
@@ -201,9 +301,21 @@ shape:
 
 threshold_water: 0.3          # noise value above which a corner is water
 threshold_water_count: 2      # a cell becomes water once more than this many corners are
-elevation_smoothing_iterations: 3   # Laplacian relaxation passes over the height field.
-                                    # Distance-from-coast elevation is terraced; without
-                                    # these it reads as facets rather than terrain.
+elevation_smoothing_iterations: 3   # Laplacian relaxation passes over the height field:
+                                    # each pulls a corner, then a cell, toward the mean of
+                                    # its neighbours. They relax the STORED heights, which
+                                    # is the shape of the landform.
+                                    #
+                                    # They do NOT decide how smooth the picture looks, and
+                                    # setting them to 0 will not give you facets — the
+                                    # drawn surface is interpolated between the stored
+                                    # values whatever these say. See elevation_surface,
+                                    # which is the setting that turns interpolation off.
+                                    # (This comment used to promise facets at 0. That was
+                                    # true of the corner-fan interpolation these knobs were
+                                    # written against, which creased once per fan edge and
+                                    # put a tent pole at every site; the Delaunay surface
+                                    # replaced it and the promise went stale.)
 elevation_smoothing_strength: 0.5   # how far toward the neighbour mean each pass moves
 sea_level: 0.25               # THE WATERLINE, in the normalised [0,1] height field, and a
                               # real height rather than a convention. The sea bed occupies
@@ -241,10 +353,19 @@ terrain_roughness: 0.0        # how strongly the detail field displaces the SAMP
                               # --roughness=F overrides for one run.
 temperature_lapse_rate: 0.40  # how much a full unit of elevation cools the air; what puts
                               # snow on equatorial peaks
-temperature_falloff: 1.7      # shapes the pole-to-equator curve. A straight ramp (1.0)
-                              # leaves most of the map cold once the lapse rate is taken
-                              # off; above 1 holds the temperate band wide and pushes the
-                              # drop out to narrow polar caps.
+temperature_falloff: 1.7      # shapes the curve between the polar cap and the equator.
+                              # A straight ramp (1.0) leaves most of the map cold once the
+                              # lapse rate is taken off; above 1 holds the temperate band
+                              # wide. Where the frozen ground BEGINS is polar_extent_*.
+temperature_offset: 0.0       # shifts the whole world warmer or colder. Useful roughly
+                              # -0.5 to +0.5; an ice age and a hothouse are one number
+                              # apart on the same map. 0 changes nothing.
+polar_extent_north: 0.065     # fraction of the map at each edge that is frozen, 0 to 0.5,
+polar_extent_south: 0.065     # north and south independently. 0 means NO polar region on
+                              # that side: the cap vanishes and latitude alone never picks
+                              # ice, glacier or cold desert — altitude still can, which is
+                              # right, a mountain is cold at any latitude. The default is
+                              # the cap the old curve happened to produce (the outer 6.5%).
 
 # --- Rivers -----------------------------------------------------------------
 
@@ -289,6 +410,13 @@ river_channel_depth_per_volume_m: 4   # metres. The only one of the three river 
                               # roughness. Width comes from river_width_base_m, so the
                               # channel and the blue ribbon on the water layer register.
                               # 0 leaves the sampled surface as the mesh describes it.
+river_mouth_blend_m: 250      # over this last stretch a river becomes an ESTUARY: the channel
+                              # deepens until its bed reaches the water it empties into, and
+                              # widens with a flat bed so the whole drawn ribbon sits on it.
+                              # Without it the ground at a mouth stands 9–70 m above the
+                              # waterline, so the river either ends on a lip or is drawn under
+                              # the terrain. The pull is downward only — a river entering a
+                              # lake standing above it keeps its own level rather than climbing.
 river_incision_m: 60          # how deep a river cuts the VALLEY it runs in, in metres.
                               # 0 restores the uncarved height field exactly.
 river_incision_per_volume_m: 12  # a trunk river has had far longer to cut than its streams
@@ -378,13 +506,32 @@ towns:
   household_size_max: 7       # buildings actually placed, never invented
   capital_density: 1.6        # population density multiplier by tier
   town_density: 1.2
+  street_clearance_m: 1.5     # clear ground kept between a building and any roadway, added to
+                              # half its width — a lane's street_width_m, or a road's own width
+                              # by class. The counterpart of water_clearance_m, and needed for
+                              # the same reason: a street is a line the packer aims plots AT.
   street_offset_m: 8          # metres from a street's centreline to a plot centre; clears a
                               # 14 m footprint
   street_spacing_m: 14        # metres along a street between successive plots, so they do
                               # not touch
   position_jitter_m: 1.5      # so rows read as built over time rather than surveyed
   rotation_jitter: 0.25       # radians of yaw wobble about a street's bearing
-  infill_attempts: 200        # rejection draws before interior infill gives up
+  infill_attempts: 200        # rejection draws before interior infill gives up. The yaw of an
+                              # infill plot comes from the street nearest it, not from a random
+                              # turn — a row is only legible if its neighbours agree with it.
+  plaza_radius_m: 26          # radius of the market square, in metres. Open ground the packer
+                              # keeps clear and the civic buildings front onto; trimmed to fit
+                              # the cell, and skipped entirely when there is no room.
+  plaza_min_cells: 2          # claimed cells a settlement needs before it gets a square. Two,
+                              # so a one-cell village stays a village rather than becoming a
+                              # hamlet with a hole in it.
+  capital_civic_count: 7      # civic buildings each tier is given, taken in order from one
+  town_civic_count: 4         # roster — well, hall, market, smithy, temple, inn, granary,
+  village_civic_count: 2      # barracks, warehouse — so a town reads as a smaller capital
+                              # rather than a different kind of place. They are handed to the
+                              # buildings nearest the square, so the core is central.
+  street_width_m: 4           # width a street is drawn at; a lane, narrower than the trail
+                              # that reaches the settlement, so the two read as different things
 
 # --- Political geography ----------------------------------------------------
 
@@ -427,6 +574,57 @@ subdivide_noisy_edges: true   # wobble each cell boundary instead of drawing it 
 # regions. Turning one off leaves the fields it would have written at their defaults
 # rather than reordering anything.
 
+caves:
+  cave_count: 18            # systems to open; clamped to the qualifying slopes available
+  min_grade: 0.25           # rise over run a slope must reach to bear a cave, dimensionless.
+                            # A floor beneath a ranking, not the selection itself: candidates
+                            # are taken steepest first, so the mouths land far above this.
+  min_spacing_m: 300.0      # how far apart two mouths must be
+  roof_clearance_m: 25.0    # rock left between a ceiling and the ground above it. The margin
+                            # the "a cave stays underground" invariant is enforced with,
+                            # measured against the surface the renderer draws -- terrain
+                            # detail and river channels included -- not the control mesh.
+  passage_height_m: 8.0     # floor to ceiling in ordinary passage. Worth choosing against
+                            # level_spacing_m: a passage taller than the drop between storeys
+                            # reaches into the level below and the two interpenetrate.
+  chamber_height_m: 20.0    # floor to ceiling in a chamber
+  max_depth_m: 260.0        # hard cap on how far below its mouth a system may reach
+  vadose_share: 0.6         # share of the relief beneath a mouth that is entrance series.
+                            # Where the water table goes, and so where a cave stops
+                            # descending and starts branching. A water table is a subdued
+                            # replica of the surface, not a flat sheet at sea level.
+                            # Sets where the *deepest* table sits; the abandoned levels
+                            # above it are stacked from there.
+  level_spacing_m: 38.0     # drop from one abandoned water table to the next. What makes a
+                            # cave multi-level: the valley downcuts, the table follows, and
+                            # the network cut at the old level is left dry above the new one.
+                            # Must stay well clear of chamber_height_m or two storeys
+                            # intersect where they cross, leaving no rock between the levels.
+                            # Also decides how many storeys a map gets -- a system needs this
+                            # much relief to spend per extra table.
+  max_levels: 4             # cap on abandoned levels per system; the count itself comes from
+                            # the relief beneath the mouth
+  level_budget: 0.7         # share of the trunk length a new level's network inherits. Buys
+                            # network only -- the climb down to the next table is added on top.
+  step_m: 30.0              # distance advanced per station
+  passage_length_m: 900.0   # length budget of the trunk; branches spend from it
+  descent_grade: 0.15       # how steeply the passage falls above the water table
+  massif_bias: 0.6          # how hard a passage steers toward thicker rock when the rock
+                            # ahead thins. Without it a head wanders out from under its own
+                            # hill within a few hundred metres and has to stop.
+  meander: 0.5              # how far a passage wanders from straight, 0 to 1
+  branch_chance_vadose: 0.06     # branches are rare in the entrance series
+  branch_chance_phreatic: 0.26   # and common at the water table, where maze cave forms
+  branch_budget: 0.55       # share of the parent's remaining length a branch inherits
+  max_branches: 6           # per system
+  max_nodes: 900            # per system, shared across its storeys; the hard bound on
+                            # how long growth can run
+  passage_width_m: 6.0      # width of ordinary passage
+  chamber_radius_m: 18.0    # half-width of a chamber
+  shaft_chance: 0.10        # chance a vadose station is a vertical pitch instead
+  shaft_drop_m: 45.0        # how far a pitch falls
+  smoothing_iterations: 2   # Chaikin passes per passage, matching rivers and roads
+
 passes:
   enable_water: true
   enable_coast: true
@@ -440,4 +638,5 @@ passes:
   enable_regions: true
   enable_towns: true
   enable_landmarks: true
+  enable_caves: true        # underground; never drawn into the composite
   enable_noisy_edges: true
