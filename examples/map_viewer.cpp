@@ -83,8 +83,10 @@
 #include "map_viewer_export.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
@@ -245,6 +247,22 @@ struct ViewerState {
     bool  panning = false;
 
     Image* map_widget = nullptr;
+
+    /**
+     * @brief The overlay pin pool: built once, never grown or destroyed.
+     *
+     * Fixed for the same reason FileBrowser's row pool is: these nodes are hover targets, and
+     * destroying one while the event system is dispatching through it is a use-after-free. A
+     * default map needs 157 of them, so the cap is comfortable; past it the extras are dropped.
+     */
+    std::vector<Image*> marker_pool;
+    std::vector<Tooltip*> marker_tips;
+
+    /** @brief The full-map-rect node whose Tooltip carries the cursor readout. */
+    coopa::scene::SceneObject* probe_node = nullptr;
+    Tooltip* probe_tip = nullptr;
+    /** @brief Cell the readout was last built for, so the string is not rebuilt every frame. */
+    maps::CenterId probe_cell = maps::k_invalid_id;
     SceneObject* map_view = nullptr;
     Text* status_line = nullptr;
     ProgressBar* progress = nullptr;
@@ -400,15 +418,190 @@ void start_generation(ViewerState& state, coopa::job::JobEngine& jobs,
 }
 
 /**
+ * @brief The view window's origin in image space (normalised, Y-down).
+ * @param state Supplies zoom and view_center.
+ * @return The window's top-left corner.
+ */
+inline glm::vec2 view_origin(const ViewerState& state) {
+    return state.view_center - 0.5f / std::max(1.0f, state.zoom);
+}
+
+/** @brief The view window's extent in image space; 1 at zoom 1, 1/zoom otherwise. */
+inline float view_span(const ViewerState& state) {
+    return 1.0f / std::max(1.0f, state.zoom);
+}
+
+/**
+ * @brief Image-space position of a grid-space point, normalised and Y-down.
+ *
+ * Grid to image is a pure scale anchored at the origin with no flip -- grid Y runs down, the
+ * same way the rendered image's rows do -- so dividing by grid_size is the whole conversion.
+ * Going through image_size instead would work out the same but only while the
+ * `image_size * meters_per_pixel == grid_size * meters_per_grid_unit` invariant holds; this
+ * cannot drift.
+ *
+ * Points outside [0,1] are normal: the generator's boundary ring sits a unit outside the grid.
+ *
+ * @param config Supplies grid_size.
+ * @param point A position in grid units.
+ * @return The same position in normalised image space.
+ */
+inline glm::vec2 grid_to_image(const maps::MapConfig& config, const maps::MapPoint& point) {
+    const double g = std::max(1, config.grid_size);
+    return glm::vec2(static_cast<float>(point.x / g), static_cast<float>(point.y / g));
+}
+
+/**
+ * @brief Canvas position of an image-space point, given where the map widget is.
+ *
+ * The inverse of canvas_to_image(); both are shared with the zoom and pan code so the marker
+ * overlay and the view can never disagree about where a point is.
+ *
+ * @param state Supplies the view window.
+ * @param map_rect The map widget's resolved rect, in canvas space.
+ * @param image A normalised, Y-down image position.
+ * @return The canvas-space position, which may lie outside `map_rect` when the point is
+ *         outside the current view window -- callers cull on that.
+ */
+inline glm::vec2 image_to_canvas(const ViewerState& state, const Rect& map_rect, glm::vec2 image) {
+    const glm::vec2 t = (image - view_origin(state)) / view_span(state);
+    const glm::vec2 size = map_rect.size();
+    // 1 - t.y because canvas space is +Y up and image space is +Y down.
+    return map_rect.min + glm::vec2(t.x * size.x, (1.0f - t.y) * size.y);
+}
+
+/**
+ * @brief Image-space position under a canvas point. The inverse of image_to_canvas().
+ * @param state Supplies the view window.
+ * @param map_rect The map widget's resolved rect, in canvas space.
+ * @param canvas A canvas-space position.
+ * @return The normalised, Y-down image position.
+ */
+inline glm::vec2 canvas_to_image(const ViewerState& state, const Rect& map_rect, glm::vec2 canvas) {
+    const glm::vec2 size = glm::max(map_rect.size(), glm::vec2(1.0f));
+    glm::vec2 t = (canvas - map_rect.min) / size;
+    t.y = 1.0f - t.y;
+    return view_origin(state) + t * view_span(state);
+}
+
+/** @brief Grid-space position under a canvas point. */
+inline maps::MapPoint canvas_to_grid(const ViewerState& state, const maps::MapConfig& config,
+                                     const Rect& map_rect, glm::vec2 canvas) {
+    const glm::vec2 image = canvas_to_image(state, map_rect, canvas);
+    const double g = std::max(1, config.grid_size);
+    return maps::MapPoint{ image.x * g, image.y * g };
+}
+
+/**
+ * @brief The cell containing `point`, walking the graph from `from`.
+ *
+ * A Voronoi cell is by definition the set of points nearest its site, so stepping to whichever
+ * neighbour's site is nearer and repeating arrives at the containing cell and stops. mapcoopa
+ * has no public point-location query -- PassCaves has exactly this walk but keeps it private --
+ * so the viewer carries its own.
+ *
+ * Seeded from the previous frame's answer the walk is a hop or two; an invalid seed falls back
+ * to a scan of every site, which at ~6900 cells is around a tenth of a millisecond and happens
+ * once per map rather than once per frame.
+ *
+ * The cell whose *site* is nearest and the cell the renderer *painted* disagree in a thin band
+ * along every boundary, because the drawn outline follows the subdivided noisy edge rather than
+ * the straight Voronoi one. For a hover readout that is not worth a polygon test.
+ *
+ * @param graph The map to search.
+ * @param point A position in grid units; may lie outside the grid.
+ * @param from A cell to start from, or k_invalid_id to scan.
+ * @return The containing cell, or k_invalid_id if the graph has no cells.
+ */
+inline maps::CenterId locate_cell(const maps::MapGraph& graph, const maps::MapPoint& point,
+                                  maps::CenterId from) {
+    if (graph.centers.empty()) return maps::k_invalid_id;
+
+    maps::CenterId current = from;
+    if (current < 0 || current >= static_cast<maps::CenterId>(graph.centers.size())) {
+        current = 0;
+        double best = graph.centers[0].point.distance_to(point);
+        for (std::size_t i = 1; i < graph.centers.size(); ++i) {
+            const double d = graph.centers[i].point.distance_to(point);
+            if (d < best) { best = d; current = static_cast<maps::CenterId>(i); }
+        }
+        return current;
+    }
+
+    // Bounded so a malformed adjacency cannot spin here; a correct walk converges long before.
+    constexpr int k_max_hops = 64;
+    for (int hop = 0; hop < k_max_hops; ++hop) {
+        const maps::MapCenter& cell = graph.centers[static_cast<std::size_t>(current)];
+        double best = cell.point.distance_to(point);
+        maps::CenterId next = current;
+        for (const maps::CenterId n : cell.neighbors) {
+            if (n < 0 || n >= static_cast<maps::CenterId>(graph.centers.size())) continue;
+            const double d = graph.centers[static_cast<std::size_t>(n)].point.distance_to(point);
+            if (d < best) { best = d; next = n; }
+        }
+        if (next == current) return current;
+        current = next;
+    }
+    return current;
+}
+
+/**
+ * @brief The cell the RENDERER painted at `point`, refining a nearest-site answer.
+ *
+ * Nearest-site gives the straight-edged Voronoi cell, but the renderer fills
+ * `MapGraph::cell_outline()`, which follows the subdivided noisy edges and can bulge up to about
+ * a quarter of a cell past the straight bisector. The two therefore disagree in a thin band along
+ * every boundary -- and `pass_noisy_edges` subdivides most finely exactly where the neighbouring
+ * biomes differ, so the boundaries that wobble most are the ones where a readout's answer changes.
+ *
+ * Testing the painted outline of the nearest cell and then its neighbours closes that gap, so the
+ * name shown changes exactly where the colour under the cursor does. Falls back to the nearest
+ * site when no outline contains the point, which covers a degenerate cell (fewer than three
+ * corners, so `cell_outline` returns nothing) and the hull ring, whose adjacency is incomplete.
+ *
+ * Runs once per frame while the cursor is over the map, allocating one small point vector per
+ * candidate.
+ *
+ * @param graph The map to search.
+ * @param point A position in grid units.
+ * @param from A cell to start the nearest-site walk from, or k_invalid_id to scan.
+ * @return The cell whose drawn outline contains `point`, or the nearest site.
+ */
+inline maps::CenterId locate_drawn_cell(const maps::MapGraph& graph, const maps::MapPoint& point,
+                                        maps::CenterId from) {
+    const maps::CenterId nearest = locate_cell(graph, point, from);
+    if (nearest < 0 || nearest >= static_cast<maps::CenterId>(graph.centers.size())) return nearest;
+
+    const maps::MapCenter& cell = graph.centers[static_cast<std::size_t>(nearest)];
+    if (maps::point_in_polygon(graph.cell_outline(cell), point)) return nearest;
+    for (const maps::CenterId n : cell.neighbors) {
+        if (n < 0 || n >= static_cast<maps::CenterId>(graph.centers.size())) continue;
+        const maps::MapCenter& other = graph.centers[static_cast<std::size_t>(n)];
+        if (maps::point_in_polygon(graph.cell_outline(other), point)) return n;
+    }
+    return nearest;
+}
+
+
+/**
  * @brief Clamps the view window into the image and writes it to the sprite's uv.
  *
  * Two things make this less trivial than it looks.
  *
- * The uv uicoopa wants is V-FLIPPED, and the flip is expressed as an *inverted* Rect --
- * `min.y > max.y`. That is a valid thing to hand DrawList::add_quad(), which copies uv
- * corners verbatim, but it is not a valid `Rect` for any of rect.h's helpers (its size().y
- * is negative). So the view is kept as an honest Y-down window here and only flipped at the
- * moment it is written.
+ * The uv uicoopa wants is V-FLIPPED, and "flipped" here means **the pair is reversed, not each
+ * endpoint reflected**. DrawList::add_quad() maps uv.min to the quad's bottom-left and uv.max to
+ * its top-right with no implicit flip, and canvas space is +Y up while the source image's row 0 is
+ * the top -- so the quad's BOTTOM has to sample the band's LARGER image Y. That is
+ * `uv.min.y = hi.y, uv.max.y = lo.y`: an *inverted* Rect (`min.y > max.y`), which add_quad accepts
+ * happily but which no helper in rect.h will, since its size().y is negative. Hence the view is
+ * kept as an honest Y-down window here and only inverted at the moment it is written.
+ *
+ * Writing `1 - lo.y` / `1 - hi.y` instead looks equivalent and is not: reflecting each endpoint
+ * about the midline agrees with reversing the pair ONLY when `lo.y + hi.y == 1`, i.e. only when
+ * the window is vertically centred. That is exactly the case a zoom-only test produces -- the
+ * clamp below pins the centre at 0.5 until something pans -- so the wrong form survives any test
+ * that does not move the view off centre. It shipped once; the VIEW= capture hook exists to keep
+ * it from shipping again.
  *
  * And the window must stay inside [0,1]: the sampler is ClampToEdge, so a uv that runs off
  * the texture smears the map's edge pixels outward into a streak rather than showing
@@ -424,7 +617,7 @@ void apply_view_uv(ViewerState& state) {
 
     const glm::vec2 lo = state.view_center - half;
     const glm::vec2 hi = state.view_center + half;
-    state.map_sprite.uv = Rect{ glm::vec2(lo.x, 1.0f - lo.y), glm::vec2(hi.x, 1.0f - hi.y) };
+    state.map_sprite.uv = Rect{ glm::vec2(lo.x, hi.y), glm::vec2(hi.x, lo.y) };
 }
 
 /**
@@ -537,6 +730,141 @@ inline double wrap_degrees(double radians) {
     return deg < 0.0 ? deg + 360.0 : deg;
 }
 
+/** @brief Turns a snake_case library identifier into something readable. */
+inline std::string title_case(std::string_view snake) {
+    std::string out;
+    out.reserve(snake.size());
+    bool start = true;
+    for (const char c : snake) {
+        if (c == '_') { out.push_back(' '); start = true; continue; }
+        out.push_back(start ? static_cast<char>(std::toupper(static_cast<unsigned char>(c))) : c);
+        start = false;
+    }
+    return out;
+}
+
+/** @brief Rounds a metre value to a whole number for display. */
+inline std::string metres(double m) {
+    return std::to_string(static_cast<long long>(std::llround(m))) + " m";
+}
+
+/**
+ * @struct MarkerSpec
+ * @brief One overlay pin: where it goes, how it looks, and what it says when hovered.
+ */
+struct MarkerSpec {
+    maps::MapPoint point;   /**< @brief Position in grid units. */
+    const char*    icon;    /**< @brief IconLibrary name. */
+    glm::vec4      color;
+    float          size;    /**< @brief Rendered size in canvas pixels. */
+    std::string    text;    /**< @brief Tooltip contents. */
+};
+
+/** @brief Converts a 0-255 palette colour to the 0-1 one an Image wants. */
+inline glm::vec4 palette_color(const glm::vec3& c) {
+    return glm::vec4(c.x / 255.0f, c.y / 255.0f, c.z / 255.0f, 1.0f);
+}
+
+/**
+ * @brief Which entity kinds a layer puts pins on.
+ *
+ * A layer shows the things it is about: Structures is where settlements live, Landmarks is the
+ * landmark layer, Caves shows mouths. Composite is the everything view and gets all three. The
+ * rest depict a continuous field and would only be cluttered by pins -- they get a cursor
+ * readout instead (see probe_text()).
+ */
+struct LayerMarkers {
+    bool towns = false;
+    bool landmarks = false;
+    bool caves = false;
+};
+
+/** @brief The marker policy for `layer`. */
+inline LayerMarkers markers_for(maps::MapLayer layer) {
+    switch (layer) {
+        case maps::MapLayer::Composite:  return {true, true, true};
+        case maps::MapLayer::Structures: return {true, false, false};
+        case maps::MapLayer::Landmarks:  return {false, true, false};
+        case maps::MapLayer::Caves:      return {false, false, true};
+        default:                         return {};
+    }
+}
+
+/**
+ * @brief Builds the pin list for the current layer and zoom.
+ *
+ * Towns show at any zoom; landmarks and caves only past k_detail_zoom, because a default map has
+ * 112 landmarks and pinning all of them over a fully zoomed-out view buries the map under its
+ * own annotations. Zooming in is the gesture that asks for detail, so that is what reveals them.
+ *
+ * @param state Supplies the graph, config, layer and zoom.
+ * @return The pins to place, in draw order.
+ */
+inline std::vector<MarkerSpec> build_markers(const ViewerState& state) {
+    std::vector<MarkerSpec> out;
+    if (!state.has_map) return out;
+
+    constexpr float k_detail_zoom = 2.0f;
+    const LayerMarkers want = markers_for(state.layer);
+    const bool detail = state.zoom >= k_detail_zoom;
+    const maps::MapGraph& g = state.graph;
+
+    if (want.towns) {
+        for (const maps::MapTown& town : g.towns) {
+            std::string text = town.name + "  ·  " + title_case(maps::town_tier_name(town.tier));
+            text += "  ·  pop " + std::to_string(town.population);
+            if (town.region >= 0 && town.region < static_cast<maps::RegionId>(g.regions.size())) {
+                const maps::MapRegion& r = g.regions[static_cast<std::size_t>(town.region)];
+                text += "  ·  " + r.name;
+                if (r.country >= 0 && r.country < static_cast<maps::CountryId>(g.countries.size())) {
+                    text += ", " + g.countries[static_cast<std::size_t>(r.country)].name;
+                }
+            }
+            // Sized by tier so a capital reads as one at a glance, the way the raster's own
+            // marker radii do.
+            const float size = town.tier == maps::TownTier::Capital ? 16.0f
+                             : town.tier == maps::TownTier::Town    ? 12.0f
+                                                                    : 9.0f;
+            out.push_back({town.point, "circle", palette_color(state.palette.town_color), size,
+                           std::move(text)});
+        }
+    }
+    if (want.landmarks && detail) {
+        for (const maps::MapLandmark& lm : g.landmarks) {
+            // landmark_noun() is the display word -- landmark_kind_name() is the snake_case
+            // on-disk identity and is not meant to be shown. The generated name already ENDS
+            // with that noun ("Soochoi Tower"), so appending it unconditionally reads
+            // "Soochoi Tower - Tower"; add it only when the name does not already say it.
+            const std::string noun(maps::landmark_noun(lm.kind));
+            std::string text = lm.name;
+            const bool named_after_kind = lm.name.size() >= noun.size()
+                && lm.name.compare(lm.name.size() - noun.size(), noun.size(), noun) == 0;
+            if (!named_after_kind) text += "  ·  " + noun;
+            if (lm.region >= 0 && lm.region < static_cast<maps::RegionId>(g.regions.size())) {
+                text += "  ·  " + g.regions[static_cast<std::size_t>(lm.region)].name;
+            }
+            const bool built = lm.kind == maps::LandmarkKind::Ruins
+                            || lm.kind == maps::LandmarkKind::StandingStones
+                            || lm.kind == maps::LandmarkKind::Monolith
+                            || lm.kind == maps::LandmarkKind::Wreck
+                            || lm.kind == maps::LandmarkKind::Tower
+                            || lm.kind == maps::LandmarkKind::Shrine;
+            const glm::vec3& c = built ? state.palette.landmark_built_color
+                                       : state.palette.landmark_natural_color;
+            out.push_back({lm.point, "dot", palette_color(c), 10.0f, std::move(text)});
+        }
+    }
+    if (want.caves && detail) {
+        for (const maps::MapCave& cave : g.caves) {
+            std::string text = cave.name + "  ·  cave  ·  " + metres(cave.length_m) + " of passage";
+            text += "  ·  " + metres(cave.surface_at_mouth - cave.deepest) + " deep";
+            out.push_back({cave.mouth, "star", palette_color(state.palette.cave_mouth_color),
+                           11.0f, std::move(text)});
+        }
+    }
+    return out;
+}
+
 /**
  * @struct ModeRow
  * @brief One row's visibility, as a bitmask over the values of the enum that gates it.
@@ -584,6 +912,142 @@ bool apply_mode_rows(const UIBuilder& panel, const ModeRow (&rows)[N], int mode)
         changed = true;
     }
     return changed;
+}
+
+/** @brief Whether `layer` has a cursor readout at all. Mirrors probe_text()'s switch. */
+inline bool layer_has_probe(maps::MapLayer layer) {
+    switch (layer) {
+        case maps::MapLayer::Elevation:
+        case maps::MapLayer::Biomes:
+        case maps::MapLayer::Water:
+        case maps::MapLayer::Regions:
+        case maps::MapLayer::Composite:
+            return true;
+        default:
+            return false;
+    }
+}
+
+/**
+ * @brief The cursor readout for `layer` at a grid-space point, or empty when it has none.
+ *
+ * Reports what the layer on screen actually depicts, so the readout always answers a question
+ * the picture raises: a height on Elevation, a biome on Biomes, whose land it is on Regions.
+ * Roads has none -- the road network is visible without a label and there is no per-point road
+ * query -- and neither does Caves, because caves are a branching 3D network with no
+ * point-to-cave lookup; their names come from the pins instead.
+ *
+ * @param state Supplies the graph, config and layer.
+ * @param cell The cell under the cursor.
+ * @param point The cursor position in grid units.
+ * @return The readout, or an empty string.
+ */
+inline std::string probe_text(const ViewerState& state, maps::CenterId cell,
+                              const maps::MapPoint& point) {
+    if (cell < 0 || cell >= static_cast<maps::CenterId>(state.graph.centers.size())) return {};
+    const maps::MapCenter& c = state.graph.centers[static_cast<std::size_t>(cell)];
+    const maps::MapConfig& cfg = state.config;
+
+    // The cheapest of the four elevation_at() overloads: the landform, without the noise sample
+    // and channel lookup the rendered surface adds. Normalised [0,1].
+    const double h = state.graph.elevation_at(c, point.x, point.y);
+    // There is no single call for "metres above sea level" -- height_to_meters() is metres above
+    // the sea FLOOR and land_height() is a normalised fraction, so neither is this.
+    const double above_sea = (h - cfg.sea_level) * cfg.elevation_range_m;
+    // MapCenter::elevation is the bed under a water cell, so depth is measured to the surface.
+    const double depth = (c.water_level - c.elevation) * cfg.elevation_range_m;
+
+    const std::string biome = title_case(maps::biome_name(c.biome));
+    const auto height_text = [&]() {
+        return c.water ? metres(depth) + " deep" : metres(above_sea) + " above sea level";
+    };
+
+    switch (state.layer) {
+        case maps::MapLayer::Elevation:
+            return height_text();
+        case maps::MapLayer::Biomes:
+            return biome;
+        case maps::MapLayer::Water:
+            return c.water ? (c.ocean ? "Ocean  ·  " : "Lake  ·  ") + metres(depth) + " deep"
+                           : "Land  ·  " + metres(above_sea) + " above sea level";
+        case maps::MapLayer::Regions: {
+            const auto region_count = static_cast<maps::RegionId>(state.graph.regions.size());
+            if (c.region < 0 || c.region >= region_count) {
+                return c.water ? std::string("Unclaimed water") : std::string("Unclaimed");
+            }
+            const maps::MapRegion& r = state.graph.regions[static_cast<std::size_t>(c.region)];
+            std::string text = r.name;
+            const auto country_count =
+                static_cast<maps::CountryId>(state.graph.countries.size());
+            if (r.country >= 0 && r.country < country_count) {
+                text += ", " + state.graph.countries[static_cast<std::size_t>(r.country)].name;
+            }
+            return text;
+        }
+        case maps::MapLayer::Composite:
+            return biome + "  ·  " + height_text();
+        default:
+            return {};
+    }
+}
+
+/**
+ * @brief Places the overlay pins and updates the cursor readout for this frame.
+ *
+ * Pins are re-placed every frame rather than cached because zoom and pan move all of them at
+ * once; the work is a couple of multiplies each across at most 256 slots.
+ *
+ * @param state The viewer state; its pool, probe and probe_cell are updated.
+ * @param map_rect The map widget's resolved rect -- where the map itself is drawn.
+ * @param parent_rect The rect of the node the pins are parented to. Their anchor is that
+ *        node's bottom-left corner, and the map is letterboxed inside it, so the two are not
+ *        the same origin and using the map's would slide every pin off its feature.
+ * @param cursor The pointer position in canvas space.
+ * @param over_map Whether the pointer is inside `map_rect`.
+ */
+inline void update_overlay(ViewerState& state, const Rect& map_rect, const Rect& parent_rect,
+                           glm::vec2 cursor, bool over_map) {
+    const std::vector<MarkerSpec> pins = build_markers(state);
+
+    std::size_t slot = 0;
+    for (const MarkerSpec& pin : pins) {
+        if (slot >= state.marker_pool.size()) break;
+        const glm::vec2 image = grid_to_image(state.config, pin.point);
+        const glm::vec2 t = (image - view_origin(state)) / view_span(state);
+        // Culled against the view window rather than the rect so a pin only just off-screen
+        // does not flicker at the edge as it scrolls in.
+        if (t.x < -0.05f || t.x > 1.05f || t.y < -0.05f || t.y > 1.05f) continue;
+
+        Image* img = state.marker_pool[slot];
+        img->sprite = IconLibrary::instance().icon(pin.icon);
+        img->color = pin.color;
+        auto* rt = img->owner->get_component<RectTransform>();
+        rt->set_size_delta({pin.size, pin.size});
+        rt->set_anchored_position(image_to_canvas(state, map_rect, image) - parent_rect.min);
+        state.marker_tips[slot]->text = pin.text;
+        img->owner->set_active(true);
+        ++slot;
+    }
+    for (; slot < state.marker_pool.size(); ++slot) {
+        state.marker_pool[slot]->owner->set_active(false);
+    }
+
+    if (!state.probe_node) return;
+    const bool wants_probe = state.has_map && over_map && layer_has_probe(state.layer);
+    state.probe_node->set_active(wants_probe);
+    if (!wants_probe) {
+        state.probe_cell = maps::k_invalid_id;
+        return;
+    }
+
+    const maps::MapPoint point = canvas_to_grid(state, state.config, map_rect, cursor);
+    const maps::CenterId cell = locate_drawn_cell(state.graph, point, state.probe_cell);
+    // Rebuilt only when the cursor crosses into another cell: within one cell the answer cannot
+    // change, and this runs every frame the pointer is over the map.
+    if (cell != state.probe_cell) {
+        state.probe_cell = cell;
+        state.probe_tip->text = probe_text(state, cell, point);
+    }
 }
 
 /** @brief A one-line summary of the current map, for the status readout. */
@@ -794,6 +1258,40 @@ int main() {
         img_rt->anchor_preset(AnchorPreset::MiddleCenter);
         img_rt->hittable = false;   // Nothing to click on the map itself; let the menu scrim win.
         state.map_widget = img;
+
+        // Below the markers in the child order so they win an equal-z raycast, and carrying the
+        // cursor readout for layers that have one. Built before the pins for that reason.
+        {
+            auto probe = std::make_unique<SceneObject>("MapProbe");
+            auto* prt = probe->add_component<RectTransform>();
+            prt->anchor_preset(AnchorPreset::StretchAll);
+            prt->set_size_delta({0.0f, 0.0f});
+            state.probe_tip = probe->add_component<Tooltip>();
+            state.probe_node = map_col.node()->add_child(std::move(probe));
+            state.probe_node->set_active(false);
+        }
+
+        // The pin pool. Every slot is built hidden and reused; see ViewerState::marker_pool.
+        {
+            constexpr int k_max_markers = 256;
+            state.marker_pool.reserve(k_max_markers);
+            state.marker_tips.reserve(k_max_markers);
+            for (int i = 0; i < k_max_markers; ++i) {
+                auto pin = std::make_unique<SceneObject>("Marker_" + std::to_string(i));
+                auto* rt = pin->add_component<RectTransform>();
+                rt->anchor_preset(AnchorPreset::BottomLeft);
+                rt->set_pivot({0.5f, 0.5f});
+                rt->set_size_delta({12.0f, 12.0f});
+                // Above the probe beneath them, so hovering a pin reports the pin and not the
+                // terrain under it.
+                rt->z_order = 1;
+                auto* img = pin->add_component<Image>();
+                auto* tip = pin->add_component<Tooltip>();
+                state.marker_pool.push_back(img);
+                state.marker_tips.push_back(tip);
+                map_col.node()->add_child(std::move(pin))->set_active(false);
+            }
+        }
 
         Text* status = map_col.add_status_line("No map yet -- press Refresh.", TextRole::Secondary,
                                                "StatusLine");
@@ -1063,6 +1561,80 @@ int main() {
         apply_help(b, k_help);
         apply_mode_rows(b, k_surface_rows, static_cast<int>(cfg.elevation_surface));
         terrain.fit();
+    }
+
+    // Sits between Terrain and Water to match the generation order -- temperature runs after
+    // elevation and before moisture and biomes -- and because that is the order the settings
+    // actually compose in: the lapse rate reads the height Terrain produced.
+    CollapsibleHandle climate = settings.collapsible("SecClimate", "Climate", false);
+    {
+        UIBuilder b = climate.body();
+        b.add_slider_row("Warmth", -1.0f, 1.0f, static_cast<float>(cfg.temperature_offset), 0.0f,
+                         [&cfg](float v) { cfg.temperature_offset = v; });
+        b.add_slider_row("Lapse rate", 0.0f, 1.0f,
+                         static_cast<float>(cfg.temperature_lapse_rate), 0.0f,
+                         [&cfg](float v) { cfg.temperature_lapse_rate = v; });
+        // Floor at 0.2 rather than 0: the value is an exponent, and 0 would flatten the whole
+        // hemisphere to full warmth.
+        b.add_slider_row("Polar falloff", 0.2f, 4.0f,
+                         static_cast<float>(cfg.temperature_falloff), 0.0f,
+                         [&cfg](float v) { cfg.temperature_falloff = v; });
+        b.add_slider_row("Polar north", 0.0f, 0.5f,
+                         static_cast<float>(cfg.polar_extent_north), 0.0f,
+                         [&cfg](float v) { cfg.polar_extent_north = v; });
+        b.add_slider_row("Polar south", 0.0f, 0.5f,
+                         static_cast<float>(cfg.polar_extent_south), 0.0f,
+                         [&cfg](float v) { cfg.polar_extent_south = v; });
+
+        b.add_separator();
+        // Labelled "... pass" both because that is what they are and because apply_help() looks
+        // rows up by "<label>_Row" across the whole panel -- a bare "Biomes" would be one future
+        // row away from colliding with something else.
+        b.add_toggle_row("Temperature pass", cfg.enable_temperature,
+                         [&cfg](bool v) { cfg.enable_temperature = v; });
+        b.add_toggle_row("Moisture pass", cfg.enable_moisture,
+                         [&cfg](bool v) { cfg.enable_moisture = v; });
+        b.add_toggle_row("Biome pass", cfg.enable_biomes,
+                         [&cfg](bool v) { cfg.enable_biomes = v; });
+
+        static const SettingHelp k_help[] = {
+            {"Warmth",
+             "Shifts the whole world warmer or colder, before the range clamp -- an ice age and "
+             "a hothouse are one number apart on the same map. Roughly -0.5 to +0.5 is useful; "
+             "beyond that the clamp flattens whole hemispheres to one value."},
+            {"Lapse rate",
+             "How much a full unit of elevation cools the air. At the default a mountain top is "
+             "about half a climate band colder than the lowland on the same latitude, which is "
+             "what puts snow on equatorial peaks. It works on the normalised height field, so "
+             "Height (m) does not affect it -- but Sea level does, because a higher waterline "
+             "pushes all land to higher normalised elevations and so takes more cooling."},
+            {"Polar falloff",
+             "Shapes the latitude curve between the polar cap and the equator. A straight ramp "
+             "(1.0) leaves most of the map cold once the lapse rate is subtracted; above 1 holds "
+             "the temperate band wide and pushes the drop out toward the caps. It shapes the "
+             "temperate half only -- where frozen ground begins is the two polar extents."},
+            {"Polar north",
+             "Fraction of the map at the top edge that is frozen, 0 to 0.5. Zero means no polar "
+             "region on this side: latitude alone then never selects ice, glacier or cold "
+             "desert, though altitude still can."},
+            {"Polar south",
+             "Fraction of the map at the bottom edge that is frozen, 0 to 0.5. Independent of "
+             "the north, so a world can carry an ice cap at one end only."},
+            {"Temperature pass",
+             "Run the temperature pass. Turning it off does not give a world without climate -- "
+             "every cell keeps a temperature of zero, which the biome table reads as below "
+             "freezing everywhere, so you get an entirely frozen map."},
+            {"Moisture pass",
+             "Run the moisture pass. Moisture has no sliders by design: it is derived from "
+             "lakes, rivers and coast distance, then normalised to span the full range on every "
+             "map, so nothing could make a world globally wetter or drier -- only its "
+             "arrangement changes, through Rivers, Sea level and Lake thresh."},
+            {"Biome pass",
+             "Run the biome pass. Turning it off leaves every cell at its default biome, which "
+             "renders as open sea."},
+        };
+        apply_help(b, k_help);
+        climate.fit();
     }
 
     CollapsibleHandle water = settings.collapsible("SecWater", "Water", false);
@@ -1383,7 +1955,7 @@ int main() {
     // a pointer anywhere near the window. Applied after scene.start(), so they override the
     // initial visibility each component just settled.
     if (std::getenv("EXPAND_ALL")) {
-        for (CollapsibleHandle h : {world, terrain, water, features, render}) h.expand();
+        for (CollapsibleHandle h : {world, terrain, climate, water, features, render}) h.expand();
     }
     // SHAPE=/SURFACE= drive the two gated dropdowns through their own ComboBox, so the panel
     // ends up in exactly the state a click would leave it in -- rows hidden, section re-fitted.
@@ -1413,9 +1985,31 @@ int main() {
         state.zoom = std::max(1.0f, std::strtof(zoom_env, nullptr));
         apply_view_uv(state);
     }
+    // VIEW=cx,cy places the view window's centre in image space. Needed because apply_view_uv()
+    // clamps the centre to the middle at zoom 1, so ZOOM= alone can only ever produce a centred
+    // window -- and a centred window is the one case where a V-flip expressed as a reflection and
+    // one expressed as a swap agree. Without this the off-centre case is unreachable headlessly.
+    if (const char* view_env = std::getenv("VIEW")) {
+        double cx = 0.5, cy = 0.5;
+        if (std::sscanf(view_env, "%lf,%lf", &cx, &cy) == 2) {
+            state.view_center = glm::vec2(static_cast<float>(cx), static_cast<float>(cy));
+            apply_view_uv(state);
+        } else {
+            std::cerr << "[map_viewer] VIEW wants \"cx,cy\" in [0,1] image space.\n";
+        }
+    }
     // Parks the pointer over a named settings row, so a scripted capture can show the
     // tooltip that row carries without a hand on the mouse.
     const char* hover_row = std::getenv("HOVER_ROW");
+    // HOVER_MAP=x,y parks the pointer at a GRID-space position, so a scripted capture can show a
+    // marker's tooltip or a terrain readout without a hand on the mouse. Grid rather than canvas
+    // because that is the coordinate the map data is in -- a town's own point can be pasted in.
+    glm::dvec2 hover_map(0.0);
+    bool hover_map_set = false;
+    if (const char* hm = std::getenv("HOVER_MAP")) {
+        if (std::sscanf(hm, "%lf,%lf", &hover_map.x, &hover_map.y) == 2) hover_map_set = true;
+        else std::cerr << "[map_viewer] HOVER_MAP wants \"x,y\" in grid units.\n";
+    }
     if (std::getenv("OPEN_MENU")) file_menu.open();
     if (std::getenv("OPEN_PICKER")) open_picker("Import map", FileDialogMode::Open,
                                                 {".yaml", ".yml"}, "", [](const std::string&) {});
@@ -1445,7 +2039,12 @@ int main() {
         if (sw == 0 || sh == 0) continue;  // minimized
 
         canvas->set_viewport(sw, sh);
-        if (hover_row) {
+        if (hover_map_set && state.map_widget) {
+            const Rect mr = state.map_widget->owner->get_component<RectTransform>()->rect();
+            const glm::vec2 img = grid_to_image(state.config,
+                                                maps::MapPoint{hover_map.x, hover_map.y});
+            canvas->set_world_input(ctx.input(), image_to_canvas(state, mr, img));
+        } else if (hover_row) {
             // Injected in canvas space, the same way a world canvas feeds a ray hit in.
             SceneObject* row = canvas_raw->find_descendant(std::string(hover_row) + "_Row");
             canvas->set_world_input(ctx.input(),
@@ -1525,12 +2124,13 @@ int main() {
             const bool over_map = contains(map_rect, cursor);
             const float old_zoom = state.zoom;
 
-            // Where the cursor sits in the current view window, in image space (Y-down).
+            // Where the cursor sits in the current view window. Shared with the marker
+            // overlay's placement rather than open-coded twice -- two copies of this would
+            // drift and put pins somewhere the view is not.
             const glm::vec2 rect_size = glm::max(map_rect.size(), glm::vec2(1.0f));
-            glm::vec2 t = (cursor - map_rect.min) / rect_size;
-            t.y = 1.0f - t.y;  // canvas is +Y up, image space is +Y down
-            const float span_before = 1.0f / std::max(1.0f, state.zoom);
-            const glm::vec2 anchor = state.view_center - span_before * 0.5f + t * span_before;
+            const float span_before = view_span(state);
+            const glm::vec2 anchor = canvas_to_image(state, map_rect, cursor);
+            glm::vec2 t = (anchor - view_origin(state)) / span_before;
 
             if (over_map && canvas->input().scroll_delta().y != 0.0f) {
                 // Exponential so each notch is the same proportional step in and out.
@@ -1562,6 +2162,11 @@ int main() {
                 state.view_center = glm::vec2(0.5f);
                 apply_view_uv(state);
             }
+
+            const Rect view_rect = state.map_view
+                ? state.map_view->get_component<RectTransform>()->rect()
+                : map_rect;
+            update_overlay(state, map_rect, view_rect, cursor, over_map);
 
             // Sharpen once the zoom has settled. The magnified texture stays up meanwhile, so
             // zooming itself never waits on a render.

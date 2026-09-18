@@ -345,6 +345,7 @@ inline fkyaml::node config_to_node(const MapConfig& config) {
     node["elevation_smoothing_strength"] = config.elevation_smoothing_strength;
     node["subdivide_noisy_edges"] = config.subdivide_noisy_edges;
     node["show_regions"] = config.show_regions;
+    node["draw_landmark_marks"] = config.draw_landmark_marks;
     node["region_tint"] = config.region_tint;
     node["noise_island"] = detail::noise_to_node(config.noise_island);
     node["noise_temperature"] = detail::noise_to_node(config.noise_temperature);
@@ -529,6 +530,8 @@ inline void apply_config_node(const fkyaml::node& node, MapConfig& config) {
     config.subdivide_noisy_edges = detail::read_or(node, "subdivide_noisy_edges", config.subdivide_noisy_edges);
 
     config.show_regions = detail::read_or(node, "show_regions", config.show_regions);
+    config.draw_landmark_marks =
+        detail::read_or(node, "draw_landmark_marks", config.draw_landmark_marks);
     config.region_tint = detail::read_or(node, "region_tint", config.region_tint);
 
     detail::noise_from_node(node, "noise_cave", config.noise_cave);

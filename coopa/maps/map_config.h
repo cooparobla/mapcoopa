@@ -1108,6 +1108,25 @@ struct MapConfig {
     bool show_regions = true;
     /** @brief How strongly the region tint is mixed over the biome colour, in `[0, 1]`. */
     float region_tint = 0.13f;
+    /**
+     * @brief Whether landmark marks are painted into the `Landmarks` and `Composite` layers.
+     *
+     * Render-only, like `show_regions` beside it: no pass reads it, and nothing downstream of
+     * the renderer can tell it was set. It does **not** affect generation -- `graph.landmarks`
+     * is populated either way. `enable_landmarks` is the setting that decides whether a map has
+     * landmarks at all, and the two are not interchangeable: turning that one off leaves nothing
+     * to draw *or* to look up.
+     *
+     * Off by default because a landmark is a label, not terrain. Baking a diamond into the
+     * picture fixes its size to whatever the render happened to be and gives a viewer no way to
+     * ask what it is; an interactive overlay can place a marker that stays legible at any zoom
+     * and carries the name. The map viewer (examples/map_viewer.cpp) draws them that way.
+     *
+     * Setting it true restores the previous output byte for byte. Town marks and cave-mouth
+     * rings are unaffected either way -- they are still painted, so the `Landmarks` layer keeps
+     * its meaning rather than becoming an empty image.
+     */
+    bool draw_landmark_marks = false;
 
     // --- Pass parameters ---
 

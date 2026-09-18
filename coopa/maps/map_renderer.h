@@ -1727,8 +1727,14 @@ private:
             draw_marker_(image, town.point, scale, marker_radius_(town.tier, config),
                          palette.town_color, band);
         }
-        for (const MapLandmark& landmark : graph.landmarks) {
-            draw_landmark_(image, landmark, scale, config, palette, band);
+        // Off by default: a landmark is a label rather than terrain, and is drawn as an
+        // interactive marker by whatever is displaying the map. See
+        // MapConfig::draw_landmark_marks -- and note it is render-only, where enable_landmarks
+        // decides whether the map has any landmarks to draw in the first place.
+        if (config.draw_landmark_marks) {
+            for (const MapLandmark& landmark : graph.landmarks) {
+                draw_landmark_(image, landmark, scale, config, palette, band);
+            }
         }
         // A ring, where a town is a filled square and a natural landmark a diamond.
         // The shape has to carry the difference on a composite already crowded with

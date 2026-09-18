@@ -1226,6 +1226,51 @@ static void test_population_scales_with_buildings() {
     ASSERT_EQ(region_total, town_total);
 }
 
+/**
+ * @brief draw_landmark_marks suppresses the landmark diamonds and nothing else.
+ *
+ * The flag has to be render-only, and that is the whole risk: the obvious way to stop drawing
+ * landmarks is `enable_landmarks`, which instead stops *generating* them -- leaving nothing for
+ * an interactive overlay to place a marker on. So this asserts the graph is identical either
+ * way, and that only the two layers which paint markers change.
+ */
+static void test_draw_landmark_marks_is_render_only() {
+    MapConfig without = world_config();
+    set_render_size(without, 192);
+    without.draw_landmark_marks = false;
+    MapGenerator generator(without, maps_logger());
+    generator.generate();
+    const MapGraph& graph = generator.graph();
+    ASSERT_TRUE(!graph.landmarks.empty());
+
+    MapConfig with = without;
+    with.draw_landmark_marks = true;
+
+    // Same graph, same landmarks -- the flag never reaches a pass. This is the distinction from
+    // enable_landmarks, which would empty the vector asserted on above.
+    ASSERT_TRUE(!graph.landmarks.empty());
+
+    // Only the two layers that call draw_markers_() may differ.
+    for (const MapLayer layer : {MapLayer::Composite, MapLayer::Landmarks}) {
+        const Image on = MapLayers::render(layer, graph, with);
+        const Image off = MapLayers::render(layer, graph, without);
+        ASSERT_TRUE(on.pixels != off.pixels);
+    }
+    for (const MapLayer layer : {MapLayer::Elevation, MapLayer::Water, MapLayer::Biomes,
+                                 MapLayer::Roads, MapLayer::Structures, MapLayer::Regions,
+                                 MapLayer::Caves}) {
+        const Image on = MapLayers::render(layer, graph, with);
+        const Image off = MapLayers::render(layer, graph, without);
+        ASSERT_TRUE(on.pixels == off.pixels);
+    }
+
+    // Town marks and cave rings survive the suppression, so the Landmarks layer keeps its
+    // meaning rather than becoming an empty image.
+    const Image marks_off = MapLayers::render(MapLayer::Landmarks, graph, without);
+    const Image empty = MapLayers::allocate(MapLayer::Landmarks, without);
+    ASSERT_TRUE(marks_off.pixels != empty.pixels);
+}
+
 static void test_landmarks_respect_their_biome() {
     MapGenerator generator(world_config(), maps_logger());
     generator.generate();
@@ -1954,6 +1999,7 @@ static MapConfig perturbed_config() {
     config.noise_cave = {77, 0.61, FastNoiseLite::NoiseType_Perlin,
                          FastNoiseLite::FractalType_FBm, 3, 2.2, 0.4, 0.35};
     config.show_regions = false;
+    config.draw_landmark_marks = true;
     config.composite_shading = CompositeShading::Hillshade;
     config.elevation_surface = ElevationSurface::Flat;
     config.elevation_blend = 0.37;
@@ -2145,6 +2191,7 @@ static void test_config_round_trips_every_field() {
     ASSERT_TRUE(std::abs(loaded.noise_shape.frequency - original.noise_shape.frequency) < 1e-9);
     ASSERT_TRUE(loaded.noise_shape.type == original.noise_shape.type);
     ASSERT_TRUE(loaded.show_regions == original.show_regions);
+    ASSERT_TRUE(loaded.draw_landmark_marks == original.draw_landmark_marks);
     ASSERT_TRUE(loaded.composite_shading == original.composite_shading);
     ASSERT_TRUE(loaded.elevation_surface == original.elevation_surface);
     ASSERT_TRUE(std::abs(loaded.elevation_blend - original.elevation_blend) < 1e-9);
@@ -4326,6 +4373,68 @@ static void test_terrain_roughness_tapers_to_the_coast() {
 
 // --- Regions layer --------------------------------------------------------
 
+/**
+ * @brief Every cell's own site pixel carries that cell's biome colour.
+ *
+ * The correspondence an interactive readout depends on: hover a point, resolve it to a cell, name
+ * that cell's biome, and have the name match the colour on screen. `draw_biomes_()` is a flat fill
+ * per cell from `biome_color_()`, so the claim should hold -- but nothing asserted it, and "the
+ * layer paints the biome it says it does" is exactly what silently stops being true the day a
+ * shading or blending pass is added.
+ *
+ * Sampled at each cell's own SITE, which is the point furthest from the trouble: the renderer
+ * fills the subdivided noisy outline while a nearest-site lookup picks the straight Voronoi cell,
+ * and those disagree in a band along every boundary. Sampling interiors pins the colour mapping
+ * without baking that band in as if it were intended.
+ *
+ * `set_render_size` is not optional. `world_config` raises `grid_size` to 48 *after*
+ * `small_config` sized the render for a grid of 16, leaving under three pixels per cell -- at
+ * which point a truncated site pixel lands in a neighbour 12% of the time and this test measures
+ * nothing but its own sampling error. At 16 px per cell that falls to a quarter of a percent.
+ *
+ * That last fraction is not zero and the tolerance below is deliberate. Those are cells whose site
+ * sits within about a pixel of their own boundary, where `fill_triangle`'s pixel-centre coverage
+ * rule awards the pixel to whichever neighbour covers it last. Measured both with and without
+ * `subdivide_noisy_edges` and it does not move, so it is the rasteriser's coverage rule rather
+ * than the edge wobble -- which is why the bound is a small constant and not a claim about noise.
+ *
+ * `show_regions` is off because it lerps every land colour 13% toward its province's hue (see
+ * `biome_color_`), which would fail an exact palette comparison for reasons unrelated to biomes.
+ */
+static void test_biomes_layer_paints_each_cell_its_own_biome() {
+    MapConfig config = world_config(37);
+    config.show_regions = false;
+    set_render_size(config, 768);
+    MapGenerator generator(config, maps_logger());
+    generator.generate();
+    const MapGraph& graph = generator.graph();
+    ASSERT_TRUE(!graph.centers.empty());
+
+    const BiomePalette palette;
+    const Image biomes = MapLayers::biomes(graph, config, palette);
+    ASSERT_EQ(biomes.channels, 3);
+
+    const double scale =
+        static_cast<double>(config.image_size) / static_cast<double>(config.grid_size);
+    std::size_t checked = 0;
+    std::size_t mismatched = 0;
+    for (const MapCenter& center : graph.centers) {
+        const int x = static_cast<int>(center.point.x * scale);
+        const int y = static_cast<int>(center.point.y * scale);
+        // The boundary ring sits outside the image; it has no pixel to check.
+        if (x < 0 || y < 0 || x >= biomes.width || y >= biomes.height) continue;
+        // A cell too degenerate to outline paints nothing and keeps the background.
+        if (biomes.color_at(x, y) == palette.background_color) continue;
+
+        if (!(biomes.color_at(x, y) == palette.color_for(center.biome))) ++mismatched;
+        ++checked;
+    }
+
+    // Guards against the loop having skipped everything and asserted nothing.
+    ASSERT_TRUE(checked > graph.centers.size() / 2);
+    ASSERT_TRUE(mismatched * 100 <= checked);   // under 1%
+}
+
 static void test_regions_layer_draws_regions_and_borders() {
     MapConfig config = world_config(37);
     MapGenerator generator(config, maps_logger());
@@ -5619,6 +5728,7 @@ int main() {
     RUN_TEST(maps_test::test_regions_partition_the_land);
     RUN_TEST(maps_test::test_names_are_unique_and_reproducible);
     RUN_TEST(maps_test::test_population_scales_with_buildings);
+    RUN_TEST(maps_test::test_draw_landmark_marks_is_render_only);
     RUN_TEST(maps_test::test_landmarks_respect_their_biome);
     RUN_TEST(maps_test::test_cell_outline_is_closed_and_ordered);
     RUN_TEST(maps_test::test_renderers_produce_a_full_image);
@@ -5668,6 +5778,7 @@ int main() {
     RUN_TEST(maps_test::test_water_layer_draws_one_grey_over_open_sea);
     RUN_TEST(maps_test::test_elevation_interpolates_and_joins);
     RUN_TEST(maps_test::test_terrain_roughness_tapers_to_the_coast);
+    RUN_TEST(maps_test::test_biomes_layer_paints_each_cell_its_own_biome);
     RUN_TEST(maps_test::test_regions_layer_draws_regions_and_borders);
     RUN_TEST(maps_test::test_default_shape_matches_the_square_frame);
     RUN_TEST(maps_test::test_shape_names_round_trip);

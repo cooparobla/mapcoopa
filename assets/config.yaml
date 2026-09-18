@@ -149,6 +149,13 @@ png_compression_level: 8  # deflate effort when encoding a layer, 1-9. stb's own
                           # and pronounced when it is not. Pixels are identical at every
                           # level. --png-level=N overrides for one run.
 
+draw_landmark_marks: false  # paint landmark diamonds into the landmarks and composite
+                          # layers. Off because a landmark is a label, not terrain:
+                          # the map viewer draws them as interactive markers that stay
+                          # legible at any zoom and carry the name. true restores the
+                          # old output byte for byte. Town marks and cave-mouth rings
+                          # are unaffected. NOT the same as enable_landmarks, which
+                          # decides whether the map has any landmarks at all.
 show_regions: true        # tint cells by the region claiming them, so borders are visible
 region_tint: 0.13         # how strongly that tint is mixed over the biome colour, [0, 1].
                           # A tint and not a replacement: a political map that hides the

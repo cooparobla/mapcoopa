@@ -87,6 +87,54 @@ Over the map:
 | Wheel | Zoom in and out around the cursor, up to 16x |
 | Middle-drag | Pan |
 | Ctrl + 0 | Reset to fit |
+| Hover a pin | Its name and what it is |
+| Hover the map | What the current layer shows at that point |
+
+The map is annotated with hoverable pins, and hovering the terrain itself reads out whatever the
+current layer depicts. Both follow the layer:
+
+| Layer | Pins | Cursor readout |
+|---|---|---|
+| composite | towns, landmarks, caves | biome and height |
+| structures | towns | — |
+| landmarks | landmarks | — |
+| caves | caves | — |
+| biomes | — | biome |
+| elevation | — | height above sea level, or depth |
+| water | — | ocean, lake or land, with depth |
+| regions | — | region and country |
+| roads | — | — |
+
+Town pins show at any zoom; landmark and cave pins appear past 2x, because a default map has 112
+landmarks and pinning them all over a zoomed-out view buries the map under its own annotations.
+
+The **Climate** section is the highest-leverage part of the panel. Temperature is the outermost
+axis of biome classification -- it selects one of four whole sub-tables before elevation and
+moisture are consulted, and alone decides ice vs lake, mangrove vs beach vs tundra, and which
+wetland a wetland is. On the default seed, dropping Warmth to -0.5 takes a 22-biome world down to
+10 and puts ice, glacier and tundra on it; raising it to +0.5 removes every cold biome. Lapse rate
+works on the *normalised* height field, so Height (m) does not affect it -- but Sea level does,
+because a higher waterline pushes land to higher normalised elevations and so takes more cooling.
+
+There are deliberately **no moisture sliders**: moisture is derived from lakes, rivers and coast
+distance and then normalised to span the full range on every map, so nothing could make a world
+globally wetter or drier -- only its arrangement changes, through Rivers, Sea level and Lake
+thresh.
+
+A colour read off the **biomes** or **composite** layer is not the raw palette colour: `biome_color_`
+lerps every land cell 13% toward its province's hue while `show_regions` is on, which it is by
+default. Turn it off in the Render section before comparing a hovered biome name against the legend.
+Ocean and Lake also share one palette colour, so a lake correctly reads "Lake" while looking exactly
+like the sea.
+Caves have no cursor readout: a cave is a branching network underground with no point-to-cave
+lookup, so its name comes from the pin.
+
+**Landmark marks are no longer baked into the PNGs.** They are labels rather than terrain, so
+they are drawn as interactive pins that stay legible at any zoom and carry the name, and
+`draw_landmark_marks` in [`assets/config.yaml`](./assets/config.yaml) defaults to false. Setting
+it true restores the previous output byte for byte. Town marks and cave-mouth rings are
+unaffected either way, so `<prefix>_landmarks.png` keeps its meaning. This is render-only and is
+**not** `enable_landmarks`, which decides whether a map has any landmarks at all.
 
 Zoom is instant — it samples a window out of the texture already on screen — and once you
 stop, the preview re-renders at up to 4x resolution so the detail sharpens up. That costs a
@@ -114,6 +162,8 @@ SEED=251 MAX_FRAMES=400 SCREENSHOT_NAME=viewer ./build/mapcoopa_viewer   # write
 | `LAYER=name` | Start on a given layer (`composite`, `biomes`, `elevation`, …) |
 | `ZOOM=n` | Start zoomed in n times |
 | `HOVER_ROW=label` | Park the pointer on a settings row, to capture its tooltip |
+| `HOVER_MAP=x,y` | Park the pointer at a grid-space map position, to capture a pin or readout |
+| `VIEW=cx,cy` | Centre the view window in image space — the off-centre zoom cases `ZOOM=` alone cannot reach |
 | `SHAPE=name` | Select a shape (`rectangle`, `circle`, `triangle`, `continent`, `archipelago`) |
 | `SURFACE=name` | Select a surface (`interpolated`, `flat`, `blended`) |
 | `EXPAND_ALL=1` | Open every settings section, so the sidebar scrolls |
