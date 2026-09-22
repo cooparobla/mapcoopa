@@ -748,6 +748,12 @@ inline std::string metres(double m) {
     return std::to_string(static_cast<long long>(std::llround(m))) + " m";
 }
 
+/** @brief z_order for a landmark or cave pin -- above the map image, below a town. */
+constexpr int k_marker_z = 1;
+/** @brief z_order for a town pin. Settlements are what the overlay is mainly for, and on
+ *         Composite they are outnumbered five to one by landmarks, so they draw last. */
+constexpr int k_town_marker_z = 2;
+
 /**
  * @struct MarkerSpec
  * @brief One overlay pin: where it goes, how it looks, and what it says when hovered.
@@ -756,9 +762,27 @@ struct MarkerSpec {
     maps::MapPoint point;   /**< @brief Position in grid units. */
     const char*    icon;    /**< @brief IconLibrary name. */
     glm::vec4      color;
-    float          size;    /**< @brief Rendered size in canvas pixels. */
+    float          size;    /**< @brief Rendered size in canvas pixels at zoom 1. */
     std::string    text;    /**< @brief Tooltip contents. */
+    int            layer_order = k_marker_z; /**< @brief RectTransform::z_order; higher draws on top. */
 };
+
+/**
+ * @brief How much to enlarge a pin at `zoom`.
+ *
+ * A pin is sized in canvas pixels and so would keep the same on-screen size at every zoom,
+ * while the map under it -- including the settlement markers and plazas the renderer bakes
+ * into the image, in the same palette colour -- magnifies with the view and is re-rasterised
+ * at 2x or 4x (see render_scale_for()). Held fixed, a town ring is swallowed by its own
+ * town. Growing as the square root keeps the pin reading as an annotation rather than
+ * becoming a blob: 1.6x at zoom 2.5, 2x at zoom 4, and capped past that.
+ *
+ * @param zoom The current view zoom.
+ * @return A multiplier in [1, 2.5].
+ */
+inline float marker_zoom_scale(float zoom) {
+    return std::clamp(std::sqrt(std::max(1.0f, zoom)), 1.0f, 2.5f);
+}
 
 /** @brief Converts a 0-255 palette colour to the 0-1 one an Image wants. */
 inline glm::vec4 palette_color(const glm::vec3& c) {
@@ -797,6 +821,10 @@ inline LayerMarkers markers_for(maps::MapLayer layer) {
  * 112 landmarks and pinning all of them over a fully zoomed-out view buries the map under its
  * own annotations. Zooming in is the gesture that asks for detail, so that is what reveals them.
  *
+ * On a layer that shows all three, the detail pins are drawn beneath the towns
+ * (k_marker_z vs k_town_marker_z) and at k_detail_alpha, so revealing them annotates the
+ * settlements rather than crowding them out -- there are five landmarks for every town.
+ *
  * @param state Supplies the graph, config, layer and zoom.
  * @return The pins to place, in draw order.
  */
@@ -805,8 +833,11 @@ inline std::vector<MarkerSpec> build_markers(const ViewerState& state) {
     if (!state.has_map) return out;
 
     constexpr float k_detail_zoom = 2.0f;
+    constexpr float k_detail_alpha = 0.6f;
     const LayerMarkers want = markers_for(state.layer);
     const bool detail = state.zoom >= k_detail_zoom;
+    // Only dimmed where they compete with towns; on their own layers they ARE the subject.
+    const float detail_alpha = want.towns ? k_detail_alpha : 1.0f;
     const maps::MapGraph& g = state.graph;
 
     if (want.towns) {
@@ -826,7 +857,7 @@ inline std::vector<MarkerSpec> build_markers(const ViewerState& state) {
                              : town.tier == maps::TownTier::Town    ? 12.0f
                                                                     : 9.0f;
             out.push_back({town.point, "circle", palette_color(state.palette.town_color), size,
-                           std::move(text)});
+                           std::move(text), k_town_marker_z});
         }
     }
     if (want.landmarks && detail) {
@@ -851,15 +882,18 @@ inline std::vector<MarkerSpec> build_markers(const ViewerState& state) {
                             || lm.kind == maps::LandmarkKind::Shrine;
             const glm::vec3& c = built ? state.palette.landmark_built_color
                                        : state.palette.landmark_natural_color;
-            out.push_back({lm.point, "dot", palette_color(c), 10.0f, std::move(text)});
+            glm::vec4 color = palette_color(c);
+            color.a = detail_alpha;
+            out.push_back({lm.point, "dot", color, 10.0f, std::move(text)});
         }
     }
     if (want.caves && detail) {
         for (const maps::MapCave& cave : g.caves) {
             std::string text = cave.name + "  ·  cave  ·  " + metres(cave.length_m) + " of passage";
             text += "  ·  " + metres(cave.surface_at_mouth - cave.deepest) + " deep";
-            out.push_back({cave.mouth, "star", palette_color(state.palette.cave_mouth_color),
-                           11.0f, std::move(text)});
+            glm::vec4 color = palette_color(state.palette.cave_mouth_color);
+            color.a = detail_alpha;
+            out.push_back({cave.mouth, "star", color, 11.0f, std::move(text)});
         }
     }
     return out;
@@ -995,7 +1029,9 @@ inline std::string probe_text(const ViewerState& state, maps::CenterId cell,
  * @brief Places the overlay pins and updates the cursor readout for this frame.
  *
  * Pins are re-placed every frame rather than cached because zoom and pan move all of them at
- * once; the work is a couple of multiplies each across at most 256 slots.
+ * once; the work is a couple of multiplies each across at most 256 slots. Size and z_order are
+ * re-applied here too -- a pin grows with the zoom (marker_zoom_scale()) and a town's sits
+ * above the detail pins around it.
  *
  * @param state The viewer state; its pool, probe and probe_cell are updated.
  * @param map_rect The map widget's resolved rect -- where the map itself is drawn.
@@ -1008,6 +1044,7 @@ inline std::string probe_text(const ViewerState& state, maps::CenterId cell,
 inline void update_overlay(ViewerState& state, const Rect& map_rect, const Rect& parent_rect,
                            glm::vec2 cursor, bool over_map) {
     const std::vector<MarkerSpec> pins = build_markers(state);
+    const float zoom_scale = marker_zoom_scale(state.zoom);
 
     std::size_t slot = 0;
     for (const MarkerSpec& pin : pins) {
@@ -1022,7 +1059,9 @@ inline void update_overlay(ViewerState& state, const Rect& map_rect, const Rect&
         img->sprite = IconLibrary::instance().icon(pin.icon);
         img->color = pin.color;
         auto* rt = img->owner->get_component<RectTransform>();
-        rt->set_size_delta({pin.size, pin.size});
+        const float pin_size = pin.size * zoom_scale;
+        rt->set_size_delta({pin_size, pin_size});
+        rt->z_order = pin.layer_order;
         rt->set_anchored_position(image_to_canvas(state, map_rect, image) - parent_rect.min);
         state.marker_tips[slot]->text = pin.text;
         img->owner->set_active(true);
@@ -1283,8 +1322,9 @@ int main() {
                 rt->set_pivot({0.5f, 0.5f});
                 rt->set_size_delta({12.0f, 12.0f});
                 // Above the probe beneath them, so hovering a pin reports the pin and not the
-                // terrain under it.
-                rt->z_order = 1;
+                // terrain under it. update_overlay() raises a town's to k_town_marker_z each
+                // frame so settlements draw over the landmark pins around them.
+                rt->z_order = k_marker_z;
                 auto* img = pin->add_component<Image>();
                 auto* tip = pin->add_component<Tooltip>();
                 state.marker_pool.push_back(img);
