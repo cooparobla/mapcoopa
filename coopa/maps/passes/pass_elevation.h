@@ -15,12 +15,12 @@
 #include <queue>
 #include <utility>
 #include <vector>
-
 #include <coopa/debug/logger.h>
 #include <coopa/maps/map_config.h>
 #include <coopa/maps/map_data.h>
 #include <coopa/maps/passes/drainage.h>
 #include <coopa/maps/noise.h>
+#include <coopa/maps/portable_sort.h>
 
 namespace coopa {
 namespace maps {
@@ -250,7 +250,7 @@ private:
             return;
         }
 
-        std::sort(order.begin(), order.end(), [&graph](CornerId a, CornerId b) {
+        coopa::maps::sort(order.begin(), order.end(), [&graph](CornerId a, CornerId b) {
             const double ea = graph.corners[static_cast<std::size_t>(a)].elevation;
             const double eb = graph.corners[static_cast<std::size_t>(b)].elevation;
             if (ea != eb) {

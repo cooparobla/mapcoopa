@@ -40,6 +40,8 @@
 #include <coopa/maps/passes/pass_valleys.h>
 #include <coopa/maps/map_task.h>
 #include <coopa/maps/passes/pass_water.h>
+#include <coopa/maps/portable_random.h>
+#include <coopa/maps/portable_sort.h>
 
 namespace coopa {
 namespace maps {
@@ -158,7 +160,7 @@ private:
      */
     void generate_points_() {
         std::mt19937 rng(static_cast<std::mt19937::result_type>(config_.seed));
-        std::uniform_real_distribution<double> jitter(-1.0, 1.0);
+        coopa::maps::UniformRealDistribution<double> jitter(-1.0, 1.0);
 
         points_.clear();
         const int grid_size = config_.grid_size;
@@ -286,7 +288,7 @@ private:
                 continue;
             }
             const MapPoint centroid = centroid_of_(center.corners);
-            std::sort(center.corners.begin(), center.corners.end(),
+            coopa::maps::sort(center.corners.begin(), center.corners.end(),
                       [this, centroid](CornerId a, CornerId b) {
                           const MapPoint& pa = graph_.corners[static_cast<std::size_t>(a)].point;
                           const MapPoint& pb = graph_.corners[static_cast<std::size_t>(b)].point;

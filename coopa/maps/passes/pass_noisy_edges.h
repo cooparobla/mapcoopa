@@ -15,6 +15,7 @@
 #include <coopa/debug/logger.h>
 #include <coopa/maps/map_config.h>
 #include <coopa/maps/map_data.h>
+#include <coopa/maps/portable_random.h>
 
 namespace coopa {
 namespace maps {
@@ -157,7 +158,7 @@ private:
             return;
         }
 
-        std::uniform_real_distribution<double> unit(0.2, 0.8);
+        coopa::maps::UniformRealDistribution<double> unit(0.2, 0.8);
         const double p = unit(rng);
         const double q = unit(rng);
 

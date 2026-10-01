@@ -22,6 +22,8 @@
 #include <coopa/maps/map_data.h>
 #include <coopa/maps/name_generator.h>
 #include <coopa/maps/noise.h>
+#include <coopa/maps/portable_random.h>
+#include <coopa/maps/portable_sort.h>
 
 namespace coopa {
 namespace maps {
@@ -232,7 +234,7 @@ private:
             candidates.push_back(edge.index);
         }
 
-        std::sort(candidates.begin(), candidates.end(), [&grades](EdgeId a, EdgeId b) {
+        coopa::maps::sort(candidates.begin(), candidates.end(), [&grades](EdgeId a, EdgeId b) {
             const double ga = grades[static_cast<std::size_t>(a)];
             const double gb = grades[static_cast<std::size_t>(b)];
             if (ga != gb) {
@@ -334,8 +336,8 @@ private:
         cave.nodes.push_back(root);
         cave.deepest = mouth_floor;
 
-        std::uniform_real_distribution<double> unit(0.0, 1.0);
-        std::uniform_real_distribution<double> phase(-64.0, 64.0);
+        coopa::maps::UniformRealDistribution<double> unit(0.0, 1.0);
+        coopa::maps::UniformRealDistribution<double> phase(-64.0, 64.0);
 
         const double trunk_budget = meters_to_grid(config, caves.passage_length_m);
         // What it costs to climb from one table to the next at the descent grade.
@@ -595,8 +597,8 @@ private:
         }
         ++descents[next];
 
-        std::uniform_real_distribution<double> unit(0.0, 1.0);
-        std::uniform_real_distribution<double> phase(-64.0, 64.0);
+        coopa::maps::UniformRealDistribution<double> unit(0.0, 1.0);
+        coopa::maps::UniformRealDistribution<double> phase(-64.0, 64.0);
 
         Head down;
         down.point = from.point;

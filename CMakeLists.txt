@@ -60,6 +60,19 @@ target_include_directories(mapcoopa_lib INTERFACE
     ${CMAKE_CURRENT_BINARY_DIR}/configuration)
 target_link_libraries(mapcoopa_lib INTERFACE coopa::lib)
 
+# --- Cross-platform determinism (macOS) ---
+# A seed must produce the same world everywhere. coopa/maps/portable_random.h and
+# portable_sort.h remove the standard-library differences; the one left is the
+# compiler's: Apple Clang contracts a*b+c into a fused multiply-add by default,
+# which rounds differently from the separate multiply and add that GCC emits in
+# its ISO (-std=c++20) mode. Turning contraction off makes a macOS build
+# byte-identical to the Linux one (verified on map_out.yaml, --seed=42).
+# Apple-only so the Linux build's flags are exactly as before.
+if(APPLE)
+    target_compile_options(mapcoopa_lib INTERFACE
+        $<$<COMPILE_LANG_AND_ID:CXX,AppleClang,Clang>:-ffp-contract=off>)
+endif()
+
 # --- mapcoopa's own executables/tests. Guarded so a consumer that pulls this
 # repo in via add_subdirectory() gets only the coopa::maps target above -- not
 # a second `mapcoopa`/`mapcoopa_tests` binary or ctest entry mixed into its own

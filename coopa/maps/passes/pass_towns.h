@@ -24,6 +24,8 @@
 #include <coopa/maps/map_config.h>
 #include <coopa/maps/map_data.h>
 #include <coopa/maps/name_generator.h>
+#include <coopa/maps/portable_random.h>
+#include <coopa/maps/portable_sort.h>
 
 namespace coopa {
 namespace maps {
@@ -67,7 +69,7 @@ public:
         // of the river sources, which draw from the same value.
         seed_ = config.seed;
         std::mt19937 rng(static_cast<std::mt19937::result_type>(config.seed) + k_seed_offset);
-        std::uniform_real_distribution<double> jitter(-towns.score_jitter, towns.score_jitter);
+        coopa::maps::UniformRealDistribution<double> jitter(-towns.score_jitter, towns.score_jitter);
 
         const double mean_area = mean_land_area_(graph);
         std::vector<CenterId> candidates;
@@ -84,7 +86,7 @@ public:
             candidates.push_back(center.index);
         }
 
-        std::sort(candidates.begin(), candidates.end(), [&scores](CenterId a, CenterId b) {
+        coopa::maps::sort(candidates.begin(), candidates.end(), [&scores](CenterId a, CenterId b) {
             return scores[static_cast<std::size_t>(a)] > scores[static_cast<std::size_t>(b)];
         });
 
@@ -347,7 +349,7 @@ private:
 
         if (streets.empty()) {
             std::vector<CornerId> by_distance = center.corners;
-            std::sort(by_distance.begin(), by_distance.end(),
+            coopa::maps::sort(by_distance.begin(), by_distance.end(),
                       [&graph, &center](CornerId a, CornerId b) {
                           return center.point.distance_to(graph.corners[static_cast<std::size_t>(a)].point)
                                > center.point.distance_to(graph.corners[static_cast<std::size_t>(b)].point);
@@ -475,7 +477,7 @@ private:
         for (std::size_t i = 0; i < order.size(); ++i) {
             order[i] = i;
         }
-        std::sort(order.begin(), order.end(), [&town, &heart](std::size_t a, std::size_t b) {
+        coopa::maps::sort(order.begin(), order.end(), [&town, &heart](std::size_t a, std::size_t b) {
             return heart.distance_to(town.buildings[a].point)
                  < heart.distance_to(town.buildings[b].point);
         });
@@ -692,7 +694,7 @@ private:
         // rock holds fewer people than one on grassland.
         const double land = 0.7 + 0.3 * biome_habitability(center.biome);
 
-        std::uniform_int_distribution<int> occupants(towns.household_size_min,
+        coopa::maps::UniformIntDistribution<int> occupants(towns.household_size_min,
                                                      towns.household_size_max);
         double total = 0.0;
         for (int household = 0; household < town.households; ++household) {
@@ -860,11 +862,11 @@ private:
             return;
         }
 
-        std::uniform_real_distribution<double> offset_jitter(-layout.position_jitter,
+        coopa::maps::UniformRealDistribution<double> offset_jitter(-layout.position_jitter,
                                                              layout.position_jitter);
-        std::uniform_real_distribution<double> yaw_jitter(-layout.rotation_jitter,
+        coopa::maps::UniformRealDistribution<double> yaw_jitter(-layout.rotation_jitter,
                                                           layout.rotation_jitter);
-        std::uniform_real_distribution<double> pick_size(layout.building_min,
+        coopa::maps::UniformRealDistribution<double> pick_size(layout.building_min,
                                                          layout.building_max);
 
         for (const MapStreet& street : streets) {
@@ -940,12 +942,12 @@ private:
             max_y = std::max(max_y, point.y);
         }
 
-        std::uniform_real_distribution<double> pick_x(min_x, max_x);
-        std::uniform_real_distribution<double> pick_y(min_y, max_y);
-        std::uniform_real_distribution<double> pick_yaw(0.0, k_two_pi);
-        std::uniform_real_distribution<double> yaw_jitter(-layout.rotation_jitter,
+        coopa::maps::UniformRealDistribution<double> pick_x(min_x, max_x);
+        coopa::maps::UniformRealDistribution<double> pick_y(min_y, max_y);
+        coopa::maps::UniformRealDistribution<double> pick_yaw(0.0, k_two_pi);
+        coopa::maps::UniformRealDistribution<double> yaw_jitter(-layout.rotation_jitter,
                                                           layout.rotation_jitter);
-        std::uniform_real_distribution<double> pick_size(layout.building_min,
+        coopa::maps::UniformRealDistribution<double> pick_size(layout.building_min,
                                                          layout.building_max);
 
         // Bounded: a cell too cramped to hold another building would otherwise

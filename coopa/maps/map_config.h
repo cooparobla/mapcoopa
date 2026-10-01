@@ -19,6 +19,7 @@
 #include <noise/FastNoiseLite.h>
 
 #include <coopa/maps/biome.h>
+#include <coopa/maps/portable_random.h>
 
 namespace coopa {
 namespace maps {
@@ -1833,8 +1834,8 @@ private:
                                               (k_shape_reference_grid / grid_)));
 
         std::mt19937 rng(static_cast<std::mt19937::result_type>(config.seed) + k_shape_seed_offset);
-        std::uniform_real_distribution<double> unit(0.0, 1.0);
-        std::uniform_real_distribution<double> turn(0.0, 2.0 * 3.14159265358979323846);
+        coopa::maps::UniformRealDistribution<double> unit(0.0, 1.0);
+        coopa::maps::UniformRealDistribution<double> turn(0.0, 2.0 * 3.14159265358979323846);
 
         blobs_.reserve(static_cast<std::size_t>(count));
         for (int i = 0; i < count; ++i) {
@@ -1871,8 +1872,8 @@ private:
      * @param turn A `[0, 2*pi)` distribution over `rng`.
      */
     void place_(ShapeBlob& blob, double limit, std::mt19937& rng,
-                std::uniform_real_distribution<double>& unit,
-                std::uniform_real_distribution<double>& turn) const {
+                coopa::maps::UniformRealDistribution<double>& unit,
+                coopa::maps::UniformRealDistribution<double>& turn) const {
         if (limit <= 0.0 || blobs_.empty()) {
             // Nowhere to go, or nothing to stay away from: sample once so the
             // stream advances identically either way.

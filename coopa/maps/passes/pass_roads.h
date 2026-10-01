@@ -16,11 +16,11 @@
 #include <string>
 #include <utility>
 #include <vector>
-
 #include <coopa/debug/logger.h>
 #include <coopa/maps/biome.h>
 #include <coopa/maps/map_config.h>
 #include <coopa/maps/map_data.h>
+#include <coopa/maps/portable_sort.h>
 
 namespace coopa {
 namespace maps {
@@ -277,7 +277,7 @@ private:
             candidates.push_back(center.index);
         }
 
-        std::sort(candidates.begin(), candidates.end(), [&scores](CenterId a, CenterId b) {
+        coopa::maps::sort(candidates.begin(), candidates.end(), [&scores](CenterId a, CenterId b) {
             const double sa = scores[static_cast<std::size_t>(a)];
             const double sb = scores[static_cast<std::size_t>(b)];
             if (sa != sb) {
@@ -349,7 +349,7 @@ private:
                 links.push_back({i, j, a.distance_to(b)});
             }
         }
-        std::sort(links.begin(), links.end(), [](const Link& a, const Link& b) {
+        coopa::maps::sort(links.begin(), links.end(), [](const Link& a, const Link& b) {
             if (a.separation != b.separation) {
                 return a.separation > b.separation;
             }

@@ -21,6 +21,7 @@
 #include <coopa/maps/map_config.h>
 #include <coopa/maps/map_data.h>
 #include <coopa/maps/name_generator.h>
+#include <coopa/maps/portable_random.h>
 #include <coopa/maps/region.h>
 
 namespace coopa {
@@ -109,7 +110,7 @@ private:
             return {};
         }
 
-        std::shuffle(land.begin(), land.end(), rng);
+        coopa::maps::shuffle(land.begin(), land.end(), rng);
         std::vector<CenterId> seeds;
         double spacing = min_spacing;
 
@@ -278,7 +279,7 @@ private:
 
             const int wanted = std::max(1, std::min(settings.regions_per_country,
                                                     static_cast<int>(owned.size())));
-            std::shuffle(owned.begin(), owned.end(), rng);
+            coopa::maps::shuffle(owned.begin(), owned.end(), rng);
             const std::vector<CenterId> seeds(owned.begin(), owned.begin() + wanted);
 
             // Region ids are per-country during the fill, then remapped to the

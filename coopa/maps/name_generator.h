@@ -15,6 +15,8 @@
 #include <string>
 #include <vector>
 
+#include <coopa/maps/portable_random.h>
+
 namespace coopa {
 namespace maps {
 
@@ -96,7 +98,7 @@ inline const std::vector<std::string>& name_suffix_pool() {
 inline std::vector<std::string> draw_subset(const std::vector<std::string>& pool, std::size_t count,
                                             std::mt19937& rng) {
     std::vector<std::string> shuffled = pool;
-    std::shuffle(shuffled.begin(), shuffled.end(), rng);
+    coopa::maps::shuffle(shuffled.begin(), shuffled.end(), rng);
     shuffled.resize(std::min(count, shuffled.size()));
     return shuffled;
 }
@@ -122,11 +124,11 @@ inline std::string capitalise(std::string text) {
  * @return A language ready to generate names.
  */
 inline Language make_language(std::mt19937& rng) {
-    std::uniform_int_distribution<std::size_t> onset_count(5, 9);
-    std::uniform_int_distribution<std::size_t> nucleus_count(4, 7);
-    std::uniform_int_distribution<std::size_t> coda_count(4, 8);
-    std::uniform_int_distribution<std::size_t> affix_count(3, 6);
-    std::uniform_real_distribution<double> chance(0.2, 0.45);
+    coopa::maps::UniformIntDistribution<std::size_t> onset_count(5, 9);
+    coopa::maps::UniformIntDistribution<std::size_t> nucleus_count(4, 7);
+    coopa::maps::UniformIntDistribution<std::size_t> coda_count(4, 8);
+    coopa::maps::UniformIntDistribution<std::size_t> affix_count(3, 6);
+    coopa::maps::UniformRealDistribution<double> chance(0.2, 0.45);
 
     Language language;
     language.onsets = detail::draw_subset(detail::name_onset_pool(), onset_count(rng), rng);
@@ -152,16 +154,16 @@ inline Language make_language(std::mt19937& rng) {
  */
 inline Language derive_dialect(const Language& parent, std::mt19937& rng) {
     Language dialect = parent;
-    std::uniform_int_distribution<std::size_t> pick(0, 2);
+    coopa::maps::UniformIntDistribution<std::size_t> pick(0, 2);
 
     for (std::size_t swaps = pick(rng) + 1; swaps > 0 && !dialect.onsets.empty(); --swaps) {
-        std::uniform_int_distribution<std::size_t> slot(0, dialect.onsets.size() - 1);
-        std::uniform_int_distribution<std::size_t> source(0, detail::name_onset_pool().size() - 1);
+        coopa::maps::UniformIntDistribution<std::size_t> slot(0, dialect.onsets.size() - 1);
+        coopa::maps::UniformIntDistribution<std::size_t> source(0, detail::name_onset_pool().size() - 1);
         dialect.onsets[slot(rng)] = detail::name_onset_pool()[source(rng)];
     }
     if (!dialect.codas.empty()) {
-        std::uniform_int_distribution<std::size_t> slot(0, dialect.codas.size() - 1);
-        std::uniform_int_distribution<std::size_t> source(0, detail::name_coda_pool().size() - 1);
+        coopa::maps::UniformIntDistribution<std::size_t> slot(0, dialect.codas.size() - 1);
+        coopa::maps::UniformIntDistribution<std::size_t> source(0, detail::name_coda_pool().size() - 1);
         dialect.codas[slot(rng)] = detail::name_coda_pool()[source(rng)];
     }
     return dialect;
@@ -212,10 +214,10 @@ namespace detail {
 inline std::string generate_name_once(const Language& language, std::mt19937& rng) {
 
     const auto pick = [&rng](const std::vector<std::string>& from) -> const std::string& {
-        std::uniform_int_distribution<std::size_t> index(0, from.size() - 1);
+        coopa::maps::UniformIntDistribution<std::size_t> index(0, from.size() - 1);
         return from[index(rng)];
     };
-    std::uniform_real_distribution<double> roll(0.0, 1.0);
+    coopa::maps::UniformRealDistribution<double> roll(0.0, 1.0);
 
     // At most one affix. Allowing both produces names like
     // "Deepwiokdeomdeivmere" -- individually plausible pieces that no one would
@@ -232,7 +234,7 @@ inline std::string generate_name_once(const Language& language, std::mt19937& rn
     // An affix already carries a syllable, so the stem gives one back.
     const int upper = std::max(language.min_syllables,
                                language.max_syllables - ((take_prefix || take_suffix) ? 1 : 0));
-    std::uniform_int_distribution<int> syllables(language.min_syllables, upper);
+    coopa::maps::UniformIntDistribution<int> syllables(language.min_syllables, upper);
     const int count = syllables(rng);
 
     for (int i = 0; i < count; ++i) {

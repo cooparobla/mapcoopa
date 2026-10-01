@@ -12,10 +12,10 @@
 #include <numeric>
 #include <queue>
 #include <vector>
-
 #include <coopa/debug/logger.h>
 #include <coopa/maps/map_config.h>
 #include <coopa/maps/map_data.h>
+#include <coopa/maps/portable_sort.h>
 
 namespace coopa {
 namespace maps {
@@ -107,7 +107,7 @@ private:
 
         std::vector<CornerId> order(count);
         std::iota(order.begin(), order.end(), static_cast<CornerId>(0));
-        std::sort(order.begin(), order.end(), [&graph](CornerId a, CornerId b) {
+        coopa::maps::sort(order.begin(), order.end(), [&graph](CornerId a, CornerId b) {
             return graph.corners[static_cast<std::size_t>(a)].moisture
                  < graph.corners[static_cast<std::size_t>(b)].moisture;
         });

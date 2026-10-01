@@ -20,6 +20,8 @@
 #include <coopa/maps/map_config.h>
 #include <coopa/maps/map_data.h>
 #include <coopa/maps/name_generator.h>
+#include <coopa/maps/portable_random.h>
+#include <coopa/maps/portable_sort.h>
 
 namespace coopa {
 namespace maps {
@@ -104,7 +106,7 @@ private:
             candidates.push_back({center.index, kind, kind_priority_(kind), center.elevation});
         }
 
-        std::sort(candidates.begin(), candidates.end(),
+        coopa::maps::sort(candidates.begin(), candidates.end(),
                   [](const Candidate& a, const Candidate& b) {
                       if (a.priority != b.priority) {
                           return a.priority < b.priority;
@@ -311,7 +313,7 @@ private:
                 candidates.push_back(center.index);
             }
         }
-        std::shuffle(candidates.begin(), candidates.end(), rng);
+        coopa::maps::shuffle(candidates.begin(), candidates.end(), rng);
 
         static const LandmarkKind kinds[] = {LandmarkKind::Ruins, LandmarkKind::StandingStones,
                                              LandmarkKind::Monolith, LandmarkKind::Wreck,
@@ -337,7 +339,7 @@ private:
             if (allowed.empty()) {
                 continue;
             }
-            std::uniform_int_distribution<std::size_t> pick(0, allowed.size() - 1);
+            coopa::maps::UniformIntDistribution<std::size_t> pick(0, allowed.size() - 1);
             place_(graph, center, allowed[pick(rng)], taken, rng);
             ++placed;
         }

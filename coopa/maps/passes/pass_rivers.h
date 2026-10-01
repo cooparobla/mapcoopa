@@ -16,6 +16,7 @@
 #include <coopa/debug/logger.h>
 #include <coopa/maps/map_config.h>
 #include <coopa/maps/map_data.h>
+#include <coopa/maps/portable_random.h>
 
 namespace coopa {
 namespace maps {
@@ -47,7 +48,7 @@ public:
         }
 
         std::mt19937 rng(static_cast<std::mt19937::result_type>(config.seed));
-        std::uniform_int_distribution<std::size_t> pick(0, graph.corners.size() - 1);
+        coopa::maps::UniformIntDistribution<std::size_t> pick(0, graph.corners.size() - 1);
 
         // The original retried a rejected source by decrementing its loop
         // counter, which spins forever on a map with no land in the accepted

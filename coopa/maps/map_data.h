@@ -17,13 +17,13 @@
 #include <vector>
 
 #include <glm/glm.hpp>
-
 #include <coopa/maps/biome.h>
 #include <coopa/maps/building.h>
 #include <coopa/maps/cave.h>
 #include <coopa/maps/landmark.h>
 #include <coopa/maps/map_config.h>
 #include <coopa/maps/noise.h>
+#include <coopa/maps/portable_sort.h>
 
 namespace coopa {
 namespace maps {
@@ -83,7 +83,7 @@ inline void sort_points_radially(std::vector<MapPoint>& points) {
     const double count = static_cast<double>(points.size());
     const MapPoint centroid{sum_x / count, sum_y / count};
 
-    std::sort(points.begin(), points.end(), [centroid](const MapPoint& a, const MapPoint& b) {
+    coopa::maps::sort(points.begin(), points.end(), [centroid](const MapPoint& a, const MapPoint& b) {
         return std::atan2(a.y - centroid.y, a.x - centroid.x)
              < std::atan2(b.y - centroid.y, b.x - centroid.x);
     });

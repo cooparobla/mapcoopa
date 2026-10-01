@@ -9,6 +9,11 @@
 #include <utility>
 #include <vector>
 
+// coopa patch: libstdc++-order sort, so exact-duplicate points (the only ties
+// `compare` can produce) resolve identically on every platform. See
+// coopa/maps/portable_sort.h.
+#include <coopa/maps/portable_sort.h>
+
 namespace delaunator {
 
 //@see https://stackoverflow.com/questions/33333363/built-in-mod-vs-custom-mod-function-improve-the-performance-of-modulus-op/33333636#33333636
@@ -303,7 +308,7 @@ Delaunator::Delaunator(std::vector<double> const& in_coords)
     std::tie(m_center_x, m_center_y) = circumcenter(i0x, i0y, i1x, i1y, i2x, i2y);
 
     // sort the points by distance from the seed triangle circumcenter
-    std::sort(ids.begin(), ids.end(), compare{ coords, m_center_x, m_center_y });
+    coopa::maps::sort(ids.begin(), ids.end(), compare{ coords, m_center_x, m_center_y });
 
     // initialize a hash table for storing edges of the advancing convex hull
     m_hash_size = static_cast<std::size_t>(std::llround(std::ceil(std::sqrt(n))));
