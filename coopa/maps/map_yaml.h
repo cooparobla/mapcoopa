@@ -13,6 +13,7 @@
 #include <vector>
 
 #include <fkYAML/node.hpp>
+#include <coopa/yaml/document.h>
 #include <glm/glm.hpp>
 
 #include <coopa/collections/yaml_map.h>
@@ -833,8 +834,8 @@ struct ConfigLoadResult {
 inline ConfigLoadResult load_config(const std::string& path, MapConfig& out_config) {
     ConfigLoadResult result;
 
-    std::ifstream file(path);
-    if (!file) {
+    const std::filesystem::path resolved = coopa::yaml::resolve_variant(path);
+    if (!std::filesystem::exists(resolved)) {
         result.status = ConfigLoad::NotFound;
         result.message = "no configuration file at '" + path + "'";
         return result;
@@ -842,7 +843,7 @@ inline ConfigLoadResult load_config(const std::string& path, MapConfig& out_conf
 
     fkyaml::node root;
     try {
-        root = fkyaml::node::deserialize(file);
+        root = coopa::yaml::load_document(resolved);
     } catch (const std::exception& error) {
         result.status = ConfigLoad::Malformed;
         result.message = "could not parse '" + path + "': " + error.what();
