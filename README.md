@@ -1,1099 +1,279 @@
 # mapcoopa
 
-`mapcoopa` is a header-only C++ world generator: a seed and a `MapConfig` in, a whole
-`MapGraph` out — Voronoi cells carrying an elevation, a climate and one of 33 biomes,
-threaded with rivers that run downhill to the sea and a road network routed between the
-places worth travelling between — graded highway, road and trail by the traffic each
-stretch carries, bridging the rivers it crosses; nations divided into provinces whose
-borders settle on ridgelines and coasts; settlements
-placed where people would actually live, each with a population counted from its buildings
-and a name in its region's own invented language; and landmarks read off the terrain
-itself. It is a port of Amit Patel's *Polygonal Map Generation*
-([Red Blob Games](https://www.redblobgames.com/maps/mapgen2/)).
+**A seeded, header-only C++20 generator for whole fantasy worlds.**
 
-The world has a **scale**: 60 metres to a grid cell, so the default map is 4.8 km square,
-and every physical size — a 6 m road, a 10 m cottage, a 5 m stream — is configured in
-metres. Rendered at the default one pixel per metre, a width measured off a PNG is a
-measurement of the ground.
+mapcoopa turns a seed and a `MapConfig` into a `MapGraph`: Voronoi cells with elevation,
+climate and one of 33 biomes, rivers that run downhill to the sea, a graded road network,
+nations and provinces, named settlements with streets and buildings, landmarks, and
+multi-level cave systems. It produces data, not pixels. The graph saves to YAML so a game
+can load a world it did not generate, and a software renderer draws nine PNG layers for
+inspection. It is a port and extension of Amit Patel's
+[Polygonal Map Generation](https://www.redblobgames.com/maps/mapgen2/).
 
-It produces **data**, not pixels: nothing here touches Vulkan, GLFW or any sibling repo
-other than [`libcoopa`](../libcoopa), which it uses for exactly two headers
-(`coopa/collections/yaml_map.h` and `coopa/debug/logger.h`). The two PNG renderers are a
-software-only debugging convenience; the deliverable is the `MapGraph`, and
-`coopa/maps/map_yaml.h` writes one to disk so a game can load a world it did not generate.
+![The default world (seed 42): the composite layer, lit by elevation](docs/images/layer_composite.jpg)
 
-Everything is reproducible: a `MapConfig` plus its `seed` fully determines the output,
-byte for byte, including the settlements and the wobble on every coastline.
+<table>
+  <tr>
+    <td><img src="docs/images/layer_elevation.jpg" alt="Elevation layer"></td>
+    <td><img src="docs/images/layer_biomes.jpg" alt="Biomes layer"></td>
+    <td><img src="docs/images/layer_regions.jpg" alt="Regions layer"></td>
+  </tr>
+  <tr>
+    <td align="center"><sub><b>elevation</b>: ground height, sea bed included</sub></td>
+    <td align="center"><sub><b>biomes</b>: flat biome colour</sub></td>
+    <td align="center"><sub><b>regions</b>: provinces of five nations</sub></td>
+  </tr>
+  <tr>
+    <td><img src="docs/images/layer_water.jpg" alt="Water surface layer"></td>
+    <td><img src="docs/images/layer_caves.jpg" alt="Cave overview layer"></td>
+    <td><img src="docs/images/closeup_settlement.jpg" alt="Close-up of a settlement at one pixel per metre"></td>
+  </tr>
+  <tr>
+    <td align="center"><sub><b>water</b>: sea, lake and river surface height</sub></td>
+    <td align="center"><sub><b>caves</b>: systems coloured by depth</sub></td>
+    <td align="center"><sub><b>close-up</b>: a settlement at 1 px per metre</sub></td>
+  </tr>
+</table>
 
-Full module documentation, the data-flow diagram and a usage example live in
-[**`coopa/maps/README.md`**](./coopa/maps/README.md); the twelve generation stages are
-documented in [`coopa/maps/passes/README.md`](./coopa/maps/passes/README.md).
+All images are cropped from the `map_out_*.png` renders at the repository root, which the
+`mapcoopa` tool writes with the shipped settings.
 
----
+## Features
 
-## Generating a map
+### Terrain and climate
+- **Real scale.** One grid cell is 60 m, so the default map is 4.8 km square. Every
+  physical size in the config is in metres, and the default render is one pixel per metre.
+- **Landmass shapes.** Rectangle, circle, triangle, a single irregular continent, or an
+  archipelago of landmasses that fuse when they land close together.
+- **Elevation.** Distance from the coast blended with fractal relief, with a real sea
+  level, a sea bed, and a vertical scale in metres (`elevation_range_m`).
+- **Climate and biomes.** Temperature from latitude, altitude, noise and a global offset,
+  with independent polar caps. Moisture from water and coast distance. 33 biomes from a
+  three-axis Whittaker table.
 
-`cbuild` configures and builds; `cplay` runs `./build/mapcoopa` — the generator — and
-forwards its arguments verbatim.
+### Water
+- **Rivers that reach water.** Pits are filled so every river ends in a lake or the sea.
+  River surfaces only fall, agree at confluences, and open into estuaries at the coast.
+- **Valleys and channels.** Rivers cut a valley into the height mesh and a channel at
+  their true width into the sampled surface.
+- **Water as data.** `MapCenter::water_level` gives a flat surface per lake or sea, ready
+  for a water mesh.
 
-```bash
-cd libs/mapcoopa
-cbuild
-cplay --seed=42 --out=world
-```
+### People and places
+- **Roads.** Routed between hubs and graded into trail, road and highway by the traffic
+  each stretch carries, with bridges where they cross rivers.
+- **Nations and provinces.** Countries split into regions, each with its own invented
+  language and dialect for naming places.
+- **Settlements.** Capitals, towns and villages with streets, a market square, civic
+  buildings and dwellings that front the streets and stay off the roadway.
+- **Landmarks.** Peaks, volcanoes, waterfalls, canyons, oases, hot springs, ruins,
+  standing stones, towers, shrines and more, placed only where the terrain suits them.
+- **Caves.** Multi-level systems that open on the steepest slopes, grow by vadose and
+  phreatic rules, and never break the surface.
 
-That writes `world.yaml` and seven PNG layers into the current directory. Settings come from [`assets/config.yaml`](./assets/config.yaml); flags override
-it for one run. With no `--seed` on either, the generator draws one from system entropy and
-prints it, so every run differs but stays reproducible afterwards.
+### Engineering
+- **Deterministic.** A `MapConfig` and its seed fully determine the output, byte for
+  byte, on Linux and macOS.
+- **Header-only.** One CMake target, `coopa::maps`. No graphics dependency.
+- **Async and parallel.** Optional `JobEngine` injection for background generation and
+  parallel export, with output identical to a serial run.
+- **Save and load.** `save_map()` / `load_map()` round-trip the whole graph and its config
+  through YAML.
 
-`cbuild` wipes `build/` and reconfigures every time. For a fast iteration loop after the
-first build:
+## Getting started
 
-```bash
-cmake --build build && ./build/mapcoopa --out=world
-```
+### 1. Clone
 
-### The GUI viewer
-
-`./build/mapcoopa_viewer` is the same generator behind a window: a collapsible panel of the
-settings that most change what a map looks like, a Refresh button, a picker for all nine
-layers, and a File menu that imports and exports `.yaml` and `.png`.
-
-```bash
-cbuild
-./build/mapcoopa_viewer
-```
-
-It starts from exactly the settings the CLI starts from — the same tool defaults, the same
-[`assets/config.yaml`](./assets/config.yaml) — so the same seed gives the same map in both.
-Editing a control changes nothing until you press **Refresh**; switching layers re-renders
-from the map already generated, without regenerating it. The settings sections scroll when
-more of them are open than fit; Refresh and the progress bar stay pinned below them. Hovering
-any setting shows what it does — the text comes from that field's own documentation in
-[`coopa/maps/map_config.h`](./coopa/maps/map_config.h), which stays the source of truth.
-
-The **Shape** and **Surface** dropdowns change which rows appear below them, so the panel only
-ever offers settings the current choice actually reads: a rectangle shows width and height and
-no landmass count, an archipelago shows all six of its knobs, and the blur controls appear only
-under the `blended` surface — the other two surfaces are sampling rules with no settings of
-their own. Roughness deliberately stays visible in every surface mode: it stops texturing the
-drawn ground under `flat` and `blended`, but still shapes river channels, water surfaces and
-cave floors.
-
-Over the map:
-
-| Input | Effect |
-|---|---|
-| Wheel | Zoom in and out around the cursor, up to 16x |
-| Middle-drag | Pan |
-| Ctrl + 0 | Reset to fit |
-| Hover a pin | Its name and what it is |
-| Hover the map | What the current layer shows at that point |
-
-The map is annotated with hoverable pins, and hovering the terrain itself reads out whatever the
-current layer depicts. Both follow the layer:
-
-| Layer | Pins | Cursor readout |
-|---|---|---|
-| composite | towns, landmarks, caves | biome and height |
-| structures | towns | — |
-| landmarks | landmarks | — |
-| caves | caves | — |
-| biomes | — | biome |
-| elevation | — | height above sea level, or depth |
-| water | — | ocean, lake or land, with depth |
-| regions | — | region and country |
-| roads | — | — |
-
-Town pins show at any zoom; landmark and cave pins appear past 2x, because a default map has 112
-landmarks and pinning them all over a zoomed-out view buries the map under its own annotations.
-
-The **Climate** section is the highest-leverage part of the panel. Temperature is the outermost
-axis of biome classification -- it selects one of four whole sub-tables before elevation and
-moisture are consulted, and alone decides ice vs lake, mangrove vs beach vs tundra, and which
-wetland a wetland is. On the default seed, dropping Warmth to -0.5 takes a 22-biome world down to
-10 and puts ice, glacier and tundra on it; raising it to +0.5 removes every cold biome. Lapse rate
-works on the *normalised* height field, so Height (m) does not affect it -- but Sea level does,
-because a higher waterline pushes land to higher normalised elevations and so takes more cooling.
-
-There are deliberately **no moisture sliders**: moisture is derived from lakes, rivers and coast
-distance and then normalised to span the full range on every map, so nothing could make a world
-globally wetter or drier -- only its arrangement changes, through Rivers, Sea level and Lake
-thresh.
-
-A colour read off the **biomes** or **composite** layer is not the raw palette colour: `biome_color_`
-lerps every land cell 13% toward its province's hue while `show_regions` is on, which it is by
-default. Turn it off in the Render section before comparing a hovered biome name against the legend.
-Ocean and Lake also share one palette colour, so a lake correctly reads "Lake" while looking exactly
-like the sea.
-Caves have no cursor readout: a cave is a branching network underground with no point-to-cave
-lookup, so its name comes from the pin.
-
-**Landmark marks are no longer baked into the PNGs.** They are labels rather than terrain, so
-they are drawn as interactive pins that stay legible at any zoom and carry the name, and
-`draw_landmark_marks` in [`assets/config.yaml`](./assets/config.yaml) defaults to false. Setting
-it true restores the previous output byte for byte. Town marks and cave-mouth rings are
-unaffected either way, so `<prefix>_landmarks.png` keeps its meaning. This is render-only and is
-**not** `enable_landmarks`, which decides whether a map has any landmarks at all.
-
-Zoom is instant — it samples a window out of the texture already on screen — and once you
-stop, the preview re-renders at up to 4x resolution so the detail sharpens up. That costs a
-full re-render of the whole map: mapcoopa has no way to rasterise just a sub-region (its
-render slices are row bands, which clip rather than translate), so a 4x view renders sixteen
-times the pixels it displays. The preview is capped at 4096px for that reason, and the export
-size is never affected. What you see is rendered at a
-smaller preview resolution than `image_size` (a default map is 4800px square, which is
-seconds of rasterising); every export still uses the full configured size.
-
-It honours the scripted-capture environment variables every uicoopa demo does, so it can be
-driven without a human at the window:
+mapcoopa builds on [libcoopa](https://github.com/cooparobla/libcoopa) (logging, YAML, job
+system, and through it glm and fkYAML). CMake expects libcoopa as a **sibling directory**,
+`../libcoopa`:
 
 ```bash
-SEED=251 MAX_FRAMES=400 SCREENSHOT_NAME=viewer ./build/mapcoopa_viewer   # writes output/viewer.png
+mkdir coopa && cd coopa
+git clone git@github.com:cooparobla/libcoopa.git
+git clone git@github.com:cooparobla/mapcoopa.git
 ```
 
-| Variable | Effect |
-|---|---|
-| `SEED=N` | Start on a given seed instead of `config.yaml`'s or a random one |
-| `THEME=name` | A uicoopa theme from `libs/uicoopa/assets/themes` (`dark`, `light`) |
-| `MAX_FRAMES=N` | Exit after N frames |
-| `ONESHOT=1` | Render a single frame and exit |
-| `SCREENSHOT_NAME=x` | Write `output/x.png` on exit |
-| `LAYER=name` | Start on a given layer (`composite`, `biomes`, `elevation`, …) |
-| `ZOOM=n` | Start zoomed in n times |
-| `HOVER_ROW=label` | Park the pointer on a settings row, to capture its tooltip |
-| `HOVER_MAP=x,y` | Park the pointer at a grid-space map position, to capture a pin or readout |
-| `VIEW=cx,cy` | Centre the view window in image space — the off-centre zoom cases `ZOOM=` alone cannot reach |
-| `SHAPE=name` | Select a shape (`rectangle`, `circle`, `triangle`, `continent`, `archipelago`) |
-| `SURFACE=name` | Select a surface (`interpolated`, `flat`, `blended`) |
-| `EXPAND_ALL=1` | Open every settings section, so the sidebar scrolls |
-| `COLLAPSE=1` | Start with the sidebar folded to its rail |
-| `OPEN_MENU=1` | Start with the File menu open |
-| `OPEN_PICKER=1` | Start with the file browser open |
+### 2. Build
 
-The viewer needs the sibling `libs/uicoopa` checkout (and, through it, gfxcoopa and a
-Vulkan driver). It is built by default when that is present and skipped with a status
-message when it is not; `-DMAPCOOPA_WITH_VIEWER=OFF` skips it explicitly. The library target
-`coopa::maps` is unaffected either way — it still depends on nothing but libcoopa, and a
-consumer that pulls this repo in via `add_subdirectory()` never sees the viewer at all.
+You need CMake 3.20+ and a C++20 compiler.
 
-### Options
-
-| Flag | Default | Effect |
-|---|---|---|
-| `--seed=N` | random, printed | Master seed; reproduces a map exactly |
-| `--grid-size=N` | 80 | Cells per axis. The island noise frequency scales with this, so a bigger map resolves more finely instead of fragmenting |
-| `--image-size=N` | 4800 | Render size in pixels, square. Back-computes `meters_per_pixel`, so the two cannot disagree — see [Scale](#scale) |
-| `--rivers=N` | 55 | River sources to attempt |
-| `--towns=N` | 28 | Settlements to place |
-| `--road-hubs=N` | 32 | Places the road network is routed between |
-| `--countries=N` | 5 | Nations to carve out |
-| `--regions=N` | 3 | Provinces per nation |
-| `--no-regions` | — | Skip political geography entirely |
-| `--no-landmarks` | — | Skip notable places |
-| `--caves=N` | 18 | Cave systems to open, on the map's steepest slopes |
-| `--cave-depth=M` | 260 | Hard cap on how far below its mouth a system may reach, in metres |
-| `--cave-grade=F` | 0.25 | Steepness a slope needs to bear a cave; rise over run. A floor beneath a ranking — mouths land far above it |
-| `--no-caves` | — | Skip caves entirely |
-| `--no-roads` | — | Skip the road network |
-| `--no-subdivide` | — | Straight cell boundaries instead of wobbled ones |
-| `--out=PATH` | `map_out` | Output prefix |
-| `--config=PATH` | `assets/config.yaml` | Settings file to read before applying flags |
-| `--shading=MODE` | `elevation` | Composite lighting: `elevation` or `hillshade` |
-| `--threads=N` | 0 (all cores) | Worker threads; `1` runs everything serially |
-| `--png-level=N` | 8 | PNG deflate effort, 1–9; lower is faster and larger |
-
-Every default above comes from `assets/config.yaml`, not from the binary — see
-**Configuration**. At the default `--grid-size=80` the YAML lands around 15 MB.
-
-## Configuration
-
-[`assets/config.yaml`](./assets/config.yaml) holds every knob the generator has: the world
-scale, the sampling grid, both noise fields, the terrain and climate curves, rivers, the
-road network, settlements, political geography, landmarks, and the thirteen pass toggles.
-
-### Scale
-
-Two numbers give the world its size, and make every other measurement in the file mean
-something:
-
-```
-world extent = grid_size x meters_per_grid_unit = 80 x 60 m = 4.8 km square
-render size  = world extent / meters_per_pixel  = 4800 / 1  = 4800 px square
+```bash
+cd mapcoopa
+cmake -B build && cmake --build build -j
 ```
 
-`meters_per_grid_unit` is how much ground a cell covers — 60 m, about enough to hold the
-ten or so buildings that make a village.
+A standalone build defaults to `Release`, which matters here: the renderer is several times
+slower unoptimised. This builds the `mapcoopa` tool and `mapcoopa_tests`. If `../uicoopa`
+is also checked out, it builds the optional `mapcoopa_viewer` GUI too (see
+[docs/viewer.md](docs/viewer.md)); pass `-DMAPCOOPA_WITH_VIEWER=OFF` to skip it.
 
-#### Render resolution
+### 3. Generate a map
 
-`meters_per_pixel` and `image_size` are **one knob with two ends**, and either may be the
-one you set:
+```bash
+./build/mapcoopa --seed=42 --out=world      # writes world.yaml and world_<layer>.png
+./build/mapcoopa --shape=archipelago --shape-count=5 --out=islands
+./build/mapcoopa --help                     # every flag
+```
 
-| Set | In | Effect |
-|---|---|---|
-| `meters_per_pixel: 1` | `config.yaml` | The default, always. 4.8 km ÷ 1 m → **4800 px** |
-| `image_size: 2048` | `config.yaml` | 4.8 km ÷ 2048 px → `meters_per_pixel` becomes 2.34 |
-| `--image-size=2048` | CLI | Same, and overrides the file |
+Settings come from [`assets/config.yaml`](assets/config.yaml), and flags override it for
+one run. Without a seed in either, the tool picks one and prints it. A default run takes a
+few seconds on a multi-core machine; nearly all of it is PNG rendering and encoding.
 
-Naming either computes the other, so they can never disagree about how much ground a pixel
-covers. `image_size` wins if you set both, a pixel count being the more concrete statement
-of intent. The invariant is `image_size × meters_per_pixel == grid_size × meters_per_grid_unit`,
-and `MapConfig` satisfies it from construction.
+### 4. Use it from C++
 
-**`meters_per_pixel` defaults to 1 and that is deliberate**: a PNG is then a literal
-one-pixel-per-metre map, so a pixel count read off a render *is* a measurement — a 6 m road
-is 6 px wide because it is 6 m wide. Fix the resolution instead and you fix the pixel count
-while the scale floats: at `image_size: 2048`, changing `grid_size` re-scales the ground a
-pixel covers rather than resizing the PNG. Which you want depends on whether you are
-measuring the map or fitting it somewhere.
+Add the repository with `add_subdirectory()` and link `coopa::maps`. A parent project gets
+only that target, with no extra executables or tests. libcoopa still has to sit beside
+mapcoopa, unless your project has already defined the `coopa::lib` target.
 
-Below roughly 4 m/px, thin features stop being reliable — river strokes fragment at 8 m/px
-simply because a 7 m river is narrower than a pixel.
-
-Every physical size is therefore in **metres** and carries an `_m` suffix — `road_width_m: 6`,
-`building_size_max_m: 14`, `river_width_base_m: 5`. Counts, costs, scores and ratios are
-dimensionless and have no suffix. Widths were previously fractions of a grid unit, which
-meant nothing on its own: at 60 m to the cell, the old `road_width: 0.20` was a 12-metre
-carriageway and the highway an 18-metre one.
-It is heavily commented — each key carries its units and what it actually does — and it is
-the file to edit rather than a header.
-
-Settings are resolved in four layers, each overriding the one before it:
-
-| | Source | Where |
-|---|---|---|
-| 1 | `MapConfig`'s in-struct defaults | [`coopa/maps/map_config.h`](./coopa/maps/map_config.h) |
-| 2 | the generator's own scene defaults | [`examples/map_generator.cpp`](./examples/map_generator.cpp) |
-| 3 | `assets/config.yaml`, or `--config=PATH` | |
-| 4 | command-line flags | |
-
-Layer 2 exists so that deleting or moving the config file still produces the 80-cell,
-4800-pixel world this README documents instead of silently dropping to the library's much
-smaller defaults. It sets no `image_size`: `meters_per_pixel` is 1, and 80 cells of 60 m at
-one pixel to the metre *is* 4800 px. (It used to say `image_size = 2048` there, which was
-dead — the derivation overwrote it before anything read it, and the tool has always
-rendered at 4800.) Layer 4 means trying something never requires editing a version-controlled
-file.
-
-Every key is optional and falls back to the layer beneath it, so deleting a line is always
-safe, and unknown keys are ignored — an older binary still reads a newer file.
-
-**A missing config.yaml is a warning; a malformed one is fatal.** No file, and the
-generator says so on stderr and carries on with layer 2. A file that exists but does not
-parse stops the run with the parser's own message and exit code 1 — generating a map that
-quietly ignored the settings it was handed is worse than generating none.
-
-Three keys do not behave like the rest, and the file says so inline:
-
-- **`seed`** — `--seed` wins over it. With neither, a seed is drawn from system entropy
-  and printed.
-- **`noise_island.seed` / `noise_temperature.seed`** — not settable. Both are always
-  derived from the master seed, so one `--seed` reproduces the whole map rather than just
-  the pass ordering. They appear in the file commented out, with that note.
-- **`noise_island.frequency`** — a *reference* value at `grid_size` 40, scaled by
-  `40 / grid_size` at startup so `--grid-size` controls detail rather than the size of the
-  world. Held fixed, a bigger map comes out as an archipelago of the same small islands.
-
-To load the same settings from C++, `coopa::maps::load_config()` in
-[`coopa/maps/map_yaml.h`](./coopa/maps/map_yaml.h) applies a file on top of an existing
-`MapConfig` and reports whether it was found, parsed and whether it named a seed.
-
-## Layers
-
-Each run writes one PNG per layer rather than a single composited image, so a consumer can
-take the height field without the roads drawn over it, or the road network without the
-terrain under it. Every one of them registers pixel for pixel.
-
-| File | Format | Contents |
-|---|---|---|
-| `_elevation.png` | RGB | Ground height, sea bed included: black at the deepest water, `sea_level` at the shore, white at the summit. Height and nothing else — nothing is *painted* here, but river valleys do show, because the ground under a river really is lower. See **River valleys**. |
-| `_water.png` | RGB | Water-surface height, **on the same scale as `_elevation.png`**. Flat per body: the sea at `sea_level`, each lake at one height across all its cells, rivers at the ground height plus a depth. Dry land is black. See **Meshing the two together** for exactly where the water is guaranteed to sit above the terrain. |
-| `_biomes.png` | RGB | Flat terrain colour, no overlays. |
-| `_roads.png` | RGBA | The road network by class, transparent elsewhere. |
-| `_structures.png` | RGBA | A settlement entire: its market square, the streets its buildings front, and the footprints as rotated quads with the civic core picked out. Transparent elsewhere. |
-| `_landmarks.png` | RGBA | Settlement and landmark markers, transparent elsewhere. |
-| `_regions.png` | RGB | Provinces in flat colour, and nothing over them — the political counterpart of the biome layer, registering with it pixel for pixel. Every pixel is exactly one region's colour or exactly the background, so a consumer can recover which region covers a pixel; countries are not drawn. |
-| `_composite.png` | RGB | All of it: biome colour lit from the elevation field, then water, roads, buildings and markers — including a ring at each cave mouth, which is the only part of a cave that shows here. See **Shading** below. |
-| `_caves.png` | RGB | The readable overview: every system over heavily dimmed terrain, coloured by depth, chambers at their real size and a ring at each mouth. The passages are **not** in the composite — they are underground. See **Caves**. |
-
-The three overlay layers carry real transparency, so they stack over the terrain in any
-image editor and reproduce the composite's arrangement.
-
-### Caves
-
-Caves are the one feature that exists *below* the map rather than on it, and that shapes
-everything about how they are stored.
-
-**Where they open.** On the map's steepest ground, which in a Voronoi map is an edge with a
-big height difference across it — already the thing that sits *between* two cells. Every
-land edge is ranked by `edge_grade()`, rise over run in real metres, and the steepest are
-taken subject to a spacing rule. `--cave-grade` is a floor beneath that ranking, not the
-selection itself: at the default a map has thousands of qualifying edges and the eighteen
-that get mouths are far steeper than the threshold.
-
-**What shape they grow into.** Two regimes, which is what limestone actually does:
-
-| | Above the water table | At and below it |
-|---|---|---|
-| Water is | falling under gravity | moving sideways through saturated rock |
-| Passage | steep, narrow | level, wide |
-| Branching | rare (`branch_chance_vadose`) | common (`branch_chance_phreatic`) |
-| Also | occasional vertical pitch | chambers, maze |
-
-So a system reads as an entrance series leading into a level network, and every knob means
-something physical rather than being a tuning number. The water table is a *subdued replica
-of the surface* — `vadose_share` of the relief between the mouth and the sea — not a flat
-sheet at sea level, because rain falls on the hill and drains toward the valleys either
-side. Measured against sea level alone, a cave 400 m up needs 250 m of descent before it can
-level out, further than its length budget reaches, and the phreatic half never appears on a
-map at all.
-
-**They never break the surface**, and that is a guarantee rather than a tendency. Every
-station is clamped to `roof_clearance_m` beneath the ground, and the clamp is applied
-**twice** — once as the station is grown and again on every point of the smoothed passage,
-because corner-cutting moves points and the smoothed path is the one that is drawn and
-exported. `test_caves_stay_under_the_terrain` fails on the smoothed points alone if the
-second clamp is removed.
-
-The surface it clamps against is the one `elevation_at()` returns *with* terrain detail and
-river channels applied, not the control mesh. `river_channel_depth_m` alone cuts 18 m out of
-the drawn surface, so a cave given 25 m of clearance against the mesh has 7 m of rock over it
-where it crosses under a river — and less than none at a higher `--channel`.
-
-> **The guarantee is against `elevation_at()`, not against `_elevation.png`.** Those are not
-> quite the same surface, and the difference is the renderer's rather than the caves'.
-> `elevation_at()` takes a cell as a hint and falls back to inverse-distance over that cell's
-> corners for a point outside every triangle incident to it, so two cells can answer
-> differently for one position; the layer draws a pixel with whichever cell's *subdivided*
-> outline contains it, and a wobbled outline bulges past the straight Voronoi boundary. With
-> caves disabled entirely, **5.7% of drawn land pixels already differ from `elevation_at()`
-> by more than 25 m**, up to 212 m at the worst. The pass takes the lowest reading of the
-> nearest cell and its neighbours, which is what makes the clamp hold against whichever of
-> them the renderer picks; a few pixels per map still land on the wrong side of that when a
-> stroke's rounded cap reaches between two clamped stations. Compare a cave floor against
-> `elevation_at()` if you need the real answer — which is what the repository already tells
-> you to do for a heightfield, since the PNG is a lossy 8-bit debugging aid.
-
-**Why a system has storeys.** A water table is not fixed. The valley a cave drains to cuts
-down over time and the table follows it, which abandons the network standing at the old level
-— leaving it as dry passage — and starts a new one below. `level_spacing_m` is the drop
-between one stage and the next, and how many stages a system gets is derived from the relief
-beneath its mouth rather than configured: a mouth high in the hills has the height to spend
-on three or four, one near the coast on one. Each storey is joined to the next by the same
-vadose descent that cuts the entrance series, so a shaft between levels is not a special case
-in the model.
-
-That spacing has one hard constraint, and it is against `chamber_height_m` rather than
-against anything on the surface: two tables closer together than the tallest space cut at
-either of them produce storeys that touch where they cross, and two surfaces sharing a place
-really are one void, so the export merges them back into the single sheet the storeys existed
-to break up.
-
-**Caves are not rastered, and the saved map is why.** Every other feature of this generator
-is a surface, and a surface is what a PNG is good at. A cave is not: it is a branching network
-of passages at several depths, and squeezing one into a stack of heightmaps means flattening
-it *and* quantising it. The generator did ship a `cave_floor_N` / `cave_roof_N` pair per
-storey for a while, and measuring it settled the question:
-
-| | the PNG pairs | the same caves in `.yaml` |
-|---|---|---|
-| Size | **6.9 MB** across 10 files | **873 KB** |
-| Fidelity | 8-bit — 2.34 m per grey level at the default 600 m range, so an 8 m passage is 3 levels | full float floor, roof and radius per point, plus zone, feature and storey |
-| Export cost | 0.57 s of a 6.62 s run | already written |
-
-Most of those megabytes were compressed black — a layer with three lit pixels still cost
-670 KB. So the pairs are gone. `PATH.yaml` carries every system entire: each station with its
-position, floor, roof, radius, cell, zone, feature and storey, and each passage with the
-smoothed polyline that gets drawn, all at full precision. Read that if you want cave geometry;
-read `_caves.png` if you want to look at it.
-
-What the composite gets is the one part of a cave that is genuinely on the surface: a ring at
-each mouth, in `cave_mouth_color`, distinct from the filled squares that mark towns and the
-diamonds that mark natural landmarks. Passages stay off it, and
-`test_only_cave_mouths_reach_the_surface_layers` checks that every pixel the caves change on
-the composite lies within a mouth marker's radius.
-
-Per-cave identity is not lost — `save_map()` writes every station, zone, feature and
-smoothed passage exactly. The rasters answer "what is under this pixel"; the YAML answers
-"give me cave 7". Keying the files by cave would answer the first question with the second
-question's key.
-
-| Knob | Default | Effect |
-|---|---|---|
-| `cave_count` | **18** | Systems to open, clamped to the qualifying slopes available |
-| `min_grade` | **0.25** | Rise over run a slope needs; a floor beneath the ranking |
-| `roof_clearance_m` | **25** | Rock left above every ceiling — the invariant's margin |
-| `passage_height_m` | **8** | Floor to ceiling. Worth choosing against `elevation_range_m`: the exported layers are 8-bit on the elevation scale, so over 600 m one grey level is 2.34 m and this is three levels of separation. Over a 256 m world it is 1 m per level and the same passage is eight |
-| `vadose_share` | **0.6** | Share of the relief below a mouth that is entrance series; where the water table goes |
-| `descent_grade` | **0.15** | How steeply the entrance series falls |
-| `massif_bias` | **0.6** | How hard a passage steers toward thicker rock when the rock ahead thins. At 0 a head wanders out from under its own hill in a few hundred metres and has to stop, and every system comes out a stub |
-
-### Shading
-
-The composite lights its biome colours two ways, chosen by `composite_shading` or
-`--shading=MODE`. Both read the elevation field the map already carries, so neither can
-disagree with the heightmap layer, and **neither touches the height data** — the elevation
-layer is the raw field under either.
-
-| Mode | Brightness follows | Shows |
-|---|---|---|
-| `elevation` *(default)* | **height** — high ground is pale | *Where* the high ground is. A function of altitude alone, so the same height reads the same everywhere on the map. |
-| `hillshade` | **slope**, lit from the north-west | The *shape* of the land — ridgelines, valley walls, which way a face turns. Blind to altitude: a slope at sea level and the same slope on a summit look identical. |
-
-Hillshading costs a second full-resolution pass plus a blur, so the default mode is also
-the faster one — about 43 s for the full set against 51 s.
-
-The blur is not optional in hillshade mode. Elevation inside a cell is interpolated from
-that cell's own corners, so the surface is continuous across a shared edge but its *slope*
-is not — and shading off the raw field draws every cell as its own little dome rather than
-drawing terrain.
-
-At the default 4.8 km world and 1 m/px each layer is 4800 × 4800 — about 23 megapixels, and
-some 90 MB in memory while it is being written. They are rendered and written one at a
-time for that reason; the full set takes under a minute.
-
-## Asynchronous generation
-
-Generation and export both run off the calling thread, on a
-`coopa::job::JobEngine` the caller injects. Nothing is owned: mapcoopa *takes* an
-engine, so a host that already runs a thread pool shares it rather than competing
-with a second one. **With no engine injected everything runs inline** — that is the
-default, and it is what the determinism tests compare against.
+```cmake
+add_subdirectory(path/to/mapcoopa ${CMAKE_CURRENT_BINARY_DIR}/mapcoopa-build)
+target_link_libraries(your_target PRIVATE coopa::maps)
+```
 
 ```cpp
-generator.set_job_engine(&engine);          // nullptr, the default, is serial
-MapTask task = generator.generate_async();
+#include <coopa/debug/logger.h>
+#include <coopa/maps/image_writer.h>
+#include <coopa/maps/map_generator.h>
+#include <coopa/maps/map_renderer.h>
+#include <coopa/maps/map_yaml.h>
 
-while (!task.done()) {                      // from the frame loop, never blocking
-    draw_loading_bar(task.progress());      // 0..1
+namespace maps = coopa::maps;
+
+maps::MapConfig config;
+config.seed = 42;
+config.noise_island.seed = config.seed;     // noise fields have their own seeds
+config.grid_size = 40;                      // 40 cells x 60 m = 2.4 km square
+
+coopa::debug::Logger logger("worldgen");
+maps::MapGenerator generator(config, logger);
+generator.generate();
+const maps::MapGraph& map = generator.graph();
+
+for (const maps::MapTown& town : map.towns) {
+    // Positions are in grid units; multiply by config.meters_per_grid_unit for metres.
+    spawn_town(town.name, town.point.x, town.point.y, town.population, town.buildings);
 }
-use(generator.graph());
+for (const maps::MapCenter& cell : map.centers) {
+    if (!cell.water) {
+        place_tile(cell.point, maps::biome_name(cell.biome),
+                   map.elevation_at(cell, cell.point.x, cell.point.y));
+    }
+}
+
+maps::save_map(map, config, "world.yaml");
+maps::write_png("world_composite.png", maps::MapLayers::composite(map, config));
+
+maps::MapGraph loaded;
+maps::MapConfig loaded_config;
+maps::load_map("world.yaml", loaded, loaded_config);
 ```
 
-`MapTask` is move-only and **its destructor cancels and waits**. The work writes
-into storage the caller owns — the generator's graph, the exporter's images — so a
-task outliving what it is filling in would be a use-after-free; blocking in the
-destructor makes that unrepresentable, the same bargain `std::jthread` strikes.
+To use the same settings file as the tool, call `maps::load_config(path, config)` before
+generating. A bare `MapConfig` is smaller than the tool's default world (see
+[docs/configuration.md](docs/configuration.md#how-settings-are-resolved)).
 
-`cancel()` is cooperative. Generation checks between passes; export checks before
-each layer and between row bands. The one thing neither can interrupt is a PNG
-encode already in progress, because stb's deflate is a single opaque call.
+The graph holds `centers`, `corners`, `edges`, `rivers`, `roads`, `towns`, `regions`,
+`countries`, `landmarks` and `caves`. Records refer to each other by index, never by
+pointer. [`coopa/maps/README.md`](coopa/maps/README.md) describes each header and the data
+flow.
 
-Exporting has the same shape:
+### Used by
 
-```cpp
-MapExporter exporter;
-exporter.set_job_engine(&engine);
-MapTask task = exporter.export_layers_async(graph, config, "world");
-```
+[toyengine](https://github.com/cooparobla/toyengine), a C++/Vulkan engine, builds streamed
+3D terrain from mapcoopa worlds:
 
-### What it costs, and what it buys
+![toyengine's terrain_test scene, meshed from a mapcoopa world](docs/images/toyengine_terrain.jpg)
 
-Measured on 20 cores at the default 4.8 km world, 4800 × 4800, before the cave layers
-existed (seven layers):
+## How it works
 
-| | generate | export | yaml | total |
-|---|---|---|---|---|
-| Before any of this (`-O0`, serial) | 580 ms | 40.3 s | 1.9 s | **42.8 s** |
-| Optimised build, serial | 137 ms | 9.5 s | 563 ms | **10.2 s** |
-| Optimised build, 20 threads | 140 ms | 1.3 s | 576 ms | **2.0 s** |
+`MapGenerator` lays a jittered point grid, triangulates it with delaunator, and reads the
+Voronoi dual off the triangulation. Fourteen passes then annotate the graph in a fixed
+order, each switchable with an `enable_*` key:
 
-Two findings worth recording, because neither was the one expected:
+water, coast, elevation, temperature, rivers, valleys, moisture, biomes, roads, regions,
+towns, landmarks, caves, noisy edges.
 
-- **`CMAKE_BUILD_TYPE` was unset**, so every binary this project had ever produced
-  was `-O0`. Defaulting it to `Release` for a standalone build is one line and
-  worth **4.3×** — more than all the threading put together.
-- **Generation was never the problem.** It is 140 ms; the export is 98% of the
-  run. Nothing inside generation is parallelised, deliberately: threading 140 ms
-  would buy nothing and cost the byte-for-byte guarantee its simplest proof.
+Each pass is one header in [`coopa/maps/passes/`](coopa/maps/passes/). Their inputs,
+outputs and details are in [`coopa/maps/passes/README.md`](coopa/maps/passes/README.md).
 
-Parallel output is **byte-for-byte identical** to serial output — all seven PNGs
-and the YAML. Work is split only by disjoint output: across layers, and across
-row bands within a layer. Splitting by *cell* would race, because adjacent cells
-deliberately share their boundary pixels. For the same reason the road pass stays
-serial: each route is routed over ground earlier routes already claimed.
-
-To check it yourself:
+## Testing
 
 ```bash
-./build/mapcoopa --seed=42 --threads=1 --out=/tmp/serial
-./build/mapcoopa --seed=42 --threads=0 --out=/tmp/parallel
-cmp /tmp/serial.yaml /tmp/parallel.yaml
-for l in elevation water biomes roads structures landmarks composite; do
-    cmp /tmp/serial_$l.png /tmp/parallel_$l.png || echo "DIFFERS: $l"
-done
+ctest --test-dir build                 # or run the binary directly:
+./build/mapcoopa_tests
 ```
 
-## Water
+118 tests cover determinism, graph invariants, every pass, both renderers, the config
+loader, the world scale, the async API, the YAML round trip, and that every parallel path
+matches its serial one. Two tests read files outside the code: one checks
+`assets/config.yaml` against the documented defaults, and one checks the
+[legend](#legend) below against the palette in `map_config.h`.
 
-`sea_level` (default **0.25**) is a **real height** in the normalised field, not a
-convention. The sea bed occupies everything below it and land everything above, so
-"this ground is under water" is an honest comparison — and the sea's surface comes
-out a visible mid-grey on the same scale as everything else.
+## Project layout
 
-It was not always so. With the whole field starting at zero and the sea pinned to the
-bottom of it, nothing was ever below sea level, the sea's surface rendered as the same
-black as dry land, and a river running into the ocean appeared to run into nothing.
-
-| | |
-|---|---|
-| `_elevation.png` | the **ground**, sea bed included — genuine bathymetry |
-| `_water.png` | the **surface** of whatever water covers it, same scale |
-
-`MapCenter::water_level` carries that surface as data. It is flat per *body*, which
-`elevation` is not: the sea at `sea_level` everywhere, each lake at one height across
-all of its cells. A consumer floods a terrain mesh to it directly.
-
-Land therefore spans `[sea_level, 1]`, so every threshold that describes *land* — the
-Whittaker biome rows, `elevation_penalty_start`, `peak_elevation`, `canyon_elevation` —
-is taken through `land_height()` first. Moving the waterline does not silently shift
-them.
-
-### Vertical scale
-
-`elevation_range_m` (default **600**) is how many metres the `[0, 1]` field spans — the
-vertical counterpart of `meters_per_grid_unit`, which the world previously had no
-equivalent of. Sea floor at 0 m, waterline at `sea_level × elevation_range_m`, summit at
-the full range. Without it "a river one metre deep" had nowhere to land.
-
-### Rivers and shorelines
-
-- **Every river ends in a water body** — a lake or the sea, never in the middle of a field.
-  This took fixing in two independent places, because the requirement has two halves: the
-  river has to *arrive* at water, and the map has to *show* it.
-  - *Arriving.* A river is a walk down the flow field, so where it ends is decided by the
-    height field and not by the river pass: relief noise, the rank remap and the smoothing
-    passes each move corners independently, and any of them can leave a corner lower than
-    all its neighbours. A walk that reaches such a pit stops on dry land, and 42% of rivers
-    used to. The elevation pass now fills the pits (priority flood — see
-    [`passes/README.md`](./coopa/maps/passes/README.md)), which leaves *every* land corner
-    with a strictly descending path to water; the river pass discards anything that still
-    ends dry, so the guarantee holds even if the terrain changes under it.
-  - *Showing it.* These layers are coloured by **biome**, and `classify_biome()` used to
-    hand a shallow lake `Marsh` — a dark green. 18% of rivers therefore ended in a cell
-    that reads as forest, on a map whose data said "lake". Water cells now only ever get
-    `Ocean`, `Lake` or `Ice`.
-- **`river_depth_m`** (+ `river_depth_per_volume_m`) lifts a river's surface *above* the
-  ground it runs over, because a river is water standing in a channel rather than a line
-  painted on the terrain. Interpolated along the smoothed centreline, so the fall
-  downstream is continuous instead of terracing at every corner. Complementary to
-  `river_incision_m` below, not a duplicate of it: incision cuts the valley, depth floats
-  the sheet above the bed at the bottom of it.
-- **Bodies are drawn after rivers**, so a lake's flat surface wins inside its own
-  outline. The other way round, a river stroked at ground height gouged a channel across
-  every lake it flowed into.
-- **`water_edge_overlap_m`** (default **1**) extends every water surface past its own
-  edge so it clips *into* the terrain. Two surfaces sharing an edge exactly will show a
-  seam wherever their meshes disagree by a rounding error, and along a coastline they
-  always do.
-
-### Meshing the two together
-
-Build a terrain mesh from `_elevation.png` and a water mesh from `_water.png` at the same
-vertical scale, and this is what holds:
-
-- **Rivers: the water is above the terrain, everywhere, by construction.** The surface
-  comes from `make_river_surfaces()` ([`map_data.h`](./coopa/maps/map_data.h)), which measures
-  the ground with the *same* call the elevation layer draws with — `elevation_at()` — and
-  takes the highest point over the whole footprint of the stroke before adding
-  `river_depth_m`.
-
-  It did not always. The water layer used to compute the sheet from
-  `MapCorner::elevation` — the control mesh — while the elevation layer drew the Delaunay
-  blend of *cell* heights. Those differ by about **22 m at a river corner**, because each
-  cell averages in its non-river corners, against one or two metres of freeboard. The
-  result was that **47.7% of river samples had terrain standing above the water**. One
-  definition in one place is the fix, and the test now asserts against the drawn ground
-  rather than recomputing the surface it is checking.
-
-- **Bodies: guaranteed in the interior, not within one cell of a shore.** Under water,
-  `MapCenter::elevation` is the *bed* — except for a coastal cell, where it is not below
-  the water at all: cell heights are the mean of their corners, and a cell the sea reaches
-  into has corners up on the land. **About one water cell in ten carries a bed above its
-  own surface** for that reason, and because the ground is drawn by interpolating between
-  cell heights, those cells lift the surface through the water inside themselves *and* one
-  ring further in.
-
-  Precisely: where a cell **and every neighbour** have a bed at or below their surface,
-  every vertex the sampler can reach is under water and so is the blend — zero violations
-  measured across five maps. Elsewhere, **clip the water to where the terrain is below it**,
-  which is how water is normally drawn in any case.
-
-### River mouths
-
-A river's surface used to fall smoothly along its course and then meet the sea at a step:
-measured, the median mouth ended **10.9 m above the sea it ran into** and the worst **100.8 m**.
-Two other things were wrong with it at the same time — **48 of 55 rivers rose somewhere
-downstream**, because the highest ground under the stroke set the height and a bank beside the
-course lifted the sheet over it, and rivers meeting at a confluence disagreed by up to **30.8 m**.
-
-All three are properties of a *course*, not of a segment, so the surface is now computed for
-the whole network at once by `make_river_surfaces()`. It only ever falls, it agrees exactly
-wherever two rivers meet, and it arrives at the waterline.
-
-Arriving needed the terrain to move. The ground at a mouth stands **9 to 70 m above sea
-level** depending on the map, so a sheet drawn at sea level would lie under the terrain and a
-sheet above the terrain ends on a lip — there is no third option without lowering the ground.
-Over the last `river_mouth_blend_m` the channel therefore becomes an **estuary**: it deepens
-until its bed reaches the water it empties into, and widens with a *flat* bed. Flat matters —
-a wider parabola does not help, because at 94% of its radius a parabolic bed has already risen
-back to within 11% of the rim, leaving the edges of the ribbon resting on the bank.
-
-| Knob | Default | Effect |
-|---|---|---|
-| `river_mouth_blend_m` | **250** | How far upstream the estuary opens; about four cells. |
-
-**A river ends at or above the water it feeds, never below it.** That needed the carve to stop
-at the waterline rather than past it: taking the deeper of the ordinary channel and the depth
-needed to reach the sea meant a mouth wanting 2 m of cut got 22 m, and the sheet resting on
-that bed finished a clear 20 m *under* the sea — the dark notch where a river met a body. The
-bed is now cut to exactly one freeboard below the target, so the sheet sits on it at the
-target with a river's own depth of clearance.
-
-The surface falls everywhere except the last stretch into a body standing **above** it, where
-it rises to meet it. That is a drowned inlet, and it is bounded twice: only within
-`river_mouth_blend_m`, and never above the body's own level.
-
-Measured before and after, on the same map: ocean mouths **median +10.9 m → +0.0 m**, worst
-overshoot **+100.8 m → +9.5 m**, and none now below sea level (they were at a median of
-−13.3 m partway through this work); lake mouths land **exactly** on the lake; rivers rising
-outside the mouth blend **48 / 55 → 0**; confluence disagreement **worst 30.8 m → 0.00 m**.
-
-> **A caveat about lakes, which this exposed rather than caused.** A lake's `water_level` is
-> the *highest bed* in its body, which puts its surface above the land around it — measured on
-> one map, the three lakes stand 204 m, 236 m and 214 m above the lowest dry ground on their
-> own shores, and **100%, 80% and 96%** of their shore cells sit below their surface. A river
-> now rises to meet that level, so the join is seamless, but the level itself is not one water
-> would hold. Fixing it means changing how a lake's extent is decided, not how a river ends.
-
-### River valleys
-
-Rivers erode, and for a long time nothing in the height field knew it. Elevation is
-computed **before** rivers are routed — it has to be, the routing walks `downslope` — so
-the generator produced a drainage network drawn across a surface with nowhere for the water
-to go. The elevation layer showed no trace of the rivers the water layer was full of, and a
-mesh built from the data had rivers running over flat ground.
-
-`PassValleys` ([`passes/pass_valleys.h`](./coopa/maps/passes/pass_valleys.h)) fixes that by
-lowering the ground, and the distinction matters: **nothing is painted**. The layer once
-had its river network *dimmed* into it, which was wrong twice over — it made the layer a
-picture of the terrain rather than the terrain itself, and a consumer flooding a mesh to
-those values found channels already cut. What shows now is real geometry.
-
-That happens at **two scales, and it needs both** — which took measuring to discover.
-
-**The valley** is carved into the control mesh by `PassValleys`: corner and cell heights,
-a landform hundreds of metres across.
-
-**The channel** is cut into the surface sampled *between* those heights, by
-`make_river_channels()` ([`map_data.h`](./coopa/maps/map_data.h)), at the river's true
-width.
-
-The second exists because the first cannot do the job alone, and the geometry says why.
-`elevation_at()` interpolates *cell-site* heights over Delaunay triangles, while rivers run
-along Voronoi edges — cell *boundaries*, as far from a site as the tessellation allows. So
-the surface cannot vary faster than one cell, 60 m at the default scale, against a river 5
-to 20 m wide. Measured on a real map, the best profile cell-height carving can produce
-gives **+2.3 grey levels of contrast within half a cell** — an 80 m depression 500 m wide,
-with no edge. Deep, and invisible. Cutting the channel at sample time instead measures
-**+12.3**.
-
-So the channel lives where `terrain_roughness` lives: applied by `elevation_at()`, never
-written back to cell or corner heights. Biomes, rivers and roads keep classifying on a mesh
-no surface feature has touched, while anyone sampling the *surface* — the renderer, a
-mesher — gets the channel. Its width comes from `river_width()`, the one definition of how
-wide a river is, so the cut and the blue ribbon on the water layer register meander for
-meander.
-
-| Knob | Default | Effect |
-|---|---|---|
-| `river_channel_depth_m` | **18** | Channel depth in metres — the one that makes a river legible. **0 leaves the sampled surface as the mesh describes it.** |
-| `river_channel_depth_per_volume_m` | **4** | Extra channel depth per unit of volume. |
-| `river_incision_m` | **60** | Valley depth in metres. **0 reproduces the uncarved mesh byte for byte.** |
-| `river_incision_per_volume_m` | **12** | Extra valley depth per unit of volume — a trunk river has had far longer to cut than its streams. |
-| `river_valley_width` | **2** | Rings of corners the valley opens over. 1 is a trench with nothing either side; 2 gives it banks. |
-| `river_valley_falloff` | **0.5** | Depth multiplier per ring outward — what turns a step into a slope. |
-
-```bash
-cplay --incision=0 --channel=0   # the uncarved field, exactly as before any of this
-cplay --channel=40               # gorges
-cplay --no-valleys               # landform only; the channel stays
+```
+coopa/maps/          the library (header-only)
+├── map_config.h     MapConfig, shapes, noise settings, BiomePalette
+├── map_data.h       MapGraph and its records; elevation_at(), river surfaces
+├── map_generator.h  MapGenerator: point set, triangulation, pass order
+├── passes/          one header per generation pass
+├── map_renderer.h   MapLayers: software renders of each layer
+├── map_export.h     MapExporter: renders and writes all layers
+├── map_yaml.h       save_map(), load_map(), load_config()
+├── map_task.h       MapTask, the async handle
+└── portable_random.h, portable_sort.h   cross-platform determinism
+examples/            map_generator.cpp (the mapcoopa tool), map_viewer*.cpp (GUI)
+assets/              config.yaml (every setting, commented), svg/ legend swatches
+includes/            vendored delaunator, FastNoiseLite, stb_image_write
+tools/               gen_legend_svg.py
+docs/                guides; docs/images holds the screenshots above
+test.cpp             the test suite
+map_out.*            reference output of the shipped config (seed 42)
 ```
 
-The valley falloff earns its keep beyond looks: a cliff at every watercourse would push the
-mean elevation step between neighbouring cells past what `elevation_smoothing_iterations`
-is there to hold down. Graded, it measures 0.031 against a 0.05 ceiling.
-
-Channel sampling is guarded by a per-cell bounding box, so the overwhelming majority of the
-23 M pixels in a default render cost one comparison rather than a distance loop — rivers
-cover very little of a map.
-
-The pass finishes by calling `restore_drainage()`
-([`passes/drainage.h`](./coopa/maps/passes/drainage.h), shared with the elevation pass).
-Moving the ground owes the map its drainage back — carving digs pits where a valley wall
-grades into ground with no outlet, the waterline clamp flattens river mouths into ties, and
-`downslope` was read off a field that no longer exists. Without it, 42% of rivers would
-start ending in the middle of a field again.
-
-## Settlements
-
-A settlement is a cluster of cells, not a point: seven for a capital, three for a town, one
-for a village. Inside them, three things give it structure.
-
-**Streets.** The roads and rivers bordering each claimed cell become lanes running from the
-cell's site out to those edges; a cell with neither gets fallback lanes toward its farthest
-corners. Buildings are placed in pairs flanking each lane, then the remaining budget is spent
-on interior infill.
-
-These were private to the town pass for a long time — real enough to place plots against, and
-invisible to everyone else. Buildings lined up along something nobody could see, so a
-settlement read as a scatter of identical specks however carefully it had been arranged. They
-are now `MapTown::streets`: drawn on the structures layer, written to the map file, and
-available to a consumer laying cobbles.
-
-**Alignment.** Interior infill takes the bearing of the street nearest it rather than a yaw
-drawn uniformly from a full turn. Measured, that moved the fraction of buildings fronting a
-street from **51% to 83%** — a row is only legible if its neighbours agree with it. Positions
-stay jittered, so the layout never becomes a lattice.
-
-**Clearance.** Buildings are kept off the carriageway: every candidate is tested against the
-settlement's streets and against the `MapRoad` polylines passing through its cells, each at
-half its own width plus `street_clearance_m`. Frontage plots are also set back by their *own*
-rotated size rather than a flat distance — at 8 m of `street_offset_m` a 14 m plot reached to
-1 m from the centreline of a 4 m lane, so the largest buildings were laid onto the street by
-construction. Before this, **37% of buildings stood on a lane and 18% on a road**; both are
-now zero.
-
-The test is against the whole footprint, not its corners: a corner test misses a street
-crossing the middle of a large plot, and misses a short road segment lying wholly inside one.
-A corridor is a rotated box, so it goes through the same separating-axis routine two
-buildings use.
-
-**A square, and roles.** A settlement claiming at least `plaza_min_cells` gets a `MapPlaza` at
-its primary site — a disc, trimmed to fit the cell and skipped when there is no room — which
-the packer keeps clear. The buildings nearest it take civic roles from one roster shared by
-every tier (`well, hall, market, smithy, temple, inn, granary, barracks, warehouse`), so a
-town is a prefix of a capital rather than a different kind of place. Everything else is a
-`Dwelling`. `BuildingRole` names are append-only, like `Biome`'s: they are the on-disk
-identity of every building in every saved map.
-
-| Knob | Default | Effect |
-|---|---|---|
-| `plaza_radius_m` | **26** | Radius of the market square, trimmed to fit the cell. |
-| `plaza_min_cells` | **2** | Claimed cells needed before a settlement gets one, so a village has none. |
-| `capital_civic_count` / `town_civic_count` / `village_civic_count` | **7 / 4 / 2** | How far down the roster each tier goes. |
-| `street_width_m` | **4** | Width a street is drawn at; a lane, narrower than the trail reaching the settlement. |
-| `street_clearance_m` | **1.5** | Clear ground between a building and any roadway, added to half its width. |
-
-## Landmass shape
-
-Land is confined to a shape centred on the canvas; everything outside it is sea. The
-**canvas itself is always `grid_size` square** — the shape is inscribed in it, and the
-margin left over becomes open ocean. A smaller shape is a smaller world on the same size
-of map, not a smaller image.
-
-| Shape | Dimensions | Flag |
-|---|---|---|
-| `rectangle` *(default)* | `width_m`, `height_m` | `--shape=rect --shape-size=M --shape-height=M` |
-| `circle` | `diameter_m` | `--shape=circle --shape-size=M` |
-| `triangle` | `edge_length_m`, equilateral and apex-up | `--shape=triangle --shape-size=M --shape-rot=DEG` |
-| `continent` | `continent_size_m`, one irregular landmass | `--shape=continent --shape-size=M --shape-wobble=F` |
-| `archipelago` | `continent_size_m` × `continent_count`, scattered | `--shape=archipelago --shape-size=M --shape-count=N` |
-
-**Every dimension defaults to 0, meaning "fill the canvas"**, which makes the default a
-canvas-spanning rectangle — byte for byte what the generator produced before shapes
-existed. `rotation` turns the shape about the centre; only the triangle is asymmetric
-enough for it to show.
-
-```bash
-cplay --shape=circle      --shape-size=3600
-cplay --shape=triangle    --shape-size=4000 --shape-rot=30
-cplay --shape=rect        --shape-size=3000 --shape-height=1800
-cplay --shape=continent
-cplay --shape=archipelago --shape-count=5
-```
-
-It is one predicate: `ShapeField::inset()` in
-[`coopa/maps/map_config.h`](./coopa/maps/map_config.h) returns how far inside the shape a
-point lies, and `border_check_()` flags anything within `border_length` of the edge. The
-water pass floods those cells and the elevation pass measures height outward from them, so
-coastlines, mountains, regions and roads all follow the shape without any of them knowing
-shapes exist. It is a `ShapeField` object rather than the free `shape_inset()` because the
-organic shapes carry state — a landmass layout and a noise generator — and the predicate
-runs once per cell and again per corner. `shape_inset()` remains as the one-off path, and
-rebuilds the field on every call.
-
-### Organic shapes
-
-`rectangle`, `circle` and `triangle` are exact geometry, and it shows: however organic the
-island noise makes the interior, the *silhouette* is a hard edge. `continent` and
-`archipelago` wander the outline instead.
-
-A landmass is a radius that varies with the angle around its centre — a fractal sum of four
-sine harmonics at frequencies 2, 3, 5 and 7, each turning faster and counting for less.
-Whole numbers, so the outline closes with no seam; coprime, so it has no shorter period
-than a full turn and cannot come out symmetric. `irregularity` scales how far it wanders,
-clamped to 0.6 because past that a landmass pinches itself in two.
-
-That alone is *star-convex* — every ray from the centre crosses the coast exactly once, so
-there are no fjords and no headland that folds back. So the whole boundary is then
-displaced by `noise_shape`, at `coast_detail` × the mean radius. That is what buys inlets,
-fold-back peninsulas and the occasional island lying offshore.
-
-`archipelago` scatters `continent_count` of them, each a different size (`size_variance`)
-with its own outline, and takes the **union** — so two that land close enough fuse into one
-larger continent rather than drawing a coast through each other. The count is an upper
-bound, not a promise, and the fusion is the point: it is what stops an archipelago reading
-as a row of evenly spaced blobs. Positions come from best-candidate sampling, biased out of
-the middle of the canvas, since a landmass placed dead centre is large enough to overlap
-everything else there is.
-
-Both keep open sea all the way round the canvas by construction — a landmass reaching the
-frame would be sliced off by the border band, and could wall the ocean flood fill out of a
-bay and leave the sea classified as a lake.
-
-`continent_size_m` is the **mean diameter of one landmass**, not the size of the world, and
-its own field rather than a reuse of `diameter_m` — wiring them together would make an
-archipelago inherit whatever the circle was set to. At 0 they size themselves to the
-canvas: one continent as wide as fits, or an archipelago's worth spread across it. Raising
-it trades separation for scale — three large landmasses will fuse into a horseshoe
-continent around an inland sea, which is often what you want.
-
-## Climate
-
-Temperature is a latitude band, minus an altitude lapse rate, plus a noise field, plus a
-global offset — and it is the first axis `classify_biome()` branches on, so it decides more
-about what a map looks like than anything except the coastline.
-
-| Knob | Default | Effect |
-|---|---|---|
-| `temperature_offset` | **0** | Shifts the whole world warmer or colder. **0 changes nothing.** `--temperature=F` |
-| `polar_extent_north` | **0.065** | Frozen fraction of the map at the `y = 0` edge, 0 to 0.5. `--polar-north=F` |
-| `polar_extent_south` | **0.065** | The same at the far edge. `--polar=F` sets both. |
-| `temperature_falloff` | **1.7** | Shapes the curve *between* the cap and the equator. |
-| `temperature_lapse_rate` | **0.40** | How much a full unit of height cools the air. |
-
-**A polar extent of 0 means no ice cap on that side**, and no value of `temperature_falloff`
-could ever express that — an exponent shapes how fast the cold arrives, never whether it
-arrives at all. The caps used to be emergent: at a falloff of 1.7 the ground froze beyond
-87% of the way to the pole, the outer 6.5% of the map, and nothing in the configuration said
-6.5%. Now they are stated, one per pole, anchored to the freezing threshold so the number
-means the fraction that actually classifies as frozen.
-
-The two poles are independent, so a world can carry an ice cap at one end and none at the
-other. With an extent of 0 the curve spans freezing to equatorial across the whole
-hemisphere, so *latitude* alone never selects ice, glacier or cold desert — altitude still
-can, which is what should happen to a mountain.
-
-```bash
-cplay --polar=0              # no ice caps anywhere
-cplay --polar=0.25           # a quarter of the map frozen at each end
-cplay --polar-north=0.3 --polar-south=0   # ice at the top only
-cplay --temperature=-0.25    # ice age
-cplay --temperature=0.25     # hothouse
-```
-
-Measured on a 48-cell map: ice cells go 9 → 0 at `--polar=0` and 9 → 105 at `--polar=0.25`;
-mean temperature runs 0.238 / 0.433 / 0.664 across `--temperature=-0.25 / 0 / 0.25`.
-
-## Terrain
-
-Height is breadth-first **distance from the coast**, which is what keeps coastlines at sea
-level and puts mountains inland. Taken alone, though, it makes the high ground the literal
-*medial axis* of the landmass — every summit on a thin ridge running equidistant between the
-bays either side, which renders as bright closed loops around dark basins. That reads as
-foam, not terrain.
-
-Three knobs, at three scales:
-
-- **`terrain_relief`** (0 to 1, default **0.65**) blends the distance field toward fractal
-  noise, so the interior becomes massifs and valleys instead of a skeleton. `--relief=F`.
-  A coastal mask keeps the shore the lowest land there is, and land is lifted clear of
-  water, so rivers still run off the land into the sea. **0 restores the pure distance
-  field** — what Amit Patel's original produced.
-- **`elevation_smoothing_iterations`** relaxes the height field — how smooth the *landform*
-  is. **Not how smooth the render looks:** setting it to 0 does not produce facets, because
-  the drawn surface is interpolated between the stored values whatever it says. Two things
-  smooth the picture regardless — a cell is always the *mean* of its corners (which span
-  ~70 m), and `elevation_at()` interpolates between cell sites, so at 1 px/m a 60 m cell
-  spans 60 px and a step between two cells is spread over all of them. Measured on one map,
-  0.2% of adjacent pixels differ by 3+ grey at 4800 px against 8.6% at 900 px, from identical
-  data. Use `elevation_surface` below for hard edges.
-- **`terrain_roughness`** (0 to 1, default 0) displaces the *sampled surface* with a much
-  finer detail field — how rough the skin over it is. `--roughness=F`.
-
-### Elevation surface
-
-`elevation_surface` decides how the height field is drawn **between** the cells it is stored
-at — which is what actually governs how smooth a map looks.
-
-| Mode | Effect |
-|---|---|
-| `interpolated` *(default)* | Barycentric over the Delaunay triangle: the piecewise-linear surface through the cell sites, and what a terrain mesh built from this data would be. Continuous by construction. |
-| `flat` | One height per cell, hard edge at every boundary — `MapCenter::elevation` drawn flat, the stored field with nothing interpolated over it. |
-| `blended` | `flat`, then **blurred**. The cells are drawn flat and the finished raster is smoothed by a box blur `elevation_blend` cells across, with the river channels cut back in afterwards. A pass over the image, not a sampling rule. |
-
-```bash
-cplay --surface=flat
-cplay --surface=blended --blend=0.5
-cplay --surface=blended --blend=0.5 --blend-variation=0.8
-```
-
-`elevation_blend` (default **0.5**) is that blur's radius as a fraction of a cell, so one
-number means the same thing at 512 px as at 4800. **0 is byte-identical to `flat`** — there is
-no blur to run. 1 is the ceiling, past which the blur is wider than the tessellation and starts
-erasing the landforms along with the facets. It does not converge on `interpolated` at the top
-end and is not meant to: this is a smoothed *picture* of the stored field, where `interpolated`
-is a different surface through the same points.
-
-Three stages, and the order is what makes the rivers work: the cells are drawn flat and
-**uncut**, the whole raster is blurred, and the channels are cut in afterwards. Blurring a
-raster that already carried them costs a river nearly half its contrast — 15.0 grey levels down
-to 8.0, because a channel a few pixels wide is exactly the feature a half-cell blur destroys —
-and cutting again on top of that would subtract each river twice.
-
-99th-percentile adjacent-pixel step across the sweep, which is the edge hardness: **34 → 12 → 8
-→ 6** grey levels for blend 0 / 0.25 / 0.5 / 1, at 512 px. The *worst* step stays near 75 at
-every setting, and that is the point — it is a river bank, re-cut after the blur. Turn the
-channels off and the same render's worst step is 12.
-
-### Varying the blur, per cell
-
-One radius smooths everywhere equally, which is the one thing real ground never does.
-`elevation_blend_variation` (default **0.0**) gives **every cell its own radius**, drawn from
-`noise_blend` at that cell's site — so one cell keeps hard edges while the cell beside it is
-fully smoothed.
-
-The factor is `1 + variation × n` for a field value `n` in `[-1, 1]`, so it is **symmetric
-about `elevation_blend`**: the average radius stays where you put it and turning this up makes
-a map *more varied* rather than uniformly softer or sharper. At 0 the field is never consulted
-at all — change its seed or frequency and the render does not move by a byte.
-
-#### Distributing the soft and hard cells
-
-`noise_blend.frequency` is the second knob, and here it means something unusually concrete.
-Sites sit one grid unit apart and a grid unit *is* a cell, so the field's wavelength
-`1 / frequency` is the patch size in cells. Measured as the correlation between the factors of
-two cells that share an edge:
-
-| `frequency` | wavelength | neighbour correlation | reads as |
-|---|---|---|---|
-| `0.5` *(default)* | 2 cells | −0.01 | every cell independent |
-| `0.33` | 3 cells | 0.14 | mostly independent |
-| `0.25` | 4 cells | 0.35 | loose clumps |
-| `0.2` | 5 cells | 0.51 | clear patches |
-| `0.125` | 8 cells | 0.78 | broad regions |
-| `0.045` | 22 cells | **0.97** | no visible variation |
-
-Note the knee: at or above `0.5` the field is already fully decorrelated, so raising it
-further buys nothing. The useful range is `0.5` down to `0.125`.
-
-That last row is where this started. The first version ran the field at `0.045` on the theory
-that smoothness should vary the way bedrock hardness does — a defensible idea that produced
-nothing anyone could see, because at a correlation of 0.97 every cell in any neighbourhood
-gets the same factor and the map comes out uniformly blurred. **What varies has to vary at the
-scale of the thing it varies.**
-
-The field uses **one** octave rather than the usual five. Octaves above the first sit below
-cell size, so point-sampling one value per cell picks up near-white noise from them whatever
-the base frequency says; and FBm's gain leaves the base octave only about two thirds of the
-amplitude. Dropping the rest widens the effect measurably — the spread of per-cell edge
-sharpness goes 0.213 → 0.294, and adjacent cells land on opposite sides of the uniform blur
-half again as often (2.3% of shared edges → 3.5%).
-
-It is not rescaled by `grid_size`, unlike `noise_island`: a patch measured in cells should be
-that many cells on any map.
-
-#### How it is built
-
-A three-level pyramid — the untouched raster, a blur at the base radius, and a blur at twice
-it — with a per-cell factor choosing where between them each pixel lands. A box blur whose
-radius genuinely changed per pixel is not one filter but a different one at every pixel, and
-neighbouring pixels drawing from differently-sized boxes have no reason to agree; three
-globally consistent blurs and a feathered weight cannot seam by construction. Three levels
-rather than two so the variation can fall either side of the base radius.
-
-The factor is drawn one flat value per cell through the same polygon rasteriser the layer
-itself uses, then feathered by the **blur radius** — that is the width over which
-`blurred − sharp` is non-trivial near an edge, so it is exactly how far the weight must travel
-to hide its own step, capped at a quarter cell so a large `elevation_blend` cannot feather a
-whole cell and homogenise neighbours. Sizing the feather against the cell instead was a real
-defect: at 3000 px with `elevation_blend = 0.1` it gave a 7 px feather against a 3 px blur and
-averaged the whole effect away.
-
-Cost: the elevation layer goes **1.20 s → 2.35 s** at 4800 px, and nothing at all at
-variation 0.
-
-**The variation scales `elevation_blend`, so a small blend leaves little to vary.** At
-`elevation_blend = 0.1` the radius is 3–4 px on a 60 px cell, and the difference between
-neighbouring cells is correspondingly slight. Raise the blend to see the effect.
-
-An earlier version blended each cell toward the interpolated surface near its own rim, keeping
-the core flat. That is not a smoothing pass and it does not work at any setting: every cell
-independently ramps its own edge, so the map comes out a field of bevelled tiles with a soft
-halo tracing every Voronoi outline — reading *more* tessellated than the hard edges it was
-meant to hide. A blend is a property of the image, not of a cell.
-
-Note this is **not** `elevation_smoothing_iterations`. Those relax the heights the graph
-*stores*; this changes only how the drawn surface gets from one stored height to the next, and
-nothing downstream of the renderer can tell it was set.
-
-It affects the elevation layer and the composite's elevation shading, and so hillshade too,
-which is derived from that raster.
-
-**Rivers show in `flat` as well.** The channel cut is a function of position, not of the
-interpolation, so it subtracts from a flat cell as readily as from a gradient — measured,
-**11.6 grey levels** of contrast half a cell from a centreline against **12.3** interpolated,
-and against a uniform cell they arguably read better. River *valleys* are there too, carved
-into the cell heights themselves, as stepped cells rather than a smooth trough.
-
-The one thing `flat` drops is `terrain_roughness`, deliberately: that is surface *texture*,
-which a fill constant across a cell has no business carrying, where a river is a feature of
-the ground.
-
-Blended rather than multiplied, incidentally, because scaling the distance field by noise
-cannot reorder it: distances span tens of units and a noise factor spans one, so the ridge
-survives however hard it is attenuated.
-
-The roughness lives in the sampler, not in the graph. Cell and corner heights stay exactly
-as the passes computed them, so biomes, rivers and roads are still classified on the smooth
-control field; only what you get from `MapGraph::elevation_at()` — and therefore the
-elevation layer and the composite — roughens. The displacement is scaled by the local
-height, so a coastline stays exactly at sea level however high the knob goes.
-
-Separately, `elevation_at()` interpolates barycentrically over the **Delaunay triangle**
-containing the sample, blending the three cell-site heights at its vertices — the natural
-piecewise-linear surface through samples taken at the sites, and what a terrain mesh built
-from this data would be. Two earlier interpolations were worse:
-
-- **Inverse-distance weighting** over a cell's corners read as a plateau: every corner is
-  roughly equidistant from the middle of a cell, so the interior came out near the mean of
-  the corners.
-- **Barycentric over the cell's own corner fan** creased at each of the six-odd internal fan
-  edges *and* put a tent pole at every site, so the surface came out visibly crumpled — and
-  the fan covers only the *straight* corner polygon while the renderer draws the
-  *subdivided* outline, so 1.78% of pixels missed every triangle and fell through to the
-  inverse-distance formula, speckling every cell boundary.
-
-The Delaunay triangulation tiles the hull, so there is nothing to fall through, and it
-creases once per edge rather than six times per cell.
+## Platform notes
+
+- **Linux and macOS.** Both are supported with the plain CMake commands above.
+- **Same seed, same world.** The C++ standard does not fix how `std::uniform_*_distribution`,
+  `std::shuffle` or `std::sort` (for equal elements) behave, and libstdc++ and libc++
+  differ. [`portable_random.h`](coopa/maps/portable_random.h) and
+  [`portable_sort.h`](coopa/maps/portable_sort.h) reimplement libstdc++'s algorithms, and
+  on Apple the target adds `-ffp-contract=off` so Clang does not fuse multiply-adds. A macOS
+  build produces the same `map_out.yaml` as Linux for `--seed=42`.
+- **stb_image_write.** `image_writer.h` (and `map_export.h`, which includes it) compiles
+  a static copy of stb_image_write into each translation unit that includes it. A file that
+  also includes another project's copy of stb_image_write will not compile, so keep the
+  two apart. [`examples/map_viewer_export.h`](examples/map_viewer_export.h) explains the
+  pattern the GUI viewer uses.
+
+## Documentation
+
+- [docs/configuration.md](docs/configuration.md): settings resolution, every CLI flag, world
+  scale, landmass shapes, climate, terrain and the elevation surface.
+- [docs/output.md](docs/output.md): the map file, the nine layers, shading, and meshing
+  terrain and water together.
+- [docs/water-and-rivers.md](docs/water-and-rivers.md): sea level, river mouths, valleys
+  and channels.
+- [docs/caves.md](docs/caves.md) and [docs/settlements.md](docs/settlements.md): how those
+  are placed and stored.
+- [docs/performance.md](docs/performance.md): async generation, timings, and checking that
+  parallel output matches serial.
+- [docs/viewer.md](docs/viewer.md): the optional GUI viewer.
+- [coopa/maps/README.md](coopa/maps/README.md) and
+  [coopa/maps/passes/README.md](coopa/maps/passes/README.md): header-by-header and
+  pass-by-pass reference.
+- [assets/config.yaml](assets/config.yaml): every setting with a comment.
 
 ## Legend
 
 ### Biomes
 
-The colours `MapLayers` fills a cell with, from `BiomePalette::biome_colors` in
-[`coopa/maps/map_config.h`](./coopa/maps/map_config.h). The **name** column is the
-`snake_case` identifier written into the `.yaml` and accepted back by `biome_from_name()`
-— that string is a biome's stable on-disk identity, so it is what to key on rather than
-the enum's position. The swatches are SVGs under [`assets/svg/`](./assets/svg), one per
-palette entry.
-
-Both tables and every swatch are generated — run
-[`python3 tools/gen_legend_svg.py`](./tools/gen_legend_svg.py) after changing a palette
-colour, and `test_readme_legend_matches_the_palette` fails the build if they ever drift
-from `BiomePalette`.
+The fill colours from `BiomePalette::biome_colors` in
+[`coopa/maps/map_config.h`](coopa/maps/map_config.h). The YAML name is the biome's stable
+on-disk identity, accepted back by `biome_from_name()`. These rows and the swatches in
+[`assets/svg/`](assets/svg) are checked against the palette by
+`test_readme_legend_matches_the_palette`.
 
 | Colour | Biome | YAML name | Hex | RGB |
 |---|---|---|---|---|
@@ -1131,26 +311,19 @@ from `BiomePalette`.
 | ![](assets/svg/dunes.svg) | Dunes | `dunes` | `#E8CE94` | 232, 206, 148 |
 | ![](assets/svg/volcanic_field.svg) | Volcanic field | `volcanic_field` | `#5C4A46` | 92, 74, 70 |
 
-`ocean` and `lake` share a colour deliberately — they are the same water to look at, and
-what separates them is whether the body reaches the edge of the map, which a reader can
-see from the shape rather than the hue. `ice` is a *frozen* body and is coloured as a pale
-version of that same blue rather than as a fourth near-white beside `snow`, `glacier` and
-`salt_flat`: a river has to visibly end in water, and ending in something the eye files
-with snowfields does not count.
+`ocean` and `lake` share a colour on purpose: they look like the same water, and a lake is
+told apart by its shape. `ice` is a pale version of the same blue, so a river visibly ends
+in water. Only these three ever colour a water cell. `marsh`, `swamp` and `boreal_wetland`
+are dry land beside the water.
 
-Only those three ever colour a water cell. `marsh`, `swamp` and `boreal_wetland` are dry
-land — waterlogged basin floor beside the water, not the water itself.
-
-> **These are the untinted, unshaded colours.** Two things move a rendered pixel off the
-> table value. At the default `show_regions = true` and `region_tint = 0.13`, every claimed
-> land cell is mixed 13% toward its region's colour so that provinces are visible — generate
-> with `--no-regions`, or set `MapConfig::show_regions = false`, for exact matches. And the
-> **composite** additionally lights every land pixel by its elevation or its slope, so match
-> against `_biomes.png` rather than `_composite.png`.
+These are untinted, unshaded colours. With `show_regions` on (the default), each claimed
+land cell is mixed 13% (`region_tint`) toward its region's colour, and the composite also
+lights every land pixel. For exact matches, compare against `_biomes.png` generated with
+`--no-regions` or `show_regions: false`.
 
 ### Overlays
 
-Drawn over the filled cells, in this order — each layer covers the one beneath it.
+Drawn over the filled cells in this order; each covers the one beneath it.
 
 | Colour | Overlay | Hex | RGB | Shape |
 |---|---|---|---|---|
@@ -1169,41 +342,5 @@ Drawn over the filled cells, in this order — each layer covers the one beneath
 | ![](assets/svg/cave-mouth.svg) | Cave mouth | `#E6E6EC` | 230, 230, 236 | Ring on the slope a system opens on |
 | ![](assets/svg/background.svg) | Background | `#FFFFFF` | 255, 255, 255 | Whatever no cell covers |
 
-The three road tiers are told apart by **width** first and colour second, which is how a
-paper map does it. `RoadClass` is not a label anything chooses: it is read off
-`MapEdge::traffic`, the number of routes the road pass sent along that edge, so a highway
-is a highway because everything goes that way.
-
-The elevation render has no legend — it is a greyscale heightmap, black at sea level and
-white at the highest point, with rivers dimmed 10 values per channel over the terrain
-beneath rather than painted over it.
-
-## Running the tests
-
-The suite is a separate target, since the bare project name belongs to the generator:
-
-```bash
-cbuild
-./build/mapcoopa_tests      # or: ctest --test-dir build
-```
-
-69 cases covering determinism, the graph invariants, every pass, both renderers, the
-configuration loader, the world scale, the asynchronous API and the YAML round
-trip — including that every parallel path reproduces its serial one exactly.
-
-## Consuming it from another repo
-
-`add_subdirectory()` this repo and link `coopa::maps`; the standalone guard means you get
-the interface target and nothing else — no extra binaries, no ctest entries.
-
-```cmake
-set(MAPCOOPA_DIR "${ROOT_DIR_PARENT}/mapcoopa")
-if(NOT TARGET coopa::maps)
-    add_subdirectory(${MAPCOOPA_DIR} ${CMAKE_CURRENT_BINARY_DIR}/mapcoopa-build)
-endif()
-target_link_libraries(your_target PRIVATE coopa::maps)
-```
-
-`coopa::maps` pulls in `coopa::lib` transitively, so glm and fkYAML come with it. The
-delaunator, FastNoiseLite and stb_image_write headers this repo vendors under `includes/`
-are on its interface include path too.
+The three road tiers are told apart by width first and colour second. `RoadClass` comes
+from `MapEdge::traffic`, the number of routes the road pass sent along that edge.
