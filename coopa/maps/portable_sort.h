@@ -11,7 +11,7 @@
  * coopa::maps::sort is a faithful port of libstdc++'s introsort (median-of-three
  * pivot, unguarded partition, heap-sort fallback at 2*lg(n) depth, final
  * insertion sort with a 16-element threshold), so maps generated on Linux are
- * unchanged and every other platform now matches them exactly. See
+ * unchanged and every other platform matches them exactly. See
  * portable_random.h for the matching distributions.
  */
 

@@ -43,15 +43,14 @@ namespace maps {
  * its own line a cell away, trunks consolidate, and traffic concentrates enough
  * that the hierarchy means something.
  *
- * ### What this replaces
+ * ### Why routed rather than contoured
  *
- * The previous implementation flooded four elevation bands outward from the
- * coast and flagged any edge whose two corners fell in different bands. That
- * traces contour lines, and contour lines connect nothing: a road could run
- * half the map without passing a settlement, every road was the same width, and
- * `TownConfig::road_bonus` was rewarding proximity to a contour rather than to a
- * trade route. The switchbacks that pass produced for free survive here on
- * purpose -- see `RoadConfig::slope_cost`.
+ * Flagging every edge whose corners fall in different elevation bands traces
+ * contour lines, and contour lines connect nothing: a road could run half the
+ * map without passing a settlement, every road would be the same width, and
+ * `TownConfig::road_bonus` would reward proximity to a contour rather than to a
+ * trade route. Switchbacks still emerge here, from the cost model -- see
+ * `RoadConfig::slope_cost`.
  *
  * ### Why it can run before the town pass
  *

@@ -18,10 +18,9 @@ namespace maps {
  * @brief Samples a fractal noise field configured once at construction.
  *
  * Holding the `FastNoiseLite` instance as a member is the whole point of this
- * class. The original wrapper rebuilt the generator and reapplied all eight
- * settings on *every* sample, and the water pass constructed a fresh wrapper
- * for every corner -- tens of thousands of full generator setups to produce
- * one island mask.
+ * class. Rebuilding the generator and reapplying all eight settings on every
+ * sample, or constructing a fresh wrapper per corner, would mean tens of
+ * thousands of full generator setups to produce one island mask.
  */
 class Noise {
 public:

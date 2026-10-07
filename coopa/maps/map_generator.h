@@ -315,11 +315,11 @@ private:
      *
      * Bordering cells are forced to water by the water pass, which is what
      * guarantees a map is an island rather than a landmass sliced off by the
-     * frame. Unlike the original this marks every offending corner of a cell,
-     * not just the first one found.
+     * frame. It marks every offending corner of a cell, not just the first one
+     * found.
      *
      * The frame is `MapConfig::shape` -- a rectangle spanning the canvas by
-     * default, which is what it always was, or any other outline inscribed in it.
+     * default, or any other outline inscribed in it.
      * See `ShapeField`.
      */
     void border_check_() {

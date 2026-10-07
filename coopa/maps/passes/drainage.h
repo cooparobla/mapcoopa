@@ -36,8 +36,8 @@ inline constexpr double k_fill_epsilon = 1e-7;
  * noise, the rank remap and the smoothing passes all move corners
  * independently, and any of them can leave a corner lower than every
  * neighbour. Such a corner is a pit, and a downhill walk that reaches one
- * stops on dry land. On a default map 80 of 11 438 land corners were pits,
- * which is why 23 of 55 rivers used to end in the middle of a field.
+ * stops on dry land. Unfilled, a default map has 80 of 11 438 land corners as
+ * pits, enough to end 23 of 55 rivers in the middle of a field.
  *
  * This is the priority-flood fill (Barnes, Lehman & Mulla 2014), which is
  * what DEM processing uses for the same problem. Every corner already at or

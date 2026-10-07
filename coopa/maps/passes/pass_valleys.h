@@ -22,12 +22,12 @@ namespace maps {
  * @class PassValleys
  * @brief Lowers the ground along every watercourse, so rivers sit in valleys.
  *
- * Rivers erode, and until this pass existed nothing in the height field knew it.
- * Elevation is computed before rivers are routed -- it has to be, the routing
- * follows `MapCorner::downslope` -- so the generator produced a drainage network
- * drawn across a surface with nowhere for the water to go. The elevation layer
- * showed no trace of the rivers the water layer was full of, and a mesh built
- * from the data had rivers running over flat ground.
+ * Rivers erode, and this pass is what tells the height field so. Elevation is
+ * computed before rivers are routed -- it has to be, the routing follows
+ * `MapCorner::downslope` -- so without it the drainage network would be drawn
+ * across a surface with nowhere for the water to go: the elevation layer would
+ * show no trace of the rivers the water layer is full of, and a mesh built from
+ * the data would have rivers running over flat ground.
  *
  * ### A valley, not a channel
  *
@@ -43,13 +43,12 @@ namespace maps {
  *
  * ### Why it does not simply paint
  *
- * The elevation layer once had its rivers dimmed into it, and that was removed
- * for a good reason: it made the layer a picture of the terrain rather than the
- * terrain itself, and a consumer flooding a mesh to those values found channels
- * already cut. Nothing here paints. The ground is genuinely lower, the water
- * surface `stroke_river_surface_()` draws still sits `river_depth_m` above the
- * bed it now finds at the bottom of the valley, and flooding a mesh to it gives
- * the same answer it always did.
+ * Nothing here paints: dimming rivers into the elevation layer would make it a
+ * picture of the terrain rather than the terrain itself, and a consumer flooding
+ * a mesh to those values would find channels already cut. The ground is
+ * genuinely lower, the water surface `stroke_river_surface_()` draws sits
+ * `river_depth_m` above the bed it finds at the bottom of the valley, and
+ * flooding a mesh to that surface gives a consistent answer.
  */
 class PassValleys {
 public:

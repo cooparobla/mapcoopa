@@ -395,12 +395,12 @@ public:
      * Shaded per pixel from the cell's corner heights rather than filled flat: a
      * flat fill draws the Voronoi tessellation, not the terrain.
      *
-     * Rivers do show here, and nothing about that is painted. The layer once had
-     * the river network *dimmed* into it, which was the wrong thing twice over --
-     * it made the layer a picture of the terrain rather than the terrain itself,
-     * and a consumer flooding a mesh to those values found channels already cut.
+     * Rivers do show here, and nothing about that is painted. Dimming the river
+     * network into the layer would be wrong twice over -- it would make the layer
+     * a picture of the terrain rather than the terrain itself, and a consumer
+     * flooding a mesh to those values would find channels already cut.
      *
-     * What shows now is ground that really is lower, at two scales. `PassValleys`
+     * What shows is ground that really is lower, at two scales. `PassValleys`
      * carves the valley into the control mesh, and `make_river_channels()` cuts
      * the channel into the surface sampled between its vertices. The second is
      * what makes a river legible: the mesh has 60 m between sites and a river is
@@ -408,7 +408,7 @@ public:
      * 500 m depression with no edge -- measurably deep and invisible to look at.
      *
      * Set `river_incision_m` and `river_channel_depth_m` to 0 and the network
-     * vanishes from here again, because then the ground really is flat under it.
+     * vanishes from here, because then the ground really is flat under it.
      *
      * How the surface is drawn *between* the cells is
      * `MapConfig::elevation_surface`. The default interpolates, which is why a map
@@ -476,11 +476,10 @@ public:
      * No ink over the fills -- no borders, no outlines, no shading. That makes
      * the layer readable as *data*: every pixel is either exactly one region's
      * colour or exactly the background, so a consumer can recover which region
-     * covers a pixel by looking it up. Country borders used to be stroked over
-     * the top in near-black, which broke that property for the 93 k pixels they
-     * covered, and read as an artefact besides: a border only exists on a
-     * land-to-land edge, so every one of them dangled into the sea instead of
-     * closing around its country.
+     * covers a pixel by looking it up. Country borders stroked over the top would
+     * break that property for every pixel they covered, and read as an artefact
+     * besides: a border only exists on a land-to-land edge, so every one of them
+     * would dangle into the sea instead of closing around its country.
      *
      * Countries are therefore not distinguishable here. `MapCountry` is still in
      * the graph and in `world.yaml` for anyone who needs it, and the composite
@@ -503,7 +502,7 @@ public:
      *
      * Trails, then roads, then highways, so a highway is never interrupted by the
      * trail joining it. No casing: a 6 m road over shaded ground reads as a road
-     * without an outline, and the outline was what made it read as drawn-on ink.
+     * without an outline, and an outline would make it read as drawn-on ink.
      */
     static Image roads(const MapGraph& graph, const MapConfig& config,
                        const BiomePalette& palette = BiomePalette{},
@@ -794,13 +793,12 @@ private:
     /**
      * @brief Strokes a river's water surface at the heights `RiverSurfaces` settled on.
      *
-     * The height is not computed here, and twice now that has been the whole bug.
-     * It was once interpolated between `MapCorner::elevation` values, which is the
-     * control mesh rather than the surface the elevation layer draws -- so half of
-     * every watercourse was drawn beneath the terrain. Then it was computed per
-     * segment in isolation, which cannot see that a water surface only falls, nor
-     * that a river has a sea to meet. Both are properties of the course, so the
-     * course is where they are decided.
+     * The height is deliberately not computed here. Interpolating between
+     * `MapCorner::elevation` values would follow the control mesh rather than the
+     * surface the elevation layer draws, putting half of every watercourse beneath
+     * the terrain; computing it per segment in isolation cannot see that a water
+     * surface only falls, nor that a river has a sea to meet. Both are properties
+     * of the course, so the course is where they are decided.
      *
      * Width is still stepped along the corner chain here, since that is a property
      * of the stroke rather than of the surface: depth and width both rise with
@@ -1082,9 +1080,9 @@ private:
      * `image_size * meters_per_pixel == grid_size * meters_per_grid_unit`, which
      * is the invariant `MapConfig::image_size` documents and the config loader
      * enforces. They are *not* equal when a caller sets `image_size` by hand and
-     * leaves the scale behind: this used to draw markers 7.5x oversized on every
-     * test render for exactly that reason, while the roads and rivers beside them
-     * came out right.
+     * leaves the scale behind, and dividing by `meters_per_pixel` there would
+     * draw markers oversized (7.5x on the test renders) while the roads and rivers
+     * beside them came out right.
      *
      * Taking one scale for the whole renderer means a resolution set either way
      * round scales every feature together, and the invariant stops being load
@@ -1268,8 +1266,8 @@ private:
      * The width itself comes from `blend_radius_()`, not from here: the blur radius
      * is the distance over which `blurred - sharp` is non-trivial near an edge, so
      * it is exactly how far the weight has to travel to hide the step. Sizing the
-     * feather against the *cell* instead was a real defect -- at a 3000 px grid-80
-     * render with `elevation_blend = 0.1` that gave a 7 px feather against a 3 px
+     * feather against the *cell* instead would be wrong -- at a 3000 px grid-80
+     * render with `elevation_blend = 0.1` that gives a 7 px feather against a 3 px
      * blur, smearing each cell's value across its neighbours and averaging the
      * whole effect away.
      *
@@ -1789,8 +1787,8 @@ private:
      * `Blended` returns the same height *without* the cut, because it is only the
      * first of three stages -- the raster it produces is blurred and then re-cut by
      * `smooth_elevation_raster_()` once the whole image exists. A blend cannot be
-     * decided per pixel per cell: doing that was the bug this replaced, and it drew
-     * a bevelled rim around every cell outline instead of smoothing anything.
+     * decided per pixel per cell: doing that draws a bevelled rim around every
+     * cell outline instead of smoothing anything.
      *
      * Terrain detail is left out of both, and that asymmetry is deliberate:
      * roughness is surface *texture*, which a fill constant across a cell has no

@@ -7,8 +7,7 @@ project(mapcoopa)
 # Left unset, CMake passes no optimisation flags at all and GCC/Clang default to
 # -O0. That is not a small difference here: a default map takes 40.9 s at -O0 and
 # 9.5 s at -O3, because this is a software rasteriser and a deflate encoder
-# pushing 23 megapixels seven times over. Every binary this project produced
-# before this line was unoptimised.
+# pushing 23 megapixels nine times over, once per layer.
 #
 # Guarded on being the top-level project so a consumer that pulls mapcoopa in via
 # add_subdirectory() keeps its own build type -- overriding a parent project's
@@ -67,7 +66,7 @@ target_link_libraries(mapcoopa_lib INTERFACE coopa::lib)
 # which rounds differently from the separate multiply and add that GCC emits in
 # its ISO (-std=c++20) mode. Turning contraction off makes a macOS build
 # byte-identical to the Linux one (verified on map_out.yaml, --seed=42).
-# Apple-only so the Linux build's flags are exactly as before.
+# Apple-only so the Linux build's flags are untouched.
 if(APPLE)
     target_compile_options(mapcoopa_lib INTERFACE
         $<$<COMPILE_LANG_AND_ID:CXX,AppleClang,Clang>:-ffp-contract=off>)
@@ -81,10 +80,10 @@ endif()
 # Same guard sfxcoopa/CMakeLists.txt and uicoopa/CMakeLists.txt already use.
 #
 # NOTE on the coopa::maps claim above ("nothing here touches Vulkan, GLFW or any
-# sibling repo other than libcoopa"): that is still true of the LIBRARY, which is
-# what a consumer gets. It is no longer true of this repo built as an application
-# -- mapcoopa_viewer below is a uicoopa/gfxcoopa GUI and therefore a Vulkan binary.
-# Everything about it lives inside this guard precisely so the distinction holds. ---
+# sibling repo other than libcoopa"): that holds for the LIBRARY, which is what a
+# consumer gets, but not for this repo built as an application -- mapcoopa_viewer
+# below is a uicoopa/gfxcoopa GUI and therefore a Vulkan binary. Everything about
+# it lives inside this guard precisely so the distinction holds. ---
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     # The map generator owns the bare project name so `cplay` *is* the generate
     # command: `cbuild && cplay --seed=42 --out=world`. cplay forwards its

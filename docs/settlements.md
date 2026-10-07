@@ -20,7 +20,7 @@ the map file, so a consumer can lay them out too.
 ## Alignment
 
 Interior buildings take the bearing of the nearest street rather than a random rotation.
-Measured, that raised the share of buildings fronting a street from 51% to 83%. Positions
+Measured, 83% of buildings front a street, against 51% with random rotations. Positions
 stay jittered, so the layout never becomes a grid.
 
 ## Clearance
@@ -28,8 +28,8 @@ stay jittered, so the layout never becomes a grid.
 Buildings are kept off the roadway. Every candidate footprint is tested against the
 settlement's streets and against the `MapRoad` polylines through its cells, each at half its
 width plus `street_clearance_m`. The test uses the whole rotated footprint and the same
-separating-axis routine two buildings use. Before this, 37% of buildings stood on a lane and
-18% on a road; both are now zero.
+separating-axis routine two buildings use. Without the test, 37% of buildings stand on a lane
+and 18% on a road; with it, none do.
 
 `building_corners()` in [`map_data.h`](../coopa/maps/map_data.h) gives a footprint's four
 rotated corners. Containment and non-overlap are guaranteed against those corners.

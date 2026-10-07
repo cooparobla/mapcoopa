@@ -29,9 +29,9 @@ namespace maps {
  * @brief Parameters for the fractal noise field that decides land from water.
  *
  * The fields map one-to-one onto FastNoiseLite's setters. They are typed
- * against FastNoiseLite's own enums rather than the raw `int`s the original
- * configuration used -- those were `static_cast` at the point of use, so
- * `type = 0` silently meant OpenSimplex2 and nothing in the file said so.
+ * against FastNoiseLite's own enums rather than raw `int`s, which would be
+ * `static_cast` at the point of use, so `type = 0` would silently mean
+ * OpenSimplex2 and nothing in the file would say so.
  */
 struct NoiseConfig {
     /** @brief Seed for the noise field; independent of `MapConfig::seed`. */
@@ -603,8 +603,8 @@ struct RoadConfig {
      *
      * The reason mountain roads switchback. Climbing straight up is dear and
      * traversing a slope is not, so a route crosses the contour at a shallow
-     * angle and doubles back -- which is what the old contour-flooding pass
-     * drew directly, now arrived at for a reason rather than by construction.
+     * angle and doubles back. Switchbacks emerge from the cost rather than
+     * being drawn by construction.
      */
     double slope_cost = 9.0;
     /** @brief Cost per unit of absolute height; pushes a crossing onto the saddle. */
@@ -792,7 +792,7 @@ struct CaveConfig {
      *
      * What makes a cave multi-level, and it is not a stylistic choice: a valley
      * downcuts, the water table follows it down, and the phreatic network cut at
-     * the old level is left behind as dry passage above the new one. Do that
+     * the higher level is left behind as dry passage above the new one. Do that
      * twice and the system has three storeys with rock between them, which is
      * exactly the structure the exported floor and roof layers exist to carry.
      *
@@ -897,8 +897,8 @@ struct CaveConfig {
      * @brief Cap on stations per system; the hard bound on how long growth can run.
      *
      * Shared across every level a system grows, so it is divided rather than
-     * spent once. At the old 400 a three-level cave got some 130 stations a
-     * storey and read as three stubs stacked up, which is why this is generous.
+     * spent once. At 400 a three-level cave gets some 130 stations a storey and
+     * reads as three stubs stacked up, which is why this is generous.
      */
     int max_nodes = 900;
     /** @brief Width of an ordinary passage, in metres. */
@@ -925,8 +925,7 @@ struct CaveConfig {
  *
  * A `MapConfig` plus its `seed` fully determines the output: every pass draws
  * from a generator seeded from this struct, so two runs with equal configs
- * produce byte-identical maps. That was not true of the original, whose
- * noisy-edge pass seeded itself from the wall clock.
+ * produce byte-identical maps.
  */
 struct MapConfig {
     // --- Sampling ---
@@ -950,18 +949,18 @@ struct MapConfig {
      * is on the ground: at 60 m a cell holds a cluster of ten or so buildings,
      * which is what a village is, and `grid_size = 80` gives a 4.8 km world.
      *
-     * Before this existed, grid units were abstract and every physical size was
-     * tuned by eye against a fixed render resolution. Roads came out 12 m wide
-     * and nothing in the generator could have said so.
+     * Without it grid units would be abstract and every physical size would be
+     * tuned by eye against a render resolution, with nothing in the generator
+     * able to say how wide a road is.
      */
     double meters_per_grid_unit = 60.0;
 
     /**
      * @brief Metres of height the normalised `[0, 1]` elevation field spans.
      *
-     * The vertical scale, and the world had none: `meters_per_grid_unit` fixed
-     * how far a grid unit reaches *across* the ground while height stayed a bare
-     * fraction, so "a river one metre deep" had nowhere to land. With this, the
+     * The vertical scale. `meters_per_grid_unit` fixes how far a grid unit
+     * reaches *across* the ground; without this height would be a bare fraction,
+     * and "a river one metre deep" would have nowhere to land. With this, the
      * sea floor is at 0 m, the waterline at `sea_level * elevation_range_m`, and
      * the highest peak at the full range.
      *
@@ -1063,7 +1062,7 @@ struct MapConfig {
      * of each cell's own edge sharpness against an unvaried render: standard
      * deviation 0.154 at variation 0.5 and 0.294 at 1, and adjacent cells landing
      * on opposite sides of the uniform blur across 3.5% of shared edges -- against
-     * 0.3% for the low-frequency field this replaced, which is the difference
+     * 0.3% for a low-frequency field (0.045, last row of the table below), which is the difference
      * between variation you can see and variation you cannot.
      *
      * **It scales `elevation_blend`, so a small blend leaves little to vary.** At
@@ -1201,14 +1200,14 @@ struct MapConfig {
      * | 0.25 | 4 cells | 0.35 | loose clumps |
      * | 0.2 | 5 cells | 0.51 | clear patches |
      * | 0.125 | 8 cells | 0.78 | broad regions |
-     * | 0.045 | 22 cells | **0.97** | the old behaviour: no visible variation |
+     * | 0.045 | 22 cells | **0.97** | no visible variation |
      *
      * Note the knee: anything at or above 0.5 is already fully decorrelated, so
      * raising it further buys nothing. The interesting range is 0.5 down to 0.125.
      *
-     * That last row is where this started. The field ran at 0.045 on the theory
-     * that smoothness should vary the way bedrock hardness does -- a defensible
-     * idea that produced nothing anyone could see, because at a correlation of 0.97
+     * That last row is the trap. A frequency like 0.045 follows the theory that
+     * smoothness should vary the way bedrock hardness does -- a defensible
+     * idea that produces nothing anyone can see, because at a correlation of 0.97
      * every cell in any neighbourhood gets the same factor and the map comes out
      * uniformly blurred. What varies has to vary at the scale of the thing it
      * varies.
@@ -1275,8 +1274,8 @@ struct MapConfig {
      * distributed.
      *
      * It shapes the *temperate* half of the curve only. Where the frozen ground
-     * begins is `polar_extent_north` / `polar_extent_south`, which used to be an
-     * emergent consequence of this exponent and is now said outright.
+     * begins is set outright by `polar_extent_north` / `polar_extent_south`, not
+     * left to emerge from this exponent.
      */
     double temperature_falloff = 1.7;
     /**
@@ -1304,8 +1303,8 @@ struct MapConfig {
      * never selects ice, glacier or cold desert. Altitude still can, which is
      * right: a mountain is cold at any latitude.
      *
-     * The default reproduces the cap the old curve happened to produce -- at a
-     * falloff of 1.7 the band fell below freezing beyond `0.8^(1/1.7)` of the way
+     * The default matches the cap a single power curve would produce -- at a
+     * falloff of 1.7 the band falls below freezing beyond `0.8^(1/1.7)` of the way
      * to the pole, which is the outer 6.5% of the map.
      */
     double polar_extent_north = 0.065;
@@ -1329,9 +1328,7 @@ struct MapConfig {
      * spread over all of them.
      *
      * `MapConfig::elevation_surface` is the setting that turns the interpolation
-     * off. The facet claim this doc used to make belonged to the corner-fan
-     * interpolation these passes were written against, which creased once per fan
-     * edge and put a tent pole at every site; the Delaunay surface replaced it.
+     * off.
      */
     int elevation_smoothing_iterations = 6;
     /** @brief How far toward the neighbour mean each smoothing pass moves a corner. */
@@ -1341,13 +1338,13 @@ struct MapConfig {
      *
      * A real height, not a convention. The sea bed occupies everything below it
      * and land everything above, so "the ground here is under water" is an
-     * honest comparison rather than a vacuous one -- which it was when the whole
-     * field started at zero and the sea was pinned to the bottom of it.
+     * honest comparison rather than a vacuous one, as it would be if the whole
+     * field started at zero and the sea were pinned to the bottom of it.
      *
-     * Two consequences worth knowing. The elevation layer now carries genuine
+     * Two consequences worth knowing. The elevation layer carries genuine
      * bathymetry, dark where the sea is deep. And the sea's surface is a visible
-     * mid-grey on the same scale as everything else, rather than the black that
-     * made it indistinguishable from dry land.
+     * mid-grey on the same scale as everything else, rather than a black that
+     * would be indistinguishable from dry land.
      *
      * Land therefore spans `[sea_level, 1]`, so anything comparing against a
      * *land* height must go through `land_height()` first.
@@ -1370,8 +1367,8 @@ struct MapConfig {
     /**
      * @brief Lowest elevation a river may start from.
      *
-     * The other half of why rivers used to be short: at the old 0.3 a source
-     * could appear on the coastal plain it was meant to run down to.
+     * The other half of keeping rivers long: a low floor (0.3, say) lets a source
+     * appear on the coastal plain it is meant to run down to.
      */
     double river_source_min_elevation = 0.45;
     /** @brief Highest elevation a river may start from. */
@@ -1380,13 +1377,13 @@ struct MapConfig {
     int river_smoothing_iterations = 2;
 
     /**
-     * @brief Width of a volume-zero stream, in grid units.
+     * @brief Width of a volume-zero stream, in metres.
      *
-     * Widths are physical, not pixel counts. The original expressed them in
-     * pixels, which made a river's width depend on the render resolution -- the
-     * same map at 2048 had rivers half as wide in world terms as at 1024, and
-     * the town packer had no resolution-independent number to keep buildings
-     * out of the channel.
+     * Widths are physical, not pixel counts. A pixel width would make a river's
+     * width depend on the render resolution -- the same map at 2048 would have
+     * rivers half as wide in world terms as at 1024 -- and would leave the town
+     * packer no resolution-independent number to keep buildings out of the
+     * channel.
      */
     double river_width_base_m = 5.0;
     /** @brief Additional width per unit of river volume, in metres. */
@@ -1520,10 +1517,10 @@ struct MapConfig {
      *
      * A cart track. These three are real widths and not render tuning: at the
      * default `meters_per_pixel` they come out 3, 6 and 10 pixels, because that
-     * is what 3, 6 and 10 metres of ground are. They were previously expressed
-     * in grid units and chosen so the three would land on different *pixel*
-     * widths, which at 60 m to the grid unit meant a 12 m road and an 18 m
-     * highway -- motorway proportions on a medieval map.
+     * is what 3, 6 and 10 metres of ground are. Widths picked so the three land
+     * on different *pixel* widths at some resolution give the wrong ground
+     * widths -- a 12 m road and an 18 m highway are motorway proportions on a
+     * medieval map.
      */
     double trail_width_m = 3.0;
     /** @brief Carriageway width of a `RoadClass::Road`, in metres; two carts abreast. */
@@ -2143,8 +2140,8 @@ inline double road_width_for(const MapConfig& config, RoadClass road_class) {
  * @brief Render colours, in 0-255 component range, indexed by `Biome`.
  *
  * A flat array rather than one named field per biome: the renderer needs a
- * colour per cell per frame, and indexing an array by the enum replaces the
- * twenty-branch string comparison chain the original did at that point.
+ * colour per cell per frame, and indexing an array by the enum avoids a
+ * twenty-branch string comparison chain at that point.
  */
 struct BiomePalette {
     /** @brief One colour per `Biome`, indexed by `static_cast<std::size_t>(biome)`. */
@@ -2189,9 +2186,8 @@ struct BiomePalette {
     /**
      * @brief Colour of a `RoadClass::Road` stroke.
      *
-     * Warm earth rather than the flat black this used to be. A pure black line
-     * of even width across a coloured map reads as an administrative border,
-     * not as a road -- which is exactly how the old contour roads read.
+     * Warm earth rather than black. A pure black line of even width across a
+     * coloured map reads as an administrative border, not as a road.
      */
     glm::vec3 road_color = glm::vec3(122, 101, 82);
     /** @brief Colour of a `RoadClass::Trail` stroke. */
@@ -2201,11 +2197,10 @@ struct BiomePalette {
     /**
      * @brief Colour of a bridge or causeway parapet, drawn square across the road.
      *
-     * Stone, not the near-black this used to share with a road casing. The
-     * casing is gone: it was a dark outline under every stroke, added so a road
-     * would not vanish against dark forest, and at 6 m wide over a hillshaded
-     * composite a road no longer needs one. What it did instead was make every
-     * road read as drawn-on ink rather than as ground.
+     * Stone rather than near-black. Roads have no dark casing: at 6 m wide over a
+     * hillshaded composite a road does not vanish against dark forest, and an
+     * outline under every stroke would make each road read as drawn-on ink
+     * rather than as ground.
      */
     glm::vec3 bridge_color = glm::vec3(112, 108, 102);
     /** @brief Colour of the settlement marker drawn at a town's centre. */
@@ -2220,8 +2215,7 @@ struct BiomePalette {
      * @brief Colour of a civic building -- a hall, market, temple and the rest.
      *
      * Distinct from `building_color` on purpose: a settlement whose key structures
-     * look exactly like its houses has no legible centre, which is what every
-     * settlement used to be.
+     * look exactly like its houses has no legible centre.
      */
     glm::vec3 civic_color = glm::vec3(150, 92, 46);
     /** @brief Colour of a street inside a settlement; a lane, not a road. */
@@ -2236,10 +2230,6 @@ struct BiomePalette {
      * elevation map of the caves in the same way the terrain layer does of the
      * ground. Warm at the top and cold at the bottom, which is the one ordering a
      * reader does not have to be told.
-     *
-     * The exported `cave_floor_*` and `cave_roof_*` layers ignore both: those are
-     * data, written in the same eight-bit greyscale as the elevation layer so they
-     * can be compared with it directly.
      */
     glm::vec3 cave_shallow_color = glm::vec3(236, 196, 120);
     /** @brief Colour of the deepest cave passage on the overview layer. */
@@ -2253,7 +2243,7 @@ struct BiomePalette {
 
     /**
      * @brief Looks up the stroke colour for a road class.
-     * @param road_class The class to colour; `None` returns the casing colour.
+     * @param road_class The class to colour; `None` returns `bridge_color`.
      * @return The palette entry, in 0-255 component range.
      */
     const glm::vec3& color_for(RoadClass road_class) const {

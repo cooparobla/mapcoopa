@@ -16,10 +16,10 @@ namespace maps {
  * @enum BuildingRole
  * @brief What a building is for, which is what makes a settlement read as one.
  *
- * Every footprint used to be the same object: a square of the same size in the
- * same colour, so a capital of seventy buildings had no hall, no market and no
- * centre -- only more squares than a village. A role is what lets a reader tell
- * the difference, and what lets a consumer place the right mesh.
+ * Without roles every footprint would be the same object: a square of the same
+ * size in the same colour, so a capital of seventy buildings would have no hall,
+ * no market and no centre -- only more squares than a village. A role is what
+ * lets a reader tell the difference, and what lets a consumer place the right mesh.
  *
  * `Dwelling` is the default and the overwhelming majority; the rest are the civic
  * core, granted by tier and placed nearest the square.

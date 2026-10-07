@@ -162,9 +162,9 @@ inline void chaikin_smooth(std::vector<MapPoint>& points, int iterations) {
  *
  * This is the unit gameplay cares about: it carries the biome, the elevation
  * and the moisture. Its three adjacency lists hold indices into `MapGraph`
- * rather than pointers; the original stored `shared_ptr`s in both directions,
- * so `center -> corners -> touches -> center` formed a reference cycle and the
- * entire graph leaked on every generation.
+ * rather than pointers: `shared_ptr`s in both directions would make
+ * `center -> corners -> touches -> center` a reference cycle and leak the
+ * entire graph on every generation.
  */
 struct MapCenter {
     CenterId index = k_invalid_id; /**< @brief This cell's own index; equals its slot in `MapGraph::centers`. */
@@ -337,8 +337,8 @@ struct MapBuilding {
     /**
      * @brief What the building is for; `Dwelling` unless it is part of the civic core.
      *
-     * Defaulted, so every reader written before roles existed -- and every map
-     * saved without them -- still means exactly what it used to.
+     * Defaulted, so a reader that ignores roles -- and a map saved without them --
+     * sees every building as a dwelling.
      */
     BuildingRole role = BuildingRole::Dwelling;
 };
@@ -353,9 +353,9 @@ struct MapBuilding {
  * both, toward the cell's farthest corners so that even an isolated hamlet has a
  * lane rather than a scatter.
  *
- * This used to be private to the town pass, which is exactly why settlements read
- * as random: the buildings were lined up along something nobody could see. Emitted
- * as map data, a street is drawn, exported, and available to a consumer laying
+ * Streets are map data rather than private to the town pass because buildings are
+ * lined up along them: a settlement whose streets nobody can see reads as random.
+ * Emitted here, a street is drawn, exported, and available to a consumer laying
  * cobbles.
  */
 struct MapStreet {
@@ -718,7 +718,7 @@ struct MapCave {
      * @brief Every water table the system was cut at, shallowest first.
      *
      * A cave has more than one level because the valley it drains to cut down and
-     * took the water table with it: the phreatic network at the old level was left
+     * took the water table with it: the phreatic network at the higher level was left
      * behind as dry passage, and a new one formed below. Each entry here is one
      * such stage, so the size of this is how many storeys the system has.
      *
@@ -918,21 +918,21 @@ public:
      * The nearest site to any point is always a vertex of the Delaunay triangle
      * containing it, so for a point in the cell the answer is in that set.
      *
-     * ### Two interpolations this replaced, and why both were wrong
+     * ### Two alternatives, and why both are wrong
      *
-     * **Inverse-distance weighting over the cell's corners** read as a plateau.
+     * **Inverse-distance weighting over the cell's corners** reads as a plateau.
      * Every corner is roughly equidistant from the middle of a cell, so the
-     * interior came out near the mean of the corners and only approached a
+     * interior comes out near the mean of the corners and only approaches a
      * corner's own value in the last few pixels before it.
      *
      * **Barycentric over the cell's own corner fan** -- site to two consecutive
-     * corners -- was worse. It put a crease at each of the six-odd internal fan
+     * corners -- is worse. It puts a crease at each of the six-odd internal fan
      * edges *and* a tent pole at every site, whose height is the mean of its
-     * corners, so the surface came out visibly crumpled. And the fan covers only
+     * corners, so the surface comes out visibly crumpled. And the fan covers only
      * the *straight* corner polygon while the renderer draws the *subdivided*
-     * outline, which bulges outside it: 1.78% of drawn pixels missed every fan
-     * triangle and fell through to the inverse-distance formula, speckling every
-     * cell boundary with slivers of a different surface.
+     * outline, which bulges outside it: some 1.8% of drawn pixels miss every fan
+     * triangle and need a fallback formula, speckling every cell boundary with
+     * slivers of a different surface.
      *
      * The Delaunay triangulation has neither problem. It tiles the hull, so there
      * is no outside to fall through, and it creases once per edge rather than six
@@ -1318,7 +1318,7 @@ public:
 /**
  * @brief Steepness of the ground across an edge, as a dimensionless grade.
  *
- * The one definition of "how steep is it here", and until caves there was none.
+ * The one definition of "how steep is it here".
  * The renderer's `hillshade_()` takes a gradient, but off the *blurred eight-bit
  * raster* and with a 600x exaggeration baked in, so it answers a question about
  * a picture rather than about the ground. `RoadConfig::slope_cost` multiplies a

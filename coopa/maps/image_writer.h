@@ -7,11 +7,11 @@
  * library with no separate compilation unit.
  *
  * `STB_IMAGE_WRITE_STATIC` gives every translation unit that includes this
- * header its own internal-linkage copy of the encoder. The alternatives were
+ * header its own internal-linkage copy of the encoder. The alternatives are
  * both worse: defining `STB_IMAGE_WRITE_IMPLEMENTATION` with external linkage
- * in a header -- what the original map generator did -- is a one-definition-rule
- * violation the moment a second translation unit includes it, and moving the
- * implementation into a `.cpp` would make libcoopa no longer header-only. The
+ * in a header is a one-definition-rule violation the moment a second
+ * translation unit includes it, and moving the implementation into a `.cpp`
+ * would stop `coopa::maps` being header-only. The
  * cost is a duplicated encoder in each translation unit that writes a PNG,
  * which in practice is one.
  */

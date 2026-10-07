@@ -62,18 +62,17 @@ coastline.
    ┌─────────────────┐        ┌─────────────────┐
    │  map_renderer.h │        │   map_yaml.h    │
    │  MapLayers      │        │  save_map()     │
-   │ 13 image layers │        │  load_map()     │
+   │  9 image layers │        │  load_map()     │
    └────────┬────────┘        └─────────────────┘
             ▼
    ┌─────────────────┐
-   │ image_writer.h  │  ──►  13 .png layers
+   │ image_writer.h  │  ──►  9 .png layers
    └─────────────────┘
 ```
 
 Cells, corners and edges refer to each other by `CenterId` / `CornerId` / `EdgeId`
-indices into `MapGraph`'s three arrays. That is a deliberate departure from the original,
-which stored `shared_ptr`s in both directions and therefore leaked the whole graph on
-every generation. The cost is one invariant every pass must respect: a record's slot is
+indices into `MapGraph`'s three arrays rather than `shared_ptr`s, which in both directions
+would form reference cycles and leak the whole graph on every generation. The cost is one invariant every pass must respect: a record's slot is
 its own index, so a pass that needs ranked order sorts an index array, never the storage.
 
 ---
@@ -81,11 +80,12 @@ its own index, so a pass that needs ranked order sorts an index array, never the
 ## File Breakdown
 
 ### [`map_config.h`](./map_config.h)
-`MapConfig` (grid density, seed, thresholds, nine pass toggles), `NoiseConfig` (typed
-against FastNoiseLite's own enums rather than the raw `int`s the original cast at the
-point of use), `TownConfig`, and `BiomePalette`. The palette is a flat array indexed by
-`Biome`, which replaces the twenty-branch string comparison the renderer used to run per
-cell.
+`MapConfig` (grid density, seed, thresholds, fourteen pass toggles), `NoiseConfig` (typed
+against FastNoiseLite's own enums rather than raw `int`s cast at the point of use),
+the per-pass configs (`RoadConfig`, `RegionConfig`, `TownConfig`, `LandmarkConfig`,
+`CaveConfig`), the landmass `MapShape` / `ShapeConfig` / `ShapeField`, and `BiomePalette`. The palette is a flat array indexed by
+`Biome`, so the renderer looks a colour up per cell rather than running a string comparison
+chain.
 
 ### [`biome.h`](./biome.h)
 The `Biome` enum (33 entries), its stable `snake_case` serialisation names, and
@@ -108,6 +108,10 @@ with their stable `snake_case` names, exactly as `building.h` carries the buildi
 zone is *recorded* rather than inferred from the floor height, because which regime cut a
 passage depends on where that system's mouth opened and on nothing about the passage in hand.
 
+### [`building.h`](./building.h)
+`BuildingRole` (`Dwelling` plus the civic roles) and its stable `snake_case` names, append-only
+like the biome names.
+
 ### [`landmark.h`](./landmark.h)
 `LandmarkKind`, its names, the descriptive noun each takes, and `landmark_suits_biome()` —
 the gate that stops a volcano appearing on ice or an oasis outside a desert.
@@ -129,9 +133,8 @@ polygon in winding order by walking its corners and chaining the edge paths betw
 cannot have its winding recovered by sorting points about their centroid.
 
 ### [`noise.h`](./noise.h)
-`Noise`, a FastNoiseLite instance configured once at construction. The original rebuilt
-the generator and reapplied all eight settings on every sample, and the water pass built
-a fresh one per corner.
+`Noise`, a FastNoiseLite instance configured once at construction and shared across a
+pass, so no sample pays for rebuilding the generator.
 
 ### [`map_generator.h`](./map_generator.h)
 `MapGenerator` — lays the jittered point lattice and its boundary ring, triangulates with
@@ -143,23 +146,25 @@ The fourteen annotation stages, one header each. See [`passes/README.md`](./pass
 
 ### [`image.h`](./image.h) and [`image_writer.h`](./image_writer.h)
 `Image` (an 8-bit interleaved buffer, not a texture — mapcoopa carries no graphics
-dependency) plus half-space triangle fill, convex polygon fan fill and Bresenham strokes.
+dependency) plus half-space triangle fill, convex polygon fan fill and distance-tested line
+strokes (`draw_line()`); `image_writer.h` adds `write_png()`.
+
 ### [`map_renderer.h`](./map_renderer.h)
 `MapLayers` renders nine views of a map — elevation, water surface, biomes, roads,
 structures, landmarks, regions, a lit composite of all of them, and a readable cave overview.
 Cave *geometry* is deliberately not among them and is not rastered at all: a branching network
 at several depths does not fit a stack of heightmaps without being both flattened and
 quantised, and the saved map already carries every station and passage at full precision, so
-the picture would be a lossy and much larger copy of the document. See the
-[repository README](../../README.md#caves) for the measurements that settled it.
+the picture would be a lossy and much larger copy of the document. See
+[docs/caves.md](../../docs/caves.md#storage) for the measurements.
 
 What the composite does carry is a ring at each cave mouth, drawn by `draw_markers_()`
 alongside the town and landmark markers so the composite and the landmarks overlay cannot
 disagree about it. A passage is underground; a mouth is a hole in a hillside. The three overlay layers are RGBA on transparency so they stack; the rest
 are RGB. Every layer is drawn at the same
 scale, so at the default one pixel per metre a width measured off a render is a
-measurement of the ground. See the [repository README](../../README.md#layers) for the file
-list and the colour legend.
+measurement of the ground. See [docs/output.md](../../docs/output.md#layers) for the file
+list and the [repository README](../../README.md#legend) for the colour legend.
 
 The composite lights its biome colours by `MapConfig::composite_shading`. `Elevation`, the
 default, is a function of height read straight from `MapGraph::elevation_at()` — high
@@ -179,11 +184,11 @@ All of it is a debugging aid: a consumer wanting a smooth heightfield should sam
 
 `elevation_at()` interpolates barycentrically over the Delaunay triangle containing the
 sample, blending the three cell-site heights at its vertices — the natural piecewise-linear
-surface through samples taken at the sites. It reached that via two worse interpolations:
-inverse-distance weighting over a cell's corners, which read as a plateau, and barycentric
-over the cell's own corner fan, which creased six times per cell, put a tent pole at every
-site, and left 1.78% of drawn pixels outside every triangle because the fan covers the
-straight corner polygon while the renderer draws the subdivided one. An overload
+surface through samples taken at the sites. Two alternatives are worse: inverse-distance
+weighting over a cell's corners reads as a plateau, and barycentric over the cell's own
+corner fan creases six times per cell, puts a tent pole at every site, and leaves some 1.8%
+of drawn pixels outside every triangle because the fan covers the straight corner polygon
+while the renderer draws the subdivided one. An overload
 takes a `TerrainDetail` — a borrowed `Noise` plus an amplitude, built by
 `make_terrain_detail()` — and displaces the result, tapered by the local height so a
 coastline stays at sea level. A further overload takes a `RiverChannels` from
@@ -205,7 +210,7 @@ and compute the same cut.
 
 `MapCenter::water_level` is the *surface* of whatever water covers a cell, flat per body,
 as against `elevation` which is the height of the ground underneath. That distinction is
-the whole reason the water layer can draw a sheet: drawing `elevation` drew the sea bed.
+the whole reason the water layer can draw a sheet: drawing `elevation` would draw the sea bed.
 
 `MapConfig::sea_level` is a real height partway up the field, not zero, so the sea bed sits
 below it and land above — which is what makes "under water" a comparison rather than a
@@ -222,7 +227,7 @@ the operation has already run inline by the time a task exists, so there is one 
 call pattern either way.
 
 ### [`map_export.h`](./map_export.h)
-`MapExporter` — renders all thirteen layers and writes them, in parallel. Its own header rather
+`MapExporter` — renders all nine layers and writes them, in parallel. Its own header rather
 than more of `map_renderer.h` because exporting needs `image_writer.h`, which carries the
 stb *implementation*; a consumer rendering a layer into a texture should not have to link an
 encoder.
@@ -231,6 +236,11 @@ Two levels of parallelism, both by disjoint output so the result is bit-identica
 serial run: across layers (which is the only way to overlap PNG encodes, stb's deflate
 being one opaque call per image) and across row bands within a layer. Nesting them is safe —
 `JobEngine::wait_for()` has a waiting worker participate rather than idle.
+
+### [`portable_random.h`](./portable_random.h) and [`portable_sort.h`](./portable_sort.h)
+`UniformIntDistribution`, `UniformRealDistribution`, `shuffle()` and `sort()`: reimplementations
+of libstdc++'s algorithms, so a seed produces the same world with libc++ (macOS) as with
+libstdc++ (Linux). Every pass uses these instead of the `std::` versions.
 
 ### [`map_yaml.h`](./map_yaml.h)
 `save_map()` / `load_map()`, and the `map_to_node()` / `map_from_node()` pair beneath
@@ -294,7 +304,7 @@ for (const coopa::maps::MapLandmark& landmark : map.landmarks) {
 
 // Persist it, and render a preview.
 coopa::maps::save_map(map, config, "world.yaml");
-coopa::maps::write_png("world_biomes.png",
+coopa::maps::write_png("world_composite.png",
                        coopa::maps::MapLayers::composite(map, config));
 
 // Load it back in a later session.

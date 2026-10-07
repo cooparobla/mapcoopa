@@ -95,9 +95,9 @@ private:
     /**
      * @brief Rank-normalises wetness so it spans `[0, 1]` uniformly.
      *
-     * Sorts an index array, not the corner storage. The original sorted
-     * `corners` itself, permanently breaking the `corners[i].index == i`
-     * invariant every later pass and the serialiser depend on.
+     * Sorts an index array, not the corner storage: sorting `corners` itself
+     * would break the `corners[i].index == i` invariant every later pass and
+     * the serialiser depend on.
      */
     void redistribute_moisture_(MapGraph& graph) const {
         const std::size_t count = graph.corners.size();

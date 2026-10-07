@@ -1,15 +1,16 @@
 /**
  * @file map_generator.cpp
- * @brief Standalone tool that generates a random map and writes it out as two
- *        PNG renders and one YAML document.
+ * @brief Standalone tool that generates a random map and writes it out as one
+ *        PNG render per `MapLayer` and one YAML document.
  *
- * Build target `coopa_mapgen`. Settings come from four places, each overriding
- * the one before it:
+ * Build target `mapcoopa` (so `cplay` runs it). Settings come from four places,
+ * each overriding the one before it:
  *
  *   1. `MapConfig`'s in-struct defaults, sized for the small map a bare
  *      `MapConfig` gives a library consumer.
- *   2. `k_scene_*` below -- this tool's own defaults, which is what keeps a run
- *      with no configuration file producing the documented 80-cell world.
+ *   2. The overrides at the top of `main()` -- this tool's own defaults, which
+ *      keep a run with no configuration file producing the documented 80-cell
+ *      world.
  *   3. `assets/config.yaml`, or whatever `--config=` names.
  *   4. Command-line flags, so trying something never means editing a
  *      version-controlled file.
@@ -19,9 +20,9 @@
  * worse than generating none.
  *
  * @code
- * ./build/coopa_mapgen                          # assets/config.yaml, written to ./map_out.*
- * ./build/coopa_mapgen --seed=251 --out=/tmp/m  # reproducible, written to /tmp/m.*
- * ./build/coopa_mapgen --config=/tmp/alt.yaml   # a different configuration entirely
+ * ./build/mapcoopa                          # assets/config.yaml, written to ./map_out.*
+ * ./build/mapcoopa --seed=251 --out=/tmp/m  # reproducible, written to /tmp/m.*
+ * ./build/mapcoopa --config=/tmp/alt.yaml   # a different configuration entirely
  * @endcode
  */
 
@@ -132,7 +133,7 @@ bool match_option(std::string_view argument, std::string_view name, std::string_
 } // namespace
 
 /**
- * @brief Parses the command line, generates a map, and writes the three output files.
+ * @brief Parses the command line, generates a map, and writes the layer PNGs and YAML.
  * @param argc Argument count.
  * @param argv Argument values.
  * @return 0 on success, 1 on a bad argument or a failed write.
@@ -163,7 +164,7 @@ int main(int argc, char** argv) {
     // never be able to disagree about how much ground a pixel covers.
     int image_size_override = 0;
     // 0 means one worker per core. 1 means no engine at all -- the serial path,
-    // which is what the byte-for-byte comparison in the README is run against.
+    // which is what the byte-for-byte comparison in docs/performance.md is run against.
     int threads = 0;
     // One flag drives whichever dimension the chosen shape actually uses, so a
     // caller does not have to know that a circle reads `diameter_m` and a

@@ -265,7 +265,7 @@ inline fkyaml::node config_to_node(const MapConfig& config) {
     landmarks["cape_ocean_ratio_denominator"] = config.landmarks.cape_ocean_ratio_denominator;
 
     // The pass toggles live under one key rather than loose at the root: there are
-    // twelve of them, they are the coarsest thing in the file, and grouping them
+    // fourteen of them, they are the coarsest thing in the file, and grouping them
     // is what lets a reader see the pipeline at a glance.
     fkyaml::node passes = fkyaml::node::mapping();
     passes["enable_water"] = config.enable_water;

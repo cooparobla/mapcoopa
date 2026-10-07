@@ -56,7 +56,7 @@ namespace maps {
  *
  * **Why it has storeys.** A water table is not fixed. The valley a system drains
  * to cuts down over time and the table follows it, which abandons the network cut
- * at the old level -- leaving it as dry passage -- and starts a new one below.
+ * at the higher level -- leaving it as dry passage -- and starts a new one below.
  * `level_tables_()` works out how many stages a mouth has the relief to support,
  * and growth then runs the same two-regime model once per stage, joining each to
  * the next with the vadose descent that is what a shaft between levels *is*.
@@ -504,10 +504,10 @@ private:
      * old level was abandoned and left dry above the new one. Each entry returned
      * here is one of those stages, shallowest first.
      *
-     * The sequence is anchored at the *bottom* rather than the top, which is what
-     * keeps `vadose_share` and `max_depth_m` meaning what they have always meant:
-     * the deepest table sits exactly where the single table used to, so a system
-     * still bottoms out where the configuration says it may. The abandoned levels
+     * The sequence is anchored at the *bottom* rather than the top, which keeps
+     * `vadose_share` and `max_depth_m` meaning the same thing whatever the number
+     * of levels: the deepest table sits where a single table would, so a system
+     * bottoms out where the configuration says it may. The abandoned levels
      * are then stacked upward from it at `level_spacing_m`, as many as fit while
      * leaving at least one spacing of entrance series between the mouth and the
      * shallowest of them -- a cave whose first table is immediately under its own

@@ -8,8 +8,7 @@
  * `ctest --test-dir build`.
  *
  * The harness is the same hand-rolled RUN_TEST/ASSERT_* one libcoopa uses,
- * carried over verbatim when this module was split out, so the cases below are
- * unchanged from the ones that used to live in libcoopa/test.cpp.
+ * so the cases below read the same as libcoopa's own tests.
  */
 
 #include <algorithm>
@@ -165,7 +164,7 @@ static void test_classify_biome_table() {
 
     // A water cell is `Ice` or `Lake` and nothing else, at any elevation and any
     // moisture -- see `test_water_cells_always_get_a_water_biome` for why that
-    // matters. A shallow lake used to come back `Marsh` and a high one `Ice`.
+    // matters. A shallow lake must not come back `Marsh`, nor a high one `Ice`.
     ASSERT_TRUE(classify_biome(0.05, 0.5, 0.5, true, false, false) == Biome::Lake);
     ASSERT_TRUE(classify_biome(0.9, 0.5, 0.5, true, false, false) == Biome::Lake);
     ASSERT_TRUE(classify_biome(0.5, 0.5, 0.5, true, false, false) == Biome::Lake);
@@ -338,8 +337,8 @@ static void test_generate_is_deterministic() {
         ASSERT_TRUE(std::abs(a.centers[i].elevation - b.centers[i].elevation) < 1e-12);
         ASSERT_TRUE(std::abs(a.centers[i].moisture - b.centers[i].moisture) < 1e-12);
     }
-    // The noisy-edge pass used to seed itself from the wall clock, so this is
-    // where a reintroduced non-deterministic seed would show up first.
+    // The noisy-edge pass draws random midpoints, so this is where a
+    // non-deterministic seed (the wall clock, say) would show up first.
     for (std::size_t i = 0; i < a.edges.size(); ++i) {
         ASSERT_EQ(a.edges[i].noisy_points0.size(), b.edges[i].noisy_points0.size());
         ASSERT_EQ(a.edges[i].river, b.edges[i].river);
@@ -391,8 +390,8 @@ static void test_graph_invariants_hold() {
 
     for (std::size_t i = 0; i < graph.centers.size(); ++i) {
         const MapCenter& center = graph.centers[i];
-        // The moisture pass used to sort this array in place, which broke the
-        // identity between a record's slot and its own index.
+        // A pass that sorted this array in place (the moisture pass ranks by
+        // wetness) would break the identity between a slot and its own index.
         ASSERT_EQ(center.index, static_cast<CenterId>(i));
         ASSERT_TRUE(center.elevation >= 0.0 && center.elevation <= 1.0);
         ASSERT_TRUE(center.moisture >= 0.0 && center.moisture <= 1.0);
@@ -608,7 +607,7 @@ static void test_building_layout_is_not_a_lattice() {
     }
 
     ASSERT_TRUE(total > 0);
-    // Measured at 100% for jittered placement, 62% for the lattice it replaced.
+    // Measured at 100% for jittered placement; a regular lattice scores 62%.
     ASSERT_TRUE(distinct * 100 >= total * 90);
 }
 
@@ -625,12 +624,11 @@ static void test_buildings_front_their_streets() {
     std::size_t fronting = 0;
 
     for (const MapTown& town : graph.towns) {
-        // The settlement's own streets, not a second set re-derived here. This
-        // used to rebuild them from the road and river edges, which silently
-        // missed the fallback lanes a cell with neither is given -- so it scored
-        // every building fronting one of those as fronting nothing, and measured
-        // 62% where the layout was actually at 72%. A test that recomputes what it
-        // is checking measures its own copy.
+        // The settlement's own streets, not a second set re-derived here.
+        // Rebuilding them from the road and river edges would miss the fallback
+        // lanes a cell with neither is given, and score every building fronting
+        // one of those as fronting nothing. A test that recomputes what it is
+        // checking measures its own copy.
         if (town.streets.empty()) {
             continue;
         }
@@ -669,10 +667,10 @@ static void test_buildings_front_their_streets() {
     }
 
     ASSERT_TRUE(total > 0);
-    // Measured at 72%: 51% before the interior infill stopped drawing its yaw from
-    // a full turn, 83% after, and back to 72% once plots were set back far enough
-    // to clear the carriageway -- a building held off the lane by its own size is
-    // further from the centreline than one standing on it. Uniformly random yaw
+    // Measured at 72%. Plots are set back far enough to clear the carriageway, and
+    // a building held off the lane by its own size is further from the centreline
+    // than one standing on it, so this is below what yaw alignment alone would
+    // give. Uniformly random yaw
     // would put only ~8% within `rotation_jitter` of a street, so this still
     // separates a street-aware layout from jittered noise by a wide margin.
     ASSERT_TRUE(fronting * 100 >= total * 65);
@@ -720,13 +718,12 @@ static void test_renderers_produce_a_full_image() {
 /**
  * @brief Rivers reach the height field by carving it, and only by carving it.
  *
- * The elevation layer used to have its river network *dimmed* into it, which was
- * wrong twice over: it made the layer a picture of the terrain rather than the
- * terrain itself, and a consumer flooding a mesh to those values found channels
- * already cut. That painting is gone and is not coming back.
+ * The elevation layer must not paint the river network into itself: that would
+ * make the layer a picture of the terrain rather than the terrain itself, and a
+ * consumer flooding a mesh to those values would find channels already cut.
  *
- * What replaced it is the valley pass, which lowers the ground. So the layer must
- * now differ when rivers run -- otherwise the carve never reached the pixels --
+ * Rivers reach it through the valley pass, which lowers the ground. So the layer
+ * must differ when rivers run -- otherwise the carve never reached the pixels --
  * and must be *bit-identical* once the incision is set to zero, which is the
  * guarantee that the only thing moving the image is the terrain itself.
  */
@@ -923,10 +920,10 @@ static void test_temperature_offset_shifts_the_world() {
 /**
  * @brief A settlement emits the streets its buildings were laid out along.
  *
- * They used to be private to the pass: real enough to place plots against, and
- * invisible to everyone else. A settlement whose streets nobody can see reads as
- * a scatter no matter how carefully it was arranged, so emitting them is the
- * change, not a side effect of it.
+ * Streets kept private to the pass would be real enough to place plots against
+ * and invisible to everyone else. A settlement whose streets nobody can see reads
+ * as a scatter no matter how carefully it was arranged, so emitting them is part
+ * of the layout, not a side effect of it.
  */
 static void test_towns_emit_their_streets() {
     MapConfig config = world_config(251);
@@ -1043,8 +1040,8 @@ static void test_nothing_is_built_in_the_square() {
 /**
  * @brief A settlement has a civic core, sized to what it is.
  *
- * Every building used to be the same object, so a capital was a village with more
- * squares in it. Roles are what make the tiers different in kind rather than only
+ * Without roles every building is the same object, so a capital is a village with
+ * more squares in it. Roles are what make the tiers different in kind rather than only
  * in count -- and the core sits at the heart, not scattered through the outskirts.
  */
 static void test_settlements_have_a_civic_core() {
@@ -2042,11 +2039,10 @@ static MapConfig perturbed_config() {
     config.border_length = 1.75;
     // The render scale, set from the metres end. `image_size` is not listed
     // separately: it is not independent of this, and the two are reconciled on
-    // load -- see the assertions in `test_config_round_trips_every_field`. It
-    // used to say `image_size = 333` beside a `meters_per_pixel` of 1.0 on a
-    // 37 x 60 m world, which is 2220 m of ground claiming to be 333 px at one
-    // pixel to the metre: a pair that could not both be true, and which only went
-    // unnoticed because the value was overwritten before anything read it.
+    // load -- see the assertions in `test_config_round_trips_every_field`.
+    // Setting both here would invite a contradictory pair (say `image_size = 333`
+    // beside 1 m per pixel on a 37 x 60 m world, 2220 m of ground claiming to be
+    // 333 px) that load would silently overwrite.
     config.meters_per_pixel = 3.0;
     config.png_compression_level = 4;
     config.sea_level = 0.18;
@@ -2359,7 +2355,7 @@ static void test_config_round_trips_every_field() {
     ASSERT_EQ(loaded.landmarks.cape_ocean_ratio_numerator,
               original.landmarks.cape_ocean_ratio_numerator);
 
-    // All twelve toggles, which a saved map used to lose outright.
+    // Every pass toggle survives the round trip.
     ASSERT_TRUE(loaded.enable_water == original.enable_water);
     ASSERT_TRUE(loaded.enable_coast == original.enable_coast);
     ASSERT_TRUE(loaded.enable_elevation == original.enable_elevation);
@@ -2463,9 +2459,8 @@ static void test_shipped_config_matches_the_documented_defaults() {
  * converted through the scale, so a contradictory pair draws features at a width
  * the resolution does not agree with.
  *
- * `image_size` used to be read out of a document and then thrown away, so
- * `image_size: 2048` in a configuration file was silently ignored. It is now
- * honoured, and honouring it means back-computing `meters_per_pixel`.
+ * `image_size: 2048` in a configuration file is honoured, not read and thrown
+ * away, and honouring it means back-computing `meters_per_pixel`.
  */
 static void test_config_image_size_sets_the_scale() {
     const std::string path = "test_image_size.yaml";
@@ -2770,15 +2765,14 @@ static void test_caves_descend_from_their_mouths() {
 /**
  * @brief A cave grows more than one storey.
  *
- * The regression guard for the bug the level model exists to fix. Before it, a
- * system was one near-planar sheet -- an entrance series down to a single water
- * table and a network spread along it -- so "multi-level cave" was a phrase the
- * documentation used and the geometry did not support.
+ * Guards what the level model exists for. Without it a system is one near-planar
+ * sheet -- an entrance series down to a single water table and a network spread
+ * along it -- and "multi-level cave" is a phrase the geometry does not support.
  *
  * Checked on a population rather than on one lucky cave, because how many storeys
  * a system gets is derived from the relief beneath its mouth: a map where only the
  * single highest mouth managed a second table would satisfy a weaker claim and
- * still be the old behaviour in all but name.
+ * still be single-level in all but name.
  */
 static void test_caves_grow_more_than_one_storey() {
     MapConfig config = cave_config(11);
@@ -2870,12 +2864,12 @@ static void test_cave_storeys_are_further_apart_than_a_chamber_is_tall() {
  * passages out of it is that nobody added the call. A mouth is a hole in a
  * hillside, so the composite *must* show it.
  *
- * Those pull in opposite directions, and byte-identity alone can no longer express
- * the first now that the second exists. So the differing pixels are bounded
+ * Those pull in opposite directions, and byte-identity cannot express the first
+ * while the second holds. So the differing pixels are bounded
  * instead: every pixel the caves change on the composite has to lie within a mouth
  * marker's reach of an actual mouth. Draw a passage there by accident and the
  * pixels land hundreds of metres from any mouth and this fails, which is exactly
- * the guarantee the old identity check was protecting.
+ * the guarantee a byte-identity check would give.
  */
 static void test_only_cave_mouths_reach_the_surface_layers() {
     MapConfig with = cave_config(3);
@@ -3082,12 +3076,12 @@ static void test_features_render_at_their_configured_size() {
 /**
  * @brief A stroke is the width it was asked for, whichever way it runs.
  *
- * Two width bugs lived here in turn, and neither was visible from a horizontal
- * measurement. A **square** brush widened a line by up to sqrt(2) off the axes,
- * so a diagonal 6 m road drew 8 m wide. Replacing it with a round brush stamped
- * along an 8-connected path introduced the opposite error -- the path advances
- * sqrt(2) of ground per step, so a diagonal drew 0.707 of its width. `draw_line()`
- * now paints by distance to the segment and has neither problem.
+ * Two brush-based strokes get this wrong, and neither shows in a horizontal
+ * measurement. A **square** brush widens a line by up to sqrt(2) off the axes, so
+ * a diagonal 6 m road draws 8 m wide. A round brush stamped along an 8-connected
+ * path makes the opposite error -- the path advances sqrt(2) of ground per step,
+ * so a diagonal draws 0.707 of its width. `draw_line()` paints by distance to the
+ * segment and has neither problem.
  *
  * Measured as painted area over Euclidean length, which is direction-independent;
  * a scanline measures the secant across anything not perpendicular to it. The
@@ -3426,8 +3420,8 @@ static void test_flat_surface_draws_one_height_per_cell() {
 /**
  * @brief The flat surface shows the rivers too.
  *
- * A flat fill was said to have nowhere to put a river channel, since a channel is
- * far narrower than the cell it crosses. That was wrong: the cut is a function of
+ * A flat fill might seem to have nowhere to put a river channel, since a channel
+ * is far narrower than the cell it crosses. It does: the cut is a function of
  * position, not of the interpolation, so it subtracts from a constant just as
  * readily as from a gradient. Measured against a uniform cell the rivers come out
  * at 11.6 grey levels of contrast, where the interpolated surface manages 12.3.
@@ -3534,22 +3528,20 @@ static void test_blended_at_zero_is_flat() {
 /**
  * @brief Blending smooths the whole raster, not the rim of each cell.
  *
- * This replaces a test that asserted the mechanism it was written for, and the two
- * disagree on purpose. `blended` was first built as a per-pixel term evaluated
- * *inside each cell*: pull the flat height toward the interpolated one near the
- * cell's own rim. The old test pinned exactly that -- core untouched, rim moved --
- * and it passed while the mode was visibly broken, because a map where every cell
- * ramps its own edge is a field of bevelled tiles with a halo tracing each outline.
- * It drew the tessellation more sharply than the hard edges it was meant to hide.
+ * Not "core untouched, rim moved": a per-pixel term evaluated *inside each cell*,
+ * pulling the flat height toward the interpolated one near the cell's own rim,
+ * would satisfy that and still look broken, because a map where every cell ramps
+ * its own edge is a field of bevelled tiles with a halo tracing each outline. It
+ * draws the tessellation more sharply than the hard edges it is meant to hide.
  *
- * So the property is now stated over the image. A blend is a pass over the
+ * So the property is stated over the image. A blend is a pass over the
  * rasterised grid, and both halves matter:
  *
  * - **Steps fall.** The 99th percentile adjacent-pixel step goes 34 grey levels on
  *   `flat` to 12, 8 and 6 as the knob climbs -- measured, and barred well clear.
- * - **Cores move.** 82.9% of cell sites no longer read their stored height. Under
- *   the mechanism this replaced that figure was 0 by construction, so this is the
- *   half that would have caught the halo.
+ * - **Cores move.** 82.9% of cell sites do not read their stored height. A
+ *   rim-only blend scores 0 here by construction, so this is the half that
+ *   catches the halo.
  *
  * The *worst* step is deliberately not asserted: it stays near 75 at every blend,
  * and it is the river cut-bank, which is re-cut after the blur and is supposed to
@@ -3624,21 +3616,18 @@ static void test_blended_smooths_the_whole_raster() {
         }
     }
     ASSERT_TRUE(cores > 0);
-    // 82.9% measured. The broken mechanism scored 0% here by construction.
+    // 82.9% measured. A rim-only blend scores 0% here by construction.
     ASSERT_TRUE(moved * 2 > cores);
 }
 
 /**
  * @brief Blend variation is picked per *cell*, so neighbours can differ.
  *
- * This replaces a test that measured high-frequency detail averaged over 32 px
- * tiles, and the two disagree about the scale on purpose. That metric was written
- * for a field varying over some twenty cells; it passed while the feature was
- * visibly broken, because a 32 px tile spans about three cells and per-cell
- * variation partly averages out inside one. Measuring at the wrong scale is how
- * "the elevation is blurred pretty much consistently across cells" got shipped.
+ * Not measured as high-frequency detail averaged over 32 px tiles: a 32 px tile
+ * spans about three cells and per-cell variation partly averages out inside one,
+ * so a map blurred uniformly across cells can pass that metric.
  *
- * So the measurement is now per cell, and normalised against the *same* cell in an
+ * So the measurement is per cell, and normalised against the *same* cell in an
  * unvaried render. A cell's edge sharpness depends mostly on how much its height
  * differs from its neighbours', which has nothing to do with this knob -- taking
  * the ratio against `variation = 0` divides that out and leaves only what the knob
@@ -3939,7 +3928,7 @@ static void test_composite_shading_modes() {
     // samples a cell at its own site and the composite draws things there. Region
     // tint would give two grassland cells in different provinces different base
     // colours; a landmark or settlement marker would cover the pixel outright,
-    // which is what it was doing -- both samples came back as marker blue.
+    // and both samples would come back as marker blue.
     by_height.show_regions = false;
     by_height.enable_landmarks = false;
     by_height.enable_towns = false;
@@ -4244,8 +4233,8 @@ static void test_export_tuning_does_not_change_output() {
 /**
  * @brief Every body of water has one flat surface, which `elevation` does not.
  *
- * The sea used to render mottled because the water layer drew `elevation` -- the
- * height of the *bed*. Only `border` corners are pinned to zero, and the rank
+ * Drawing the water layer from `elevation` -- the height of the *bed* -- renders
+ * the sea mottled. Only `border` corners are pinned to zero, and the rank
  * remap then spreads every corner across [0, 1], so an ocean cell away from the
  * map edge has a small but nonzero height. Flat water has to be stated.
  */
@@ -4334,11 +4323,10 @@ static void test_water_layer_draws_one_grey_over_open_sea() {
 /**
  * @brief The sampled surface interpolates the control mesh, and joins across cells.
  *
- * Barycentric interpolation replaced inverse-distance weighting, which read as a
- * plateau: every corner is roughly equidistant from the middle of a cell, so most
- * of the interior came out near the mean of the corners. What has to survive the
- * change is that the surface still passes through the values it interpolates and
- * still meets itself at a shared edge.
+ * Barycentric, not inverse-distance weighting, which reads as a plateau: every
+ * corner is roughly equidistant from the middle of a cell, so most of the interior
+ * comes out near the mean of the corners. What is asserted is that the surface
+ * passes through the values it interpolates and meets itself at a shared edge.
  */
 static void test_elevation_interpolates_and_joins() {
     MapConfig config = world_config(23);
@@ -4352,10 +4340,9 @@ static void test_elevation_interpolates_and_joins() {
             continue;
         }
         // At a site the surface passes through that site's own height: the sites
-        // are the interpolation vertices now, not the corners. A Voronoi corner
-        // is interior to a Delaunay triangle, so its own `elevation` is *not*
-        // what the surface reads there, and asserting otherwise was a leftover
-        // from the corner-fan interpolation this replaced.
+        // are the interpolation vertices, not the corners. A Voronoi corner is
+        // interior to a Delaunay triangle, so its own `elevation` is *not* what
+        // the surface reads there.
         ASSERT_TRUE(std::abs(graph.elevation_at(center, center.point.x, center.point.y)
                              - center.elevation) < 1e-9);
         // A sample anywhere in the cell stays in range. Deliberately not asserted
@@ -4559,10 +4546,10 @@ static void test_regions_layer_draws_regions_and_borders() {
 // --- Landmass shapes ------------------------------------------------------
 
 /**
- * @brief The default shape is the square frame it replaced, to the last bit.
+ * @brief The default shape is exactly the square frame, to the last bit.
  *
- * `shape_inset()` took over a hard-coded square test that every map ever
- * generated went through, so this is the regression guard that matters most:
+ * Every default-shape map goes through `shape_inset()`, so this is the guard
+ * that matters most:
  * `min(half - |dx|)` over a canvas-spanning rectangle has to equal
  * `min(x, grid - x, y, grid - y)` for every point, or every existing map moves.
  */
@@ -4882,41 +4869,20 @@ static void test_terrain_relief_reshapes_without_breaking_drainage() {
 
 
 /**
- * @brief Every river ends in a lake or the sea, and the terrain guarantees it.
- *
- * Two properties, and the second is the one that makes the first hold rather
- * than merely happen to be true on this seed.
- *
- * A river is a walk down `downslope`, so where it ends is decided entirely by
- * the height field. Relief noise, the rank remap and two smoothing passes each
- * move corners independently of their neighbours, and any of them can leave a
- * corner lower than everything around it. That corner is a pit, and a river that
- * reaches one stops in the middle of a field. It was not a rare accident: 80 of
- * 11 438 land corners were pits, and 23 of 55 rivers ended dry.
- *
- * `fill_depressions()` removes them, so the assertion here is on
- * the terrain and not on the rivers: *every* dry corner must have a strictly
- * lower neighbour, which by induction gives it a descending path to water. That
- * is a much stronger statement than "the 55 rivers this seed happened to place
- * all found the sea", and it is what a caller adding rivers, changing their
- * sources or sampling flow directly can rely on.
- */
-/**
  * @brief A cell with water in it is classified as water, on every map.
  *
  * The layer a reader actually looks at is coloured by *biome*, not by
  * `MapCenter::water`, so those two disagreeing is a visible defect however sound
- * the underlying data is. `classify_biome()` used to hand a low water cell
- * `Marsh` and a high one `Ice` -- dark green and near-white -- so a river that
- * ended in a shallow lake ended in what reads as forest. 18% of them did, and a
- * lake you cannot see is indistinguishable from no lake at all.
+ * the underlying data is. A low water cell classed `Marsh` or a high one `Ice`
+ * -- dark green and near-white -- makes a river that ends in a shallow lake end in
+ * what reads as forest, and a lake you cannot see is indistinguishable from no
+ * lake at all.
  *
  * Asserted over a generated map rather than on the classifier alone because the
  * two can disagree through the *arguments*: `PassBiomes` passes
- * `land_height()`, so the thresholds are fractions of the land range, and it was
- * exactly that rescale -- moving the waterline off zero -- that pushed most
- * lakes under the old 0.1 marsh threshold. A table test on
- * `classify_biome()` would have stayed green throughout.
+ * `land_height()`, so the thresholds are fractions of the land range, and that
+ * rescale can push most lakes under a land threshold such as a marsh cut-off.
+ * A table test on `classify_biome()` would not see it.
  */
 static void test_water_cells_always_get_a_water_biome() {
     MapGenerator generator(world_config(), maps_logger());
@@ -4955,6 +4921,27 @@ static void test_water_cells_always_get_a_water_biome() {
     }
 }
 
+/**
+ * @brief Every river ends in a lake or the sea, and the terrain guarantees it.
+ *
+ * Two properties, and the second is the one that makes the first hold rather
+ * than merely happen to be true on this seed.
+ *
+ * A river is a walk down `downslope`, so where it ends is decided entirely by
+ * the height field. Relief noise, the rank remap and two smoothing passes each
+ * move corners independently of their neighbours, and any of them can leave a
+ * corner lower than everything around it. That corner is a pit, and a river that
+ * reaches one stops in the middle of a field. Left unfilled it is not a rare
+ * accident: on the default world some 80 of 11 438 land corners are pits, and 23
+ * of 55 rivers end dry.
+ *
+ * `fill_depressions()` removes them, so the assertion here is on
+ * the terrain and not on the rivers: *every* dry corner must have a strictly
+ * lower neighbour, which by induction gives it a descending path to water. That
+ * is a much stronger statement than "the 55 rivers this seed happened to place
+ * all found the sea", and it is what a caller adding rivers, changing their
+ * sources or sampling flow directly can rely on.
+ */
 static void test_every_river_ends_in_a_water_body() {
     MapGenerator generator(world_config(), maps_logger());
     generator.generate();
@@ -5014,10 +5001,10 @@ static void test_every_river_ends_in_a_water_body() {
 /**
  * @brief The waterline is a real height: the sea below it, everything else above.
  *
- * This is what makes "the ground here is under water" a comparison worth making,
- * and it was vacuous before -- the whole field started at zero with the sea
- * pinned to the bottom of it, so nothing was ever below sea level and the sea's
- * own surface rendered as the same black as dry land.
+ * This is what makes "the ground here is under water" a comparison worth making.
+ * With the whole field starting at zero and the sea pinned to the bottom of it,
+ * nothing would ever be below sea level and the sea's own surface would render as
+ * the same black as dry land.
  */
 static void test_waterline_separates_sea_from_land() {
     MapConfig config = world_config(61);
@@ -5391,12 +5378,11 @@ static void test_valleys_are_visible_in_the_height_field() {
 /**
  * @brief A river's water surface stands above the terrain the elevation layer draws.
  *
- * The invariant a consumer meshing the two layers together depends on, and it was
- * broken for a long time without this test noticing -- because the test used to
- * compute the surface *itself*, from `corner.elevation`, and then assert it was
- * above `corner.elevation`. Trivially true, and about the wrong surface.
+ * The invariant a consumer meshing the two layers together depends on. Computing
+ * the surface here from `corner.elevation` and asserting it sits above
+ * `corner.elevation` would be trivially true, and about the wrong surface.
  *
- * It now reads `RiverSurfaces`, the same table the renderer strokes from, and
+ * So this reads `RiverSurfaces`, the same table the renderer strokes from, and
  * compares against the ground the elevation layer actually draws, cut channel and
  * all, sampled across the whole width of the stroke. This is the invariant most at
  * risk from settling the profile downward to meet the sea, which is why it is

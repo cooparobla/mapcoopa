@@ -40,8 +40,8 @@ public:
     void execute(MapGraph& graph, const MapConfig& config, coopa::debug::Logger& logger) const {
         logger.info("map pass: water");
 
-        // One sampler for the whole pass. The original built a fresh
-        // FastNoiseLite per corner, which dominated generation time.
+        // One sampler for the whole pass: building a FastNoiseLite per corner
+        // would dominate generation time.
         const Noise noise(config.noise_island);
 
         for (MapCorner& corner : graph.corners) {

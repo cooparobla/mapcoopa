@@ -28,8 +28,8 @@ mouth and the sea, not a flat sheet at sea level.
 
 ## Storeys
 
-A water table drops over time as the valley it drains to cuts down. The network at the old
-level is left dry and a new one forms below. `level_spacing_m` is the drop between levels.
+A water table drops over time as the valley it drains to cuts down. The network at the
+higher level is left dry and a new one forms below. `level_spacing_m` is the drop between levels.
 How many levels a system gets (up to `max_levels`) comes from the relief beneath its mouth.
 Levels are joined by the same vadose descent that cuts the entrance series.
 
@@ -50,9 +50,9 @@ floor against `elevation_at()` if you need an exact answer.
 ## Storage
 
 Caves are not rasterised. A branching network at several depths does not fit a stack of
-heightmaps without being flattened and quantised. An earlier version wrote floor/roof PNG
-pairs per storey; they were 6.9 MB across 10 files, against 873 KB for the same caves in
-YAML at full precision, and were removed.
+heightmaps without being flattened and quantised, and it would cost more: floor/roof PNG
+pairs per storey measured 6.9 MB across 10 files, against 873 KB for the same caves in YAML
+at full precision.
 
 `save_map()` writes every system: each station with position, floor, roof, radius, cell,
 zone, feature and storey, and each passage as the smoothed polyline that gets drawn. Read

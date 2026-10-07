@@ -34,10 +34,10 @@ namespace maps {
  * noise field that keeps isotherms from running as straight lines, and a global
  * offset that moves the whole world warmer or colder.
  *
- * The latitude band names its polar caps rather than implying them. It used to be
- * `1 - d^falloff`, which does produce caps -- at the default exponent the ground
- * froze beyond 87% of the way to the pole, the outer 6.5% of the map -- but
- * nothing in the configuration said 6.5%, and no value of the exponent says zero.
+ * The latitude band names its polar caps rather than implying them. A plain
+ * `1 - d^falloff` does produce caps -- at the default exponent the ground freezes
+ * beyond 87% of the way to the pole, the outer 6.5% of the map -- but nothing in
+ * the configuration would say 6.5%, and no value of the exponent says zero.
  * `polar_extent_north` and `polar_extent_south` say it outright, one per pole.
  */
 class PassTemperature {

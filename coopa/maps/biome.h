@@ -24,9 +24,9 @@ namespace maps {
  * elevation and moisture, with water, lake and coast handled as special cases
  * before the diagram is consulted.
  *
- * Stored as an enum rather than the `std::string` the original implementation
- * used: the renderer looks a colour up per cell per frame, and a string
- * compare chain of twenty `==` tests was the hot path of that loop. The
+ * Stored as an enum rather than a `std::string`: the renderer looks a colour up
+ * per cell per frame, and a string compare chain of twenty `==` tests would be
+ * the hot path of that loop. The
  * strings survive as `biome_name()` for serialisation only.
  */
 enum class Biome {
@@ -258,17 +258,16 @@ inline Biome classify_biome(double elevation, double moisture, double temperatur
     }
     if (is_water) {
         // Every water cell gets a water biome, without exception. A cell with a
-        // `water_level` is a body of water and has to *read* as one: this used to
-        // hand a shallow lake `Marsh` or `Swamp`, which are dark greens, so on the
-        // biome and composite layers 18% of rivers ended in what looked like
-        // forest. Ending in a lake you cannot see is indistinguishable from ending
-        // nowhere, and "a river ends in water" is worth nothing if the map
-        // disagrees. `Marsh` and `Swamp` are now what the words mean -- wet
-        // *ground*, classified below.
+        // `water_level` is a body of water and has to *read* as one: handing a
+        // shallow lake `Marsh` or `Swamp`, which are dark greens, would make rivers
+        // on the biome and composite layers end in what looks like forest. Ending
+        // in a lake you cannot see is indistinguishable from ending nowhere, and
+        // "a river ends in water" is worth nothing if the map disagrees. `Marsh`
+        // and `Swamp` are what the words mean -- wet *ground*, classified below.
         //
-        // Freezing is on temperature alone. The elevation test that used to sit
-        // here double-counted altitude, because `PassTemperature` already applies
-        // an altitude lapse rate -- a high lake was frozen twice over and a cold
+        // Freezing is on temperature alone. An elevation test here would
+        // double-count altitude, because `PassTemperature` already applies an
+        // altitude lapse rate -- a high lake would be frozen twice over and a cold
         // low one not at all. A tarn in a temperate zone is a lake.
         return temperature < k_biome_frigid ? Biome::Ice : Biome::Lake;
     }

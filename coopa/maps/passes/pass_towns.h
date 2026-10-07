@@ -41,10 +41,9 @@ namespace maps {
  * mouth. Buildings are packed into the accepted cell by scanning a grid and
  * keeping any footprint that lies wholly inside the polygon.
  *
- * The original left this pass as a stub that logged its own name, with a
- * commented-out sketch of the packing step referencing types that never
- * existed. The scoring and placement here are new; the packing follows that
- * sketch's ray-cast containment test.
+ * The upstream generator this ports has no working town pass. The scoring and
+ * placement here are mapcoopa's own; the packing uses a ray-cast containment
+ * test.
  */
 class PassTowns {
 public:
@@ -501,9 +500,9 @@ private:
      * Every candidate is accepted only if all four of its *rotated* corners lie
      * inside the cell and it clears every building already placed. Testing the
      * rotated footprint is what makes `MapBuilding::rotation` a pose a consumer
-     * can trust; the previous implementation tested an axis-aligned box and then
-     * assigned a random yaw afterwards, so a building drawn at its stated angle
-     * could poke outside the cell or into its neighbour.
+     * can trust; testing an axis-aligned box and assigning the yaw afterwards
+     * would let a building drawn at its stated angle poke outside the cell or
+     * into its neighbour.
      *
      * The polygon comes from `MapCenter::corners` rather than the edges' noisy
      * paths: this pass runs before the noisy-edge pass, so those paths do not
@@ -576,9 +575,8 @@ private:
      *
      * Two settlements of one region draw from the same small phoneme table, so a
      * collision is not rare -- it is a matter of how many towns that region got.
-     * Nothing here used to check, and two places on the same map could share a
-     * name, which is worse than a slightly duller name: a consumer keying on a
-     * place name would silently conflate them.
+     * Two places on the same map sharing a name is worse than a slightly duller
+     * name: a consumer keying on a place name would silently conflate them.
      *
      * The last resort is a numeric suffix rather than another draw, because only
      * that terminates: a dialect has a finite vocabulary and a region crowded
@@ -892,9 +890,9 @@ private:
                     // flat distance. A square of side `s` turned by `yaw` relative
                     // to the street reaches `(s/2)(|cos| + |sin|)` across it, so a
                     // flat offset puts every plot larger than it expected onto the
-                    // carriageway -- which is what the largest ones were, by a
-                    // metre, before this. `street_offset` stays as the nominal
-                    // setback and a smaller plot still sits exactly where it did.
+                    // carriageway, the largest by about a metre. `street_offset`
+                    // stays as the nominal setback, so a smaller plot still sits
+                    // at it.
                     const double reach =
                         size * 0.5 * (std::abs(std::cos(yaw)) + std::abs(std::sin(yaw)));
                     const double offset =
@@ -918,10 +916,10 @@ private:
     /**
      * @brief Spends the remaining budget on jittered rejection sampling inside the cell.
      *
-     * Aligned to the nearest street, not to a random bearing. It used to draw a yaw
-     * uniformly from a full turn, which is why a settlement read as scatter however
-     * carefully the frontage had been laid: half the buildings faced nowhere, and a
-     * row is only legible if its neighbours agree with it. Position stays jittered,
+     * Aligned to the nearest street, not to a random bearing. A yaw drawn uniformly
+     * from a full turn makes a settlement read as scatter however carefully the
+     * frontage has been laid: half the buildings face nowhere, and a row is only
+     * legible if its neighbours agree with it. Position stays jittered,
      * which is what keeps the layout off a lattice -- that is a property of where
      * buildings sit, not of which way they face.
      */

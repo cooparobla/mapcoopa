@@ -220,14 +220,12 @@ noise_blend:              # gives each cell its own blur radius under
                           #   0.25  → 4 cells,  r = 0.35  : loose clumps
                           #   0.2   → 5 cells,  r = 0.51  : clear patches
                           #   0.125 → 8 cells,  r = 0.78  : broad regions
-                          #   0.045 → 22 cells, r = 0.97  : the old behaviour — no visible
-                          #                                 variation at all
+                          #   0.045 → 22 cells, r = 0.97  : no visible variation at all
                           # Note the knee: at or above 0.5 the field is already fully
                           # decorrelated, so raising it further buys nothing. The useful range
                           # is 0.5 down to 0.125.
-                          # That last row is where this started — at r = 0.97 every cell in a
-                          # neighbourhood gets the same factor, so the map came out uniformly
-                          # blurred. What varies has to vary at the scale of the thing it
+                          # At r = 0.97 every cell in a neighbourhood gets the same factor, so
+                          # the map comes out uniformly blurred. What varies has to vary at the scale of the thing it
                           # varies.
                           # Not rescaled by grid_size, unlike noise_island: a patch measured in
                           # cells should be that many cells on any map.
@@ -318,21 +316,15 @@ elevation_smoothing_iterations: 3   # Laplacian relaxation passes over the heigh
                                     # drawn surface is interpolated between the stored
                                     # values whatever these say. See elevation_surface,
                                     # which is the setting that turns interpolation off.
-                                    # (This comment used to promise facets at 0. That was
-                                    # true of the corner-fan interpolation these knobs were
-                                    # written against, which creased once per fan edge and
-                                    # put a tent pole at every site; the Delaunay surface
-                                    # replaced it and the promise went stale.)
 elevation_smoothing_strength: 0.5   # how far toward the neighbour mean each pass moves
 sea_level: 0.25               # THE WATERLINE, in the normalised [0,1] height field, and a
                               # real height rather than a convention. The sea bed occupies
                               # everything below it and land everything above, so "this
-                              # ground is under water" is an honest comparison — it was a
-                              # vacuous one when the whole field started at zero and the sea
-                              # was pinned to the bottom of it. Two consequences: the
+                              # ground is under water" is an honest comparison rather than
+                              # a vacuous one. Two consequences: the
                               # elevation layer carries genuine bathymetry, and the sea's
                               # surface is a visible mid-grey on the same scale as
-                              # everything else rather than the black that made it
+                              # everything else rather than black, which would be
                               # indistinguishable from dry land.
                               # Land therefore spans [sea_level, 1], and every threshold
                               # that describes LAND — biome rows, town elevation penalty,
@@ -371,8 +363,8 @@ polar_extent_north: 0.065     # fraction of the map at each edge that is frozen,
 polar_extent_south: 0.065     # north and south independently. 0 means NO polar region on
                               # that side: the cap vanishes and latitude alone never picks
                               # ice, glacier or cold desert — altitude still can, which is
-                              # right, a mountain is cold at any latitude. The default is
-                              # the cap the old curve happened to produce (the outer 6.5%).
+                              # right, a mountain is cold at any latitude. The default
+                              # freezes the outer 6.5% at each edge.
 
 # --- Rivers -----------------------------------------------------------------
 
@@ -576,7 +568,7 @@ subdivide_noisy_edges: true   # wobble each cell boundary instead of drawing it 
 
 # --- Pass toggles -----------------------------------------------------------
 #
-# The twelve stages, in the order MapGenerator runs them. The order is a dependency
+# The fourteen stages, in the order MapGenerator runs them. The order is a dependency
 # chain, not a preference — moisture needs rivers, biomes need moisture, towns need
 # regions. Turning one off leaves the fields it would have written at their defaults
 # rather than reordering anything.

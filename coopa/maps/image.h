@@ -351,11 +351,11 @@ inline void fill_polygon_shaded(Image& image, const std::vector<MapPoint>& verti
  * @brief Draws a line of a given half-width, by distance to the segment.
  *
  * Every pixel whose centre lies within `half_width` of the segment is painted.
- * Not a brush stamped along a rasterised path, which is what this used to be and
- * what two separate width bugs came out of:
+ * Not a brush stamped along a rasterised path, because both kinds of brush get
+ * the width wrong:
  *
  * - A **square** brush widens a line by up to sqrt(2) as it turns off the axes,
- *   so a diagonal 6 m road drew 8 m wide.
+ *   so a diagonal 6 m road draws 8 m wide.
  * - A round brush stamped along an 8-connected path fixes that but introduces
  *   the opposite error: the path advances sqrt(2) of ground per step, so a
  *   diagonal covers sqrt(2) fewer pixels per unit length and draws 0.707 of the

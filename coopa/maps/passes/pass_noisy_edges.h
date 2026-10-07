@@ -46,9 +46,8 @@ public:
     void execute(MapGraph& graph, const MapConfig& config, coopa::debug::Logger& logger) const {
         logger.info("map pass: noisy edges");
 
-        // Seeded from the map, not the wall clock. The original seeded this one
-        // pass from system_clock, which made the whole generator irreproducible
-        // even though every other pass was carefully seeded.
+        // Seeded from the map, not the wall clock: one clock-seeded pass would
+        // make the whole generator irreproducible.
         std::mt19937 rng(static_cast<std::mt19937::result_type>(config.seed) + k_seed_offset);
 
         for (MapEdge& edge : graph.edges) {
@@ -99,9 +98,8 @@ private:
     /**
      * @brief Chooses the subdivision threshold for one edge.
      *
-     * Computed fresh per edge. The original held this in a member that was only
-     * ever assigned, never reset, so the first coastline encountered left the
-     * threshold at its detail value for every subsequent edge in the map.
+     * Computed fresh per edge rather than held in a member, so a coastline's
+     * detail threshold cannot leak into every edge processed after it.
      */
     double min_length_for_(const MapGraph& graph, const MapEdge& edge) const {
         const MapCenter& c0 = graph.centers[static_cast<std::size_t>(edge.d0)];
@@ -139,14 +137,11 @@ private:
     /**
      * @brief Recursively splits the quadrilateral `a b c d`, emitting midpoints.
      *
-     * Three fixes relative to the original, none of which works alone: the call
-     * site was commented out so the routine never ran; the depth counter was
-     * passed by reference, so the two halves shared one counter and the second
-     * always terminated early; and the threshold arrived through an `int`
-     * parameter, truncating the 0.15 detail length to zero so the length test
-     * could never reject. The emitted point also belongs *between* the two
-     * recursive calls -- pushing it first, as the original did, interleaves the
-     * halves and produces a self-crossing outline.
+     * The depth counter is passed by value, so each half gets its own budget
+     * (a shared counter would end the second half early), and the threshold is
+     * a `double`, so the 0.15 detail length is not truncated to zero. The
+     * emitted point belongs *between* the two recursive calls -- pushing it first
+     * interleaves the halves and produces a self-crossing outline.
      */
     void subdivide_(std::vector<MapPoint>& points,
                     const MapPoint& a, const MapPoint& b,

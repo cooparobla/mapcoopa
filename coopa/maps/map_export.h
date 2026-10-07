@@ -37,7 +37,7 @@ namespace maps {
  *
  * ### Why this is the part worth threading
  *
- * A default map -- 4800 x 4800, thirteen layers -- spends about 135 ms generating
+ * A default map -- 4800 x 4800, nine layers -- spends about 135 ms generating
  * the world and the rest of its time here: roughly 3.9 s rasterising and 5.5 s
  * inside stb's deflate. Generation is a rounding error by comparison, which is
  * why it is not what this class parallelises.
@@ -74,7 +74,7 @@ public:
     /**
      * @brief Caps how many layers may be in flight at once, bounding peak memory.
      *
-     * Uncapped by default, which means all seven, because capping costs far more
+     * Uncapped by default, which means all nine, because capping costs far more
      * than it appears to. Measured on a 20-core machine at the default 4800 x 4800:
      *
      * | layers in flight | export |
@@ -280,11 +280,11 @@ private:
      * draw sequence clipped to those rows.
      *
      * One route, whatever the thread count: allocate, draw, finish. The engineless
-     * case used to hand off to `MapLayers::render()` instead, and that shortcut
-     * stopped being harmless the moment a layer grew a whole-image pass -- only
-     * that one path would have run it, so an unthreaded render and a threaded one
-     * would have produced different pixels. `finish()` is called exactly once here,
-     * after every band, which is the only place it can be correct.
+     * case deliberately does not hand off to `MapLayers::render()`: a layer with a
+     * whole-image pass would then run it on only one of the two paths, and an
+     * unthreaded render and a threaded one would produce different pixels.
+     * `finish()` is called exactly once here, after every band, which is the only
+     * place it can be correct.
      */
     Image render_layer_(const MapGraph& graph, const MapConfig& config,
                         const BiomePalette& palette, const CellGeometry& geometry,

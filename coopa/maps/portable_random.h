@@ -7,12 +7,12 @@
  * that turn it into numbers -- `std::uniform_int_distribution`,
  * `std::uniform_real_distribution` and `std::shuffle` -- are left to the
  * implementation. libstdc++ (Linux) and libc++ (macOS) disagree on all three,
- * so the same seed used to generate a different map on each.
+ * so without these the same seed would generate a different map on each.
  *
  * These are drop-in replacements that reproduce libstdc++'s algorithms
  * exactly (GCC 11+: Lemire's nearly-divisionless downscale, the two-draw
  * `generate_canonical`, and the paired-swap `shuffle`), so maps generated on
- * Linux are unchanged and every other platform now matches them bit for bit.
+ * Linux are unchanged and every other platform matches them bit for bit.
  * Verified against map_out.yaml, a Linux-generated `--seed=42` world, together
  * with portable_sort.h and the -ffp-contract=off this repo's CMakeLists.txt
  * applies on macOS.

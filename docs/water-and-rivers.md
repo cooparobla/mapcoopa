@@ -65,9 +65,10 @@ the water it feeds, never below it. The one place a surface rises is the last st
 a body that stands above it (a drowned inlet). That is bounded to `river_mouth_blend_m` and
 never goes above the body's own level.
 
-Measured on one map, before and after this change: ocean mouths went from a median of
-+10.9 m above the sea to +0.0 m (worst +100.8 m to +9.5 m); rivers rising outside the mouth
-blend went from 48 of 55 to 0; disagreement at confluences went from 30.8 m to 0.
+Measured on one map against a surface computed per segment, without the estuary: ocean
+mouths sit a median of +0.0 m above the sea rather than +10.9 m (worst +9.5 m rather than
++100.8 m); no river rises outside the mouth blend, against 48 of 55; and confluences agree
+exactly, against a 30.8 m disagreement.
 
 > **Known limitation: lake levels.** A lake's `water_level` is the highest bed in its body,
 > which can put its surface above the land around it. On one map, three lakes stood over

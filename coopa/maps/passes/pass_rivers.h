@@ -50,10 +50,9 @@ public:
         std::mt19937 rng(static_cast<std::mt19937::result_type>(config.seed));
         coopa::maps::UniformIntDistribution<std::size_t> pick(0, graph.corners.size() - 1);
 
-        // The original retried a rejected source by decrementing its loop
-        // counter, which spins forever on a map with no land in the accepted
-        // elevation band -- an all-ocean seed hangs the generator outright.
-        // Bounding the attempts turns that into a logged shortfall.
+        // Attempts are bounded: retrying a rejected source indefinitely would
+        // spin forever on a map with no land in the accepted elevation band (an
+        // all-ocean seed). A bound turns that into a logged shortfall.
         const int max_attempts = config.river_count * k_attempts_per_river;
         int placed = 0;
         for (int attempt = 0; attempt < max_attempts && placed < config.river_count; ++attempt) {
@@ -189,8 +188,8 @@ private:
      * @brief Finds the edge joining two adjacent corners.
      *
      * Scans the first corner's own `protrudes` list -- at most a handful of
-     * entries. The original scanned the entire edge array on every step of
-     * every river, which is the dominant cost of the pass at any real grid size.
+     * entries. Scanning the whole edge array on every step of every river would
+     * dominate the cost of the pass at any real grid size.
      *
      * @return The connecting edge, or `k_invalid_id` if the corners are not adjacent.
      */

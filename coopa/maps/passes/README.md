@@ -52,7 +52,7 @@ over ground the earlier ones already claimed. Every pass that draws randomness s
 ## Notes Per Pass
 
 ### 1. Water ([`pass_water.h`](./pass_water.h))
-The `border` flag it reads comes from `MapGenerator::border_check_()`, which is now driven
+The `border` flag it reads comes from `MapGenerator::border_check_()`, which is driven
 by `MapConfig::shape` — a canvas-spanning rectangle by default, or a circle, triangle,
 continent or archipelago inscribed in the canvas. That one predicate (`ShapeField::inset()`)
 is where the shape of the world comes from; nothing in here knows shapes exist.
@@ -82,9 +82,9 @@ a noise factor spans one. A coastal mask keeps the shore the lowest land, and la
 clear of water so drainage still runs seaward. Zero restores the pure distance field.
 
 The rank remap is **split**: the sea takes `[0, sea_level)` and everything else
-`[sea_level, 1]`. Ranked together — which they were — the two interleave, because a corner
-far out to sea accumulates enough hundredths of a step to outrank a coastal one. The sea had
-no consistent depth, the shoreline no consistent height, and `elevation` under water meant
+`[sea_level, 1]`. Ranked together the two would interleave, because a corner far out to sea
+accumulates enough hundredths of a step to outrank a coastal one: the sea would have no
+consistent depth, the shoreline no consistent height, and `elevation` under water would mean
 nothing at all. Split, depth becomes real bathymetry and the waterline becomes a definite
 height. Lakes rank with the *land*: a tarn sits at altitude, and the only thing below sea
 level is the sea. Smoothing is likewise confined to each side of the waterline, since
@@ -93,9 +93,9 @@ relaxing across it drags the sea onto the shore and the shore under it.
 Then it **fills the pits**, which is what makes the drainage a drainage. The distance field
 is monotone, but nothing after it is: relief noise, the rank remap and both smoothing passes
 move corners independently of their neighbours, and any of them can leave a corner lower
-than everything around it. A downhill walk that reaches one stops on dry land — 80 of 11 438
-land corners were such pits, and 23 of 55 rivers used to end in the middle of a field. The
-fix is the priority-flood fill (Barnes, Lehman & Mulla 2014), what DEM processing uses for
+than everything around it. A downhill walk that reaches one stops on dry land — unfilled, 80
+of 11 438 land corners are such pits, enough to end 23 of 55 rivers in the middle of a field.
+The cure is the priority-flood fill (Barnes, Lehman & Mulla 2014), what DEM processing uses for
 exactly this: seed a min-heap with every corner already at or in water, then pop the lowest
 and raise each dry neighbour to just above it. That walks outward from the sea in ascending
 order of the height water would need to reach a corner, so every corner is resolved *from* a
@@ -106,7 +106,7 @@ is 1e-7 and chains run to 39 corners, so the worst-case rise is 4e-6 of the rang
 millimetres at the default 600 m, and not a visible change to the terrain.
 
 `assign_downslopes()` compares strictly (`<`). An equal-height neighbour is not downhill, and
-accepting one let two corners at the same elevation name each other as their downslope — a
+accepting one would let two corners at the same elevation name each other as their downslope — a
 two-cycle a flow walk follows until its step guard. Strictness is also what makes "points at
 itself" mean "has nowhere lower to go" rather than "happened to be scanned last".
 
@@ -123,40 +123,39 @@ Without it biomes are classified on elevation and moisture alone, which leaves a
 the table unreachable and puts deserts at the pole. Latitude runs along **y**, so a map
 reads as a north-south slice of a globe.
 
-The band names its polar caps rather than implying them. It used to be `1 - d^falloff`,
-which does produce caps — at the default exponent the ground froze beyond 87% of the way to
-the pole, the outer 6.5% of the map — but nothing in the configuration said 6.5%, and no
-value of the exponent says *zero*. `polar_extent_north` and `polar_extent_south` say it
+The band names its polar caps rather than implying them. A plain `1 - d^falloff` does
+produce caps — at the default exponent the ground freezes beyond 87% of the way to the pole,
+the outer 6.5% of the map — but nothing in the configuration would say 6.5%, and no value of
+the exponent says *zero*. `polar_extent_north` and `polar_extent_south` say it
 outright, one per pole, anchored to `k_biome_frigid` so the number means the fraction that
 actually classifies as frozen. Set one to 0 and that cap vanishes; the curve then spans
 freezing to equatorial across the whole hemisphere, so latitude alone never picks ice.
 Altitude still can, which is what should happen to a mountain.
 
 `temperature_offset` shifts every sample, so an ice age and a hothouse are one number apart
-on the same map. `temperature_falloff` survives, now shaping only the temperate half of the
-curve.
+on the same map. `temperature_falloff` shapes only the temperate half of the curve.
 
 ### 5. Rivers ([`pass_rivers.h`](./pass_rivers.h))
 Sample sources uniformly, reject any outside the source elevation band, and walk
-`downslope` until the water. The attempt count is bounded: the original retried by
-decrementing its loop counter, which hangs outright on a map with no qualifying land.
+`downslope` until the water. The attempt count is bounded, so a map with no qualifying land
+logs a shortfall rather than hanging.
 
 **Every river ends in a water body**, and that is a guarantee rather than a tendency. The
 walk stops on `water || coast` — the union, not `coast` alone, because `PassCoast`
 deliberately excludes the shoreline from `water` so the two can be told apart: a sea mouth
-is a `coast` corner and a lake mouth a `water` one. Stopping on `coast` alone also ran a
-river on down a lake *bed* to its lowest corner, drawing a channel across the surface,
+is a `coast` corner and a lake mouth a `water` one. Stopping on `coast` alone would also run
+a river on down a lake *bed* to its lowest corner, drawing a channel across the surface,
 since lake corners sit below their shore. A walk that somehow still ends dry has its river
 discarded and logged. With the pits filled that rejection never fires, and it stays anyway:
 "always ends in water" is a property callers rely on, and one enforced only by an invariant
 two passes away is one a future change to elevation can quietly break.
 
 The walk gathers the corner chain *before* raising any volume, and only commits a
-watercourse at least `river_min_length` corners long. Raising volumes as it walked — which
-is what this did — makes a short river impossible to reject, because by the time you can
-measure it you have already carved it. Most land is near a coast, so without the rejection
-the map fills with two-cell trickles. The source floor was raised from 0.3 to 0.45 for the
-same reason: below that a "source" can appear on the plain it was meant to run down to.
+watercourse at least `river_min_length` corners long. Raising volumes while walking would
+make a short river impossible to reject, because by the time you can measure it you have
+already carved it. Most land is near a coast, so without the rejection the map fills with
+two-cell trickles. The source floor (`river_source_min_elevation`, 0.45) is there for the
+same reason: much lower and a "source" can appear on the plain it is meant to run down to.
 
 Each kept watercourse is then traced into a `MapRiver` — the corner chain, and a copy of it
 corner-cut by `chaikin_smooth()` ([`../map_data.h`](../map_data.h), shared with the road
@@ -173,8 +172,8 @@ none of them properties a single segment can check.
 ### 6. Valleys ([`pass_valleys.h`](./pass_valleys.h))
 The only pass that rewrites `elevation` after pass 3, and it has to be: rivers erode, but
 elevation is computed *before* rivers are routed — it has to be, the routing follows
-`downslope` — so without this the height field has no idea a river pass ever ran. The
-elevation layer showed no trace of the rivers the water layer is full of.
+`downslope` — so without this the height field has no idea a river pass ever ran, and the
+elevation layer would show no trace of the rivers the water layer is full of.
 
 It cuts a **valley, not a channel**, and the geometry forces that. `elevation_at()`
 interpolates *cell-site* heights over Delaunay triangles while rivers run along Voronoi
@@ -212,23 +211,22 @@ original 18.
 **A water cell always gets a water biome** — `Ocean`, `Lake` or `Ice`, and nothing else.
 This is not cosmetic. The biome and composite layers are coloured by *biome*, not by
 `MapCenter::water`, so the two disagreeing is a defect the reader sees however sound the
-data underneath is: `classify_biome()` used to hand a shallow lake `Marsh` (33, 94, 33 —
-a dark green) and 18% of rivers ended in what looks exactly like forest. A lake you cannot
-see is indistinguishable from no lake, and rivers must visibly end in water.
+data underneath is: a shallow lake classified `Marsh` (33, 94, 33 — a dark green) would end
+rivers in what looks exactly like forest. A lake you cannot see is indistinguishable from no
+lake, and rivers must visibly end in water.
 
-`Marsh`, `Swamp` and `BorealWetland` are land biomes now, which is what the words mean:
+`Marsh`, `Swamp` and `BorealWetland` are land biomes, which is what the words mean:
 waterlogged basin floor beside the water rather than the water itself. Moisture is seeded
 from lakes and rivers, so they land where they belong.
 
-Freezing is on temperature alone. The elevation test that used to also freeze a high lake
-double-counted altitude, because `PassTemperature` already applies an altitude lapse rate —
-a high lake was frozen twice over and a cold low one not at all.
+Freezing is on temperature alone. An elevation test that also froze a high lake would
+double-count altitude, because `PassTemperature` already applies an altitude lapse rate —
+a high lake would be frozen twice over and a cold low one not at all.
 
 The thresholds are fractions of the **land** range, because the pass passes
-`land_height()`. That rescale is what broke the marsh rule in the first place: `0.1` meant
-"below 0.1 absolute" when the waterline sat at 0, and became "the bottom tenth of the land"
-once it moved to `sea_level` — which is where lakes sit, since a lake is a basin. A table
-test on `classify_biome()` stayed green throughout, because the arguments changed and not
+`land_height()`, not absolute heights: a threshold like `0.1` means "the bottom tenth of the
+land", which is where lakes sit, since a lake is a basin. A table test on `classify_biome()`
+alone cannot catch a mismatch here, because it is the arguments that are rescaled and not
 the function.
 
 ### 9. Roads ([`pass_roads.h`](./pass_roads.h))
@@ -247,8 +245,7 @@ is a pair of thresholds on that count taken as a *share of the routes laid* — 
 spur always carries exactly `hubs - 1` routes, so an absolute cutoff would mean something
 different on every map.
 
-Switchbacks survive from the old implementation, but for a reason rather than by
-construction: `slope_cost` makes climbing straight up dear and traversing a slope cheap, so
+Switchbacks emerge for a reason rather than by construction: `slope_cost` makes climbing straight up dear and traversing a slope cheap, so
 a mountain route crosses the contour at a shallow angle and doubles back. Bridges need no
 geometry — a road follows the Delaunay edge `d0`–`d1` and a river the dual Voronoi edge
 `v0`–`v1`, and those are the same `MapEdge`, so an edge carrying both *is* the crossing.
@@ -262,11 +259,10 @@ island keeps its own self-contained network. The search state is therefore
 `(cell, consecutive water crossed)` rather than just the cell — the same lake cell is
 reachable one hop from shore and unreachable three hops out.
 
-**What this replaces.** The pass used to flood four elevation bands outward from the coast
-and flag any edge whose two corners fell in different bands. That traces contour lines, and
-contour lines connect nothing: a road could run half the map without passing a settlement,
-every road was the same width, and `TownConfig::road_bonus` was rewarding proximity to a
-contour rather than to a trade route.
+**Why routed rather than contoured.** Flagging every edge whose corners fall in different
+elevation bands traces contour lines, and contour lines connect nothing: a road could run
+half the map without passing a settlement, every road would be the same width, and
+`TownConfig::road_bonus` would reward proximity to a contour rather than to a trade route.
 
 **Why it runs before towns.** Towns want roads to score sites by and good roads want towns
 to connect, which looks circular. It is not: the pass picks its own hubs with the same
@@ -312,21 +308,22 @@ the interior without falling back into a grid.
 Three things make that read as a settlement rather than as noise, and the first is the one
 that matters:
 
-- **The streets are emitted.** They were private to this pass — real enough to place plots
-  against and invisible to everyone else — so buildings lined up along something nobody
-  could see, and a settlement read as scatter however carefully it had been arranged. They
-  are now `MapTown::streets`, drawn on the structures layer and written to the map file.
+- **The streets are emitted.** Kept private to this pass they would be real enough to place
+  plots against and invisible to everyone else, so buildings would line up along something
+  nobody could see, and a settlement would read as scatter however carefully it had been
+  arranged. They are `MapTown::streets`, drawn on the structures layer and written to the
+  map file.
 - **Interior infill takes the bearing of the nearest street** instead of a yaw drawn
-  uniformly from a full turn. That alone moved the fraction of buildings fronting a street
-  from **51% to 83%**; a row is only legible if its neighbours agree with it. Position stays
+  uniformly from a full turn. That alone puts **83%** of buildings fronting a street, against
+  **51%** with random yaws; a row is only legible if its neighbours agree with it. Position stays
   jittered, which is what keeps the layout off a lattice — that is a property of where
   buildings sit, not of which way they face.
 - **Buildings are kept off the carriageway.** `can_place_()` tests every candidate against
   the cell's streets and the road polylines passing through it, at half the roadway's width
   plus `street_clearance_m`, and frontage plots are set back by their own rotated size rather
-  than a flat `street_offset_m` — which a `building_size_max_m` plot overran by a metre. Both
-  halves were needed: 37% of buildings stood on a lane and 18% on a road, and a keep-out alone
-  would have rejected the rows rather than placing them. A corridor is tested as a rotated box
+  than a flat `street_offset_m` — which a `building_size_max_m` plot overruns by a metre. Both
+  halves are needed: without them 37% of buildings stand on a lane and 18% on a road, and a
+  keep-out alone would reject the rows rather than place them. A corridor is tested as a rotated box
   through `buildings_overlap()`, because a corner-distance test misses a lane crossing the
   middle of a plot.
 - **A market square, and roles.** A settlement claiming at least `plaza_min_cells` gets a
@@ -345,9 +342,8 @@ draw from the same small phoneme table, so a collision is a matter of how many t
 region got — and two places sharing a name silently conflates them for anything keying on
 one.
 
-This pass was a stub in the original — it logged its own name and returned, with a
-commented-out sketch of the packing step referencing types that never existed. The scoring,
-placement and layout are new; the containment test follows that sketch's ray-cast approach.
+The upstream generator this ports has no working town pass; the scoring, placement and
+layout here are mapcoopa's own.
 
 ### 12. Landmarks ([`pass_landmarks.h`](./pass_landmarks.h))
 Natural features are *read off* the terrain rather than sprinkled onto it — a peak is a cell
@@ -372,7 +368,7 @@ get mouths are far steeper than the threshold. The mouth sits at the edge midpoi
 first passage heads from the *lower* cell toward the higher one, because a cave mouth is
 something you walk into the hill through.
 
-`edge_grade()` had to be written — nothing here computed slope. `hillshade_()` takes a
+`edge_grade()` is the module's one measure of slope; nothing else answers it. `hillshade_()` takes a
 gradient off the blurred 8-bit raster with a 600× exaggeration baked in, so it answers a
 question about a picture; `RoadConfig::slope_cost` uses a height difference never divided by
 the distance it spreads over; and `downslope` is a direction with no magnitude.
@@ -387,21 +383,21 @@ The water table is `vadose_share` of the relief between the mouth and the sea, c
 `max_depth_m` — a subdued replica of the surface rather than a flat sheet, because rain
 falls on the hill and drains to the valleys either side. That is not decoration: measured
 against sea level alone a cave 400 m up needs 250 m of descent before it can level out,
-further than its budget reaches, so every system came out pure entrance series and the
-phreatic half never appeared on a map.
+further than its budget reaches, so every system would come out pure entrance series and
+the phreatic half would never appear on a map.
 
 **Storeys, because the table moved.** The valley a system drains to cuts down over time and
-the water table follows it, abandoning the network standing at the old level — left as dry
+the water table follows it, abandoning the network standing at the higher level — left as dry
 passage — and starting a new one below. `level_tables_()` returns that sequence, and growth
 runs the same two-regime model once per table, joining each to the next with the descent that
 *is* a shaft between levels. Nothing about the model is special-cased for it: a descent head
 is an ordinary head whose table happens to be the next one down.
 
-The sequence is anchored at the bottom. The deepest table sits exactly where the single table
-used to, so `vadose_share` and `max_depth_m` still say how deep a cave may go, and the
-abandoned levels are stacked upward from it at `level_spacing_m`. Anchoring at the top would
-have split one budget of relief between the entrance series and the storeys, so raising the
-spacing would have made caves shallower — two knobs pulling on one number.
+The sequence is anchored at the bottom. The deepest table sits where a single table would,
+so `vadose_share` and `max_depth_m` say how deep a cave may go whatever the number of
+levels, and the abandoned levels are stacked upward from it at `level_spacing_m`. Anchoring
+at the top would split one budget of relief between the entrance series and the storeys, so
+raising the spacing would make caves shallower — two knobs pulling on one number.
 
 `level_spacing_m` also decides how many storeys a map gets, and not gently: a system needs
 that much relief to spend per extra table, so doubling it roughly halves the count. It has to
@@ -451,5 +447,5 @@ cells read the same edge, so they can never disagree about where their shared bo
 Cost is paid only where it shows: open ocean is never subdivided, same-biome interiors only
 if long, coastlines and river banks always.
 
-Controlled by `MapConfig::subdivide_noisy_edges` — off reproduces the original's
-straight-edged output, which shipped with the subdivision call commented out.
+Controlled by `MapConfig::subdivide_noisy_edges` — off draws every cell boundary as a
+straight line, as the upstream generator does.
