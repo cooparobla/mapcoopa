@@ -1,0 +1,5 @@
+// Config.h.in
+#pragma once
+
+#define ROOT_DIR "/Users/tblaney/Code/toyengine/libs/mapcoopa"
+#define PROJ_DIR "/Users/tblaney/Code/toyengine/libs"

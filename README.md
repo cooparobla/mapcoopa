@@ -200,14 +200,27 @@ outputs and details are in [`coopa/maps/passes/README.md`](coopa/maps/passes/REA
 ## Testing
 
 ```bash
-ctest --test-dir build                 # or run the binary directly:
-./build/mapcoopa_tests
+ctest --test-dir build -j8             # every suite, in parallel
+ctest --test-dir build -R mapcoopa_rivers --output-on-failure   # one suite
+./build/mapcoopa_tests --list          # or drive the runner directly:
+./build/mapcoopa_tests --suite rivers  # one suite; a name substring selects tests
 ```
 
-118 tests cover determinism, graph invariants, every pass, both renderers, the config
-loader, the world scale, the async API, the YAML round trip, and that every parallel path
-matches its serial one. Two tests read files outside the code: one checks
-`assets/config.yaml` against the documented defaults, and one checks the
+The tests live in [`tests/`](tests), one `<suite>_test.cpp` per system -- determinism,
+the graph, climate and biomes, water, terrain, rivers and their surfaces, roads,
+settlements and buildings, regions, landmarks, caves, shapes, the layer renderers,
+export, the async task API, the YAML map document, configuration files, the world
+scale, and the README legend. Each file is one ctest entry (`mapcoopa_<suite>`), built
+into the single `mapcoopa_tests` binary on libcoopa's test framework
+(`coopa/testing/test.h`). Shared fixtures are in [`tests/support/`](tests/support):
+the standard configs, and a few worlds generated once per suite and read `const` --
+generation is deterministic, so tests that would regenerate an identical map share it.
+
+The suites pin invariants rather than tuning: determinism, id and range invariants,
+rivers only falling and always reaching water, caves staying under the terrain, lossless
+round trips, and that every parallel or banded path matches its serial one. Tests write
+only to a per-test scratch directory under the system temp dir. Two read files outside
+the code: one loads the shipped `assets/config.yaml`, and one checks the
 [legend](#legend) below against the palette in `map_config.h`.
 
 ## Project layout
@@ -228,7 +241,7 @@ assets/              config.yaml (every setting, commented), svg/ legend swatche
 includes/            vendored delaunator, FastNoiseLite, stb_image_write
 tools/               gen_legend_svg.py
 docs/                guides; docs/images holds the screenshots above
-test.cpp             the test suite
+tests/               the test suites (one <suite>_test.cpp per system), support/ fixtures
 map_out.*            reference output of the shipped config (seed 42)
 ```
 
@@ -273,7 +286,7 @@ The fill colours from `BiomePalette::biome_colors` in
 [`coopa/maps/map_config.h`](coopa/maps/map_config.h). The YAML name is the biome's stable
 on-disk identity, accepted back by `biome_from_name()`. These rows and the swatches in
 [`assets/svg/`](assets/svg) are checked against the palette by
-`test_readme_legend_matches_the_palette`.
+`readme_legend_matches_the_palette` in [`tests/legend_test.cpp`](tests/legend_test.cpp).
 
 | Colour | Biome | YAML name | Hex | RGB |
 |---|---|---|---|---|

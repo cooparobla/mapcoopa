@@ -10,7 +10,7 @@ reference them. A legend is only useful if it is true, and keeping three artefac
 (palette, swatches, README) in agreement by hand across 33 biomes and 10 overlays
 is not something anyone does reliably.
 
-`maps_test::test_readme_legend_matches_the_palette` is the other half of the
+`legend/readme_legend_matches_the_palette` (tests/legend_test.cpp) is the other half of the
 arrangement: this script makes the three agree, that test proves they still do and
 fails the build if they have drifted. Running this on an unchanged palette must
 leave the tree byte-identical -- it is deliberately idempotent, so `git diff` after

@@ -92,12 +92,24 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     target_link_libraries(mapcoopa PRIVATE coopa::maps)
 
     # The test suite is therefore a separate target, unlike the sibling repos
-    # where the bare name is the test runner.
-    add_executable(mapcoopa_tests test.cpp)
-    target_link_libraries(mapcoopa_tests PRIVATE coopa::maps)
+    # where the bare name is the test runner. One `<suite>_test.cpp` per system
+    # under tests/, shared fixtures under tests/support/; coopa::test_main is the
+    # runner, and coopa_add_test_suites() registers each file as its own ctest
+    # entry (mapcoopa_<suite>) so `ctest -j` runs the suites in parallel.
+    file(GLOB MAPCOOPA_TEST_SOURCES CONFIGURE_DEPENDS
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/*_test.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/support/*.cpp)
+    add_executable(mapcoopa_tests ${MAPCOOPA_TEST_SOURCES})
+    target_include_directories(mapcoopa_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_link_libraries(mapcoopa_tests PRIVATE coopa::maps coopa::test_main)
 
     enable_testing()
-    add_test(NAME mapcoopa_tests COMMAND mapcoopa_tests)
+    # A suite takes a few seconds on an idle machine; the timeout is generous because
+    # ctest -j shares the cores with every other suite (and whatever else is running).
+    coopa_add_test_suites(mapcoopa_tests PREFIX mapcoopa
+        SOURCES ${MAPCOOPA_TEST_SOURCES}
+        LABELS unit
+        TIMEOUT 120)
 
     # --- Optional GUI map viewer (uicoopa) ---
     # Degrades to "not built" rather than a configure failure when ../uicoopa simply
