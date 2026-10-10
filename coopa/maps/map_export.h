@@ -65,7 +65,7 @@ public:
     /**
      * @brief Sets the engine to spread work across; null runs everything inline.
      * @param engine Not owned. The house pattern -- see `AnimationSystem` and
-     *               `PixelRenderPipeline` -- is an injected, nullable engine
+     *               `ToyRenderPipeline` -- is an injected, nullable engine
      *               pointer, so a subsystem never owns a thread pool a host is
      *               already running.
      */
