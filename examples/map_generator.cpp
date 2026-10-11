@@ -42,13 +42,11 @@
 #include <coopa/maps/map_export.h>
 #include <coopa/maps/map_config.h>
 #include <coopa/maps/map_generator.h>
+#include <coopa/maps/map_presets.h>
 #include <coopa/maps/map_renderer.h>
 #include <coopa/maps/map_yaml.h>
 
 namespace {
-
-/** @brief Grid size the library's default noise frequency is tuned for. */
-constexpr double k_reference_grid_size = 40.0;
 
 /** @brief Degrees to radians, for the shape rotation flag. */
 constexpr double k_degrees_to_radians = 3.14159265358979323846 / 180.0;
@@ -139,22 +137,15 @@ bool match_option(std::string_view argument, std::string_view name, std::string_
  * @return 0 on success, 1 on a bad argument or a failed write.
  */
 int main(int argc, char** argv) {
-    coopa::maps::MapConfig config;
-    // This tool's own defaults, applied before the configuration file so that a
-    // run without one still produces the world the README documents rather than
-    // quietly dropping to MapConfig's library defaults of a grid of 50.
-    // Large enough that climate bands, several nations and a spread of landmarks
-    // all have room to appear; the YAML lands around 15 MB.
+    // The standard map (coopa/maps/map_presets.h), applied before the configuration file so
+    // that a run without one still produces the world the README documents rather than quietly
+    // dropping to MapConfig's library defaults of a grid of 50. Large enough that climate bands,
+    // several nations and a spread of landmarks all have room to appear; the YAML lands around
+    // 15 MB.
     //
-    // No image_size here: it is derived from the world extent and
-    // `meters_per_pixel`, which defaults to 1.0 so that a render is measurable at
-    // one pixel to the metre. Setting it would only have back-computed a scale
-    // that is not 1.
-    config.grid_size = 80;
-    config.towns.town_count = 28;
-    config.river_count = 55;
-    config.landmarks.max_natural = 70;
-    config.landmarks.max_abandoned = 45;
+    // No image_size here: it is derived from the world extent and `meters_per_pixel`, which
+    // defaults to 1.0 so that a render is measurable at one pixel to the metre.
+    coopa::maps::MapConfig config = coopa::maps::standard_config();
 
     std::string out_prefix = "map_out";
     bool seed_given = false;
@@ -436,18 +427,10 @@ int main(int argc, char** argv) {
         std::random_device entropy;
         config.seed = static_cast<int>(entropy() & 0x7fffffffu);
     }
-    // The island field is seeded from the master seed too, so one --seed value
-    // reproduces the whole map rather than just the pass ordering.
-    config.noise_island.seed = config.seed;
-    config.noise_temperature.seed = config.seed + 1;
-    config.noise_blend.seed = config.seed + 2;
-    config.noise_cave.seed = config.seed + 3;
-
-    // Scale the island field with the grid so --grid-size controls detail, not
-    // the size of the world. The frequency is in grid units, so holding it fixed
-    // while enlarging the map shrinks every landmass instead of resolving it more
-    // finely -- a big map comes out as an archipelago of the same small islands.
-    config.noise_island.frequency *= k_reference_grid_size / static_cast<double>(config.grid_size);
+    // The per-pass noise seeds follow the master seed, so one --seed value reproduces the whole
+    // map, and the island field scales with the grid so --grid-size controls detail, not the
+    // size of the world. Shared with every other host through map_presets.h.
+    config = coopa::maps::derived_config(config);
 
     coopa::debug::Logger logger("mapgen");
 

@@ -56,8 +56,9 @@ All images are cropped from the `map_out_*.png` renders at the repository root, 
   River surfaces only fall, agree at confluences, and open into estuaries at the coast.
 - **Valleys and channels.** Rivers cut a valley into the height mesh and a channel at
   their true width into the sampled surface.
-- **Water as data.** `MapCenter::water_level` gives a flat surface per lake or sea, ready
-  for a water mesh.
+- **Water as data.** `MapCenter::water_level` gives a flat surface per lake or sea (each lake
+  at its spill level, under every shore), rivers carry a banked surface under both banks, and
+  `WaterField` answers "is this point under water, and how high" for a 3D water mesh.
 
 ### People and places
 - **Roads.** Routed between hubs and graded into trail, road and highway by the traffic

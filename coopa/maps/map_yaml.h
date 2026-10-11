@@ -334,6 +334,7 @@ inline fkyaml::node config_to_node(const MapConfig& config) {
     node["river_valley_width"] = config.river_valley_width;
     node["river_valley_falloff"] = config.river_valley_falloff;
     node["water_edge_overlap_m"] = config.water_edge_overlap_m;
+    node["lake_depth_m"] = config.lake_depth_m;
     node["trail_width_m"] = config.trail_width_m;
     node["road_width_m"] = config.road_width_m;
     node["highway_width_m"] = config.highway_width_m;
@@ -482,6 +483,7 @@ inline void apply_config_node(const fkyaml::node& node, MapConfig& config) {
         detail::read_or(node, "river_valley_falloff", config.river_valley_falloff);
     config.water_edge_overlap_m =
         detail::read_or(node, "water_edge_overlap_m", config.water_edge_overlap_m);
+    config.lake_depth_m = detail::read_or(node, "lake_depth_m", config.lake_depth_m);
     config.trail_width_m = detail::read_or(node, "trail_width_m", config.trail_width_m);
     config.road_width_m = detail::read_or(node, "road_width_m", config.road_width_m);
     config.highway_width_m = detail::read_or(node, "highway_width_m", config.highway_width_m);

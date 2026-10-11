@@ -73,6 +73,7 @@
 #include <coopa/maps/map_config.h>
 #include <coopa/maps/map_data.h>
 #include <coopa/maps/map_generator.h>
+#include <coopa/maps/map_presets.h>
 #include <coopa/maps/map_renderer.h>
 #include <coopa/maps/map_task.h>
 #include <coopa/maps/map_yaml.h>
@@ -282,37 +283,14 @@ struct ViewerState {
  * @param state The viewer state whose config is being finalised.
  */
 void apply_derived(ViewerState& state) {
-    maps::MapConfig& c = state.config;
-    c.noise_island.seed      = c.seed;
-    c.noise_temperature.seed = c.seed + 1;
-    c.noise_blend.seed       = c.seed + 2;
-    c.noise_cave.seed        = c.seed + 3;
-
-    // k_reference_grid_size in the CLI: features keep their real-world scale as the cell
-    // count changes. Always from the pristine value -- see base_island_frequency.
-    const double grid = c.grid_size > 0 ? static_cast<double>(c.grid_size) : 40.0;
-    c.noise_island.frequency = state.base_island_frequency * (40.0 / grid);
-
-    c.image_size = maps::derive_image_size(c);
+    // maps::derived_config() scales the frequency it is given, so it is handed the authored
+    // value every time -- see base_island_frequency.
+    maps::MapConfig authored = state.config;
+    authored.noise_island.frequency = state.base_island_frequency;
+    state.config = maps::derived_config(authored);
 }
 
-/**
- * @brief Re-derives meters_per_pixel from a wanted export resolution, then image_size.
- *
- * map_config.h documents the invariant `image_size * meters_per_pixel == grid_size *
- * meters_per_grid_unit`. image_size is therefore never assignable on its own: writing it
- * behind the scale's back leaves the two disagreeing about how big the world is. This is
- * the CLI's --image-size branch, in one place.
- *
- * @param c      The config to adjust.
- * @param pixels The wanted width/height in pixels; values below 1 are ignored.
- */
-void set_image_size(maps::MapConfig& c, int pixels) {
-    if (pixels < 1) return;
-    const double world_meters = static_cast<double>(c.grid_size) * c.meters_per_grid_unit;
-    c.meters_per_pixel = world_meters / static_cast<double>(pixels);
-    c.image_size = maps::derive_image_size(c);
-}
+using maps::set_image_size;
 
 /**
  * @brief A copy of `config` scaled down to the on-screen preview resolution.
@@ -1232,14 +1210,10 @@ int main() {
     // examples/map_generator.cpp layers its settings MapConfig defaults -> tool defaults ->
     // assets/config.yaml, and only then applies flags. The viewer has no flags, but it must
     // begin at the same place or the two tools would disagree about what "seed 251" looks
-    // like -- which is the one thing a front-end for the same generator must not do. These
-    // five are that file's tool defaults verbatim; see its comment for why no image_size.
+    // like -- which is the one thing a front-end for the same generator must not do. Both start
+    // from maps::standard_config().
     ViewerState state;
-    state.config.grid_size = 80;
-    state.config.towns.town_count = 28;
-    state.config.river_count = 55;
-    state.config.landmarks.max_natural = 70;
-    state.config.landmarks.max_abandoned = 45;
+    state.config = maps::standard_config();
 
     const std::string config_path = std::string(ROOT_DIR) + "/assets/config.yaml";
     const maps::ConfigLoadResult loaded = maps::load_config(config_path, state.config);

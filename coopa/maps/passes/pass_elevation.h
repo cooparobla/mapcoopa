@@ -19,6 +19,7 @@
 #include <coopa/maps/map_config.h>
 #include <coopa/maps/map_data.h>
 #include <coopa/maps/passes/drainage.h>
+#include <coopa/maps/passes/water_levels.h>
 #include <coopa/maps/noise.h>
 #include <coopa/maps/portable_sort.h>
 
@@ -69,7 +70,7 @@ public:
         // Last, because it reads the finished heights. It cannot live in
         // PassWater, which is where sea and lake are told apart -- that pass runs
         // first and has no elevations to level anything against yet.
-        assign_water_levels_(graph, config);
+        assign_water_levels(graph, config);
     }
 
 private:
@@ -355,76 +356,6 @@ private:
                 const double mean = sum / static_cast<double>(counted);
                 const double own = previous[static_cast<std::size_t>(center.index)];
                 center.elevation = own + strength * (mean - own);
-            }
-        }
-    }
-
-    /**
-     * @brief Gives every body of water one flat surface height.
-     *
-     * `elevation` is the height of the *ground*, which under water is the bed.
-     * `water_level` is the height of the *surface*, and a surface is flat --
-     * which a bed is not. Stating them separately is what lets a consumer flood a
-     * terrain mesh, and what lets the water layer draw a sheet instead of a
-     * mottled field.
-     *
-     * The sea takes `MapConfig::sea_level` everywhere, which after the split rank
-     * remap is exactly the height its bed rises to meet. Each lake is found by
-     * flooding the `water && !ocean` cells -- the same neighbour walk `PassWater`
-     * uses to tell a lake from the sea -- and the whole body takes the *highest*
-     * bed in it, so no part of a basin pokes up through its own surface.
-     *
-     * @param graph The graph to annotate; requires cell elevations to be final.
-     * @param config Supplies the waterline.
-     */
-    void assign_water_levels_(MapGraph& graph, const MapConfig& config) const {
-        std::vector<bool> visited(graph.centers.size(), false);
-
-        for (MapCenter& center : graph.centers) {
-            // Below the waterline the ground is sea bed whatever the water pass
-            // decided, so the sea's surface is the waterline there too. This is
-            // the comparison that only became meaningful once `sea_level` stopped
-            // being the bottom of the range.
-            center.water_level = (center.ocean || center.elevation < config.sea_level)
-                                     ? config.sea_level
-                                     : 0.0;
-        }
-
-        for (MapCenter& seed : graph.centers) {
-            const std::size_t seed_index = static_cast<std::size_t>(seed.index);
-            if (!seed.water || seed.ocean || visited[seed_index]) {
-                continue;
-            }
-
-            std::vector<CenterId> body;
-            std::queue<CenterId> pending;
-            pending.push(seed.index);
-            visited[seed_index] = true;
-
-            double surface = seed.elevation;
-            while (!pending.empty()) {
-                const CenterId current = pending.front();
-                pending.pop();
-                body.push_back(current);
-                surface = std::max(surface,
-                                   graph.centers[static_cast<std::size_t>(current)].elevation);
-
-                for (const CenterId neighbor_id :
-                     graph.centers[static_cast<std::size_t>(current)].neighbors) {
-                    const std::size_t index = static_cast<std::size_t>(neighbor_id);
-                    const MapCenter& neighbor = graph.centers[index];
-                    if (visited[index] || !neighbor.water || neighbor.ocean) {
-                        continue;
-                    }
-                    visited[index] = true;
-                    pending.push(neighbor_id);
-                }
-            }
-
-            // A lake never sits below the sea it would otherwise drain into.
-            surface = std::max(surface, config.sea_level);
-            for (const CenterId cell_id : body) {
-                graph.centers[static_cast<std::size_t>(cell_id)].water_level = surface;
             }
         }
     }

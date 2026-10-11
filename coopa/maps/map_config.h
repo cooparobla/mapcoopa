@@ -1513,6 +1513,14 @@ struct MapConfig {
      */
     double water_edge_overlap_m = 1.0;
     /**
+     * @brief How deep a lake's bed lies under its surface, at the least, in metres.
+     *
+     * Lake cells are ranked with the land, so a cell the water pass flooded can carry a "bed"
+     * well up a hillside. `assign_water_levels()` lowers every lake cell to at least this far
+     * under the lake's spill level, which is what turns a flooded patch into a basin.
+     */
+    double lake_depth_m = 6.0;
+    /**
      * @brief Carriageway width of a `RoadClass::Trail`, in metres.
      *
      * A cart track. These three are real widths and not render tuning: at the

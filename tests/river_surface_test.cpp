@@ -40,7 +40,9 @@ COOPA_TEST(river_channels_are_zero_away_from_water) {
     std::size_t checked = 0;
     for (const MapCenter& center : graph.centers) {
         // A cell site is over half a cell from its own boundary, and rivers run along
-        // boundaries -- so no site is ever inside a channel.
+        // boundaries -- so no land site is ever inside a channel. (A water cell's site is where a
+        // river's mouth segment runs to: the channel carried on into the body it feeds.)
+        if (center.water) continue;
         const double x = center.point.x;
         const double y = center.point.y;
         ASSERT_TRUE(graph.elevation_at(center, x, y, detail, channels)

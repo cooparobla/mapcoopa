@@ -211,6 +211,18 @@ and compute the same cut.
 `MapCenter::water_level` is the *surface* of whatever water covers a cell, flat per body,
 as against `elevation` which is the height of the ground underneath. That distinction is
 the whole reason the water layer can draw a sheet: drawing `elevation` would draw the sea bed.
+A lake stands at its **spill level** -- just under the lowest cell of its shore -- over a bed at
+least `lake_depth_m` deep (`passes/water_levels.h`; settled again after the valleys pass, which
+can cut a shore). Every shore cell therefore stands above its lake.
+
+`RiverChannels::banked` is each river's *physical* surface (`RiverFit::Banked`): decided from the
+uncut ground before the channel is cut -- under both banks, only ever falling, backed up to the
+body it feeds near its mouth -- and the cut is then made deep enough to hold it. Each river with a
+body to feed gets one more channel segment, its **mouth**, from its last point to the nearest cell
+of that body whose bed is really under water, held at the body's level: a coastal water cell's bed
+can stand above its surface, and without the mouth a strip of dry shore would dam the river.
+`make_river_surfaces()` still returns the 2D water layer's fit (`RiverFit::Sheet`) by default,
+which stands a ribbon on the highest ground under its stroke so the image hides the bed.
 
 `MapConfig::sea_level` is a real height partway up the field, not zero, so the sea bed sits
 below it and land above — which is what makes "under water" a comparison rather than a
@@ -218,6 +230,21 @@ tautology, and what makes the sea's surface visible on the same greyscale as the
 Land therefore spans `[sea_level, 1]`, and any threshold describing land goes through
 `land_height()`. `elevation_range_m` gives the field a vertical scale in metres, so depths
 and overhangs can be stated physically like every horizontal size already could.
+
+### [`water_field.h`](./water_field.h)
+`WaterField::at(cell, x, y)` -- the counterpart of `elevation_at()` for water, for a consumer
+meshing the map in 3D: whether a point is under water, which body (`Sea`, `Lake`, `River`), how
+high its surface is, and a river's downstream direction. A sea or lake reaches every point whose
+Delaunay triangle has one of its cells as a vertex, a river the points in its channel; the point
+is wet where the ground lies below the surface. With every shore above its lake and every river
+under its banks, the water never stands above the dry ground beside it (`water_field_test`).
+
+### [`map_presets.h`](./map_presets.h)
+`standard_config()` -- the standard map, exactly what a bare `mapcoopa` run generates (the CLI and
+the viewer start from it; `presets_test` holds it to `assets/config.yaml`) -- and
+`derived_config()`, the values every host derives from a config before generating: per-pass
+noise seeds from the master seed, the island field scaled to the grid, and `image_size`. Skip it
+and the seed barely moves the coastline.
 
 ### [`map_task.h`](./map_task.h)
 `MapTask` — the token an asynchronous generation or export is observed through:

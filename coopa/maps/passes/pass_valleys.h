@@ -14,6 +14,7 @@
 #include <coopa/maps/map_config.h>
 #include <coopa/maps/map_data.h>
 #include <coopa/maps/passes/drainage.h>
+#include <coopa/maps/passes/water_levels.h>
 
 namespace coopa {
 namespace maps {
@@ -83,6 +84,10 @@ public:
         // that field is not this one.
         restore_drainage(graph);
         lower_centers_(graph, config, carve);
+        // A valley cut through a lake's shore lowers the rim the lake was levelled against, so
+        // the levels are settled again on the carved field -- or the lake would stand over the
+        // gap the river just opened.
+        assign_water_levels(graph, config);
     }
 
 private:
@@ -165,10 +170,8 @@ private:
     /**
      * @brief Cuts the measured depth out of the corner heights.
      *
-     * Water corners are skipped. A lake bed is not a valley, and `water_level`
-     * was fixed as a flat surface over the ground as the elevation pass left it
-     * -- dropping the bed under a lake would leave the sheet floating over a hole
-     * it never filled.
+     * Water corners are skipped. A lake bed is not a valley; the lake levels are
+     * re-settled on the carved field once this pass is done.
      *
      * Land stops at the waterline. Carving a river mouth through it would put dry
      * ground below sea level, which is the one thing every downstream pass reads
