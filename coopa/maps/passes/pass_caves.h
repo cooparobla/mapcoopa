@@ -108,8 +108,8 @@ public:
         // sampled with the same detail and channels the renderer applies. Built
         // once for the whole pass: `Noise` wraps a FastNoiseLite and the channel
         // index walks every river.
-        const Noise terrain(config.noise_terrain);
-        const TerrainDetail detail = make_terrain_detail(config, terrain);
+        const TerrainSurface surface(graph, config);
+        const TerrainDetail& detail = surface.detail();
         const RiverChannels channels = make_river_channels(graph, config, detail);
         const Noise wander(config.noise_cave);
 

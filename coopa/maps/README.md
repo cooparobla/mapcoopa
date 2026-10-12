@@ -231,6 +231,17 @@ Land therefore spans `[sea_level, 1]`, and any threshold describing land goes th
 `land_height()`. `elevation_range_m` gives the field a vertical scale in metres, so depths
 and overhangs can be stated physically like every horizontal size already could.
 
+### Terrain models
+`MapConfig::terrain_model` picks the ground `elevation_at(center, x, y, detail)` samples (build the
+detail with `TerrainSurface(graph, config)`). **Classic**: flat triangles between the cell sites, plus
+`terrain_roughness`. **Natural** (`NaturalTerrainConfig`, noise fields `noise_hills`, `noise_ridge`,
+`noise_plateau`, `noise_warp`): the sites' heights joined smoothly (eased barycentric weights, so it
+still passes through every site and stays within its triangle's range), then shaped by landform
+through a warped field -- ridged mountain ranges on high ground, rolling hills, flat-topped
+plateaus. Near seas and lakes (blended cell rings from the water) the shaping may only raise the
+ground, so every water guarantee holds on both (`water_field_test` runs both). An elevation render of
+a natural map samples the surface directly whatever `elevation_surface` says.
+
 ### [`water_field.h`](./water_field.h)
 `WaterField::at(cell, x, y)` -- the counterpart of `elevation_at()` for water, for a consumer
 meshing the map in 3D: whether a point is under water, which body (`Sea`, `Lake`, `River`), how

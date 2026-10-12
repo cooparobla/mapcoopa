@@ -16,6 +16,7 @@
 #include <fstream>
 #include <iterator>
 #include <limits>
+#include <memory>
 #include <string>
 
 #include <coopa/debug/logger.h>
@@ -163,8 +164,8 @@ inline std::string write_file(const std::string& path, const std::string& body) 
 class SurfaceProbe {
 public:
     SurfaceProbe(const MapGraph& graph, const MapConfig& config)
-        : graph_(graph), terrain_(config.noise_terrain),
-          detail_(make_terrain_detail(config, terrain_)),
+        : graph_(graph), surface_(std::make_unique<TerrainSurface>(graph, config)),
+          detail_(surface_->detail()),
           channels_(make_river_channels(graph, config, detail_)) {}
 
     double at(const MapPoint& point) const {
@@ -185,7 +186,7 @@ public:
 
 private:
     const MapGraph& graph_;
-    Noise terrain_;
+    std::unique_ptr<TerrainSurface> surface_;
     TerrainDetail detail_;
     RiverChannels channels_;
 };

@@ -66,7 +66,8 @@ inline MapConfig standard_config() {
  * @brief A copy of `authored` with every value the CLI derives after loading a config.
  *
  * - The per-pass noise seeds follow the master seed, so one `seed` reproduces the whole map.
- * - The island frequency is scaled by `k_reference_grid_size / grid_size`.
+ * - The island frequency (and natural terrain's landform fields) are scaled by
+ *   `k_reference_grid_size / grid_size`.
  * - `image_size` is re-derived from the world extent and `meters_per_pixel`.
  *
  * Takes the *authored* config and returns a new one rather than adjusting in place, so calling it
@@ -77,8 +78,16 @@ inline MapConfig derived_config(MapConfig authored) {
     authored.noise_temperature.seed = authored.seed + 1;
     authored.noise_blend.seed = authored.seed + 2;
     authored.noise_cave.seed = authored.seed + 3;
+    authored.noise_hills.seed = authored.seed + 4;
+    authored.noise_ridge.seed = authored.seed + 5;
+    authored.noise_plateau.seed = authored.seed + 6;
+    authored.noise_warp.seed = authored.seed + 7;
     const double grid = authored.grid_size > 0 ? static_cast<double>(authored.grid_size) : k_reference_grid_size;
     authored.noise_island.frequency *= k_reference_grid_size / grid;
+    // The natural landform fields keep their size against the world, not the cell, likewise.
+    for (NoiseConfig* field : {&authored.noise_hills, &authored.noise_ridge, &authored.noise_plateau, &authored.noise_warp}) {
+        field->frequency *= k_reference_grid_size / grid;
+    }
     authored.image_size = derive_image_size(authored);
     return authored;
 }

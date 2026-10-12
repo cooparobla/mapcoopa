@@ -24,9 +24,15 @@ COOPA_TEST_SUITE("water_field");
 
 namespace {
 
+/** @brief Five worlds, each in both terrain models: every guarantee holds on either surface. */
 std::vector<MapConfig> worlds() {
     std::vector<MapConfig> out;
-    for (int seed : {17, 31, 61, 67, 251}) out.push_back(world_config(seed));
+    for (int seed : {17, 31, 61, 67, 251}) {
+        out.push_back(world_config(seed));
+        MapConfig natural = world_config(seed);
+        natural.terrain_model = TerrainModel::Natural;
+        out.push_back(natural);
+    }
     return out;
 }
 
@@ -79,8 +85,8 @@ COOPA_TEST(banked_rivers_fall_and_hold_water_in_their_channels) {
         MapGenerator generator(config, maps_logger());
         generator.generate();
         const MapGraph& graph = generator.graph();
-        const Noise terrain(config.noise_terrain);
-        const TerrainDetail detail = make_terrain_detail(config, terrain);
+        const TerrainSurface surface(graph, config);
+        const TerrainDetail& detail = surface.detail();
         const RiverChannels channels = make_river_channels(graph, config, detail);
         const WaterField field(graph, config, detail, channels);
 
@@ -115,12 +121,14 @@ COOPA_TEST(seas_and_lakes_never_stand_over_dry_ground) {
     set_render_size(standard, 256);
     std::vector<MapConfig> configs = worlds();
     configs.push_back(standard);
+    standard.terrain_model = TerrainModel::Natural;
+    configs.push_back(standard);
     for (const MapConfig& config : configs) {
         MapGenerator generator(config, maps_logger());
         generator.generate();
         const MapGraph& graph = generator.graph();
-        const Noise terrain(config.noise_terrain);
-        const TerrainDetail detail = make_terrain_detail(config, terrain);
+        const TerrainSurface surface(graph, config);
+        const TerrainDetail& detail = surface.detail();
         const RiverChannels channels = make_river_channels(graph, config, detail);
         const WaterField field(graph, config, detail, channels);
 
@@ -163,8 +171,8 @@ COOPA_TEST(water_field_names_its_bodies) {
     const MapGenerator& generator = shared_world();
     const MapGraph& graph = generator.graph();
     const MapConfig& config = generator.config();
-    const Noise terrain(config.noise_terrain);
-    const TerrainDetail detail = make_terrain_detail(config, terrain);
+    const TerrainSurface surface(graph, config);
+    const TerrainDetail& detail = surface.detail();
     const RiverChannels channels = make_river_channels(graph, config, detail);
     const WaterField field(graph, config, detail, channels);
     std::size_t seas = 0;
@@ -195,8 +203,8 @@ COOPA_TEST(rivers_run_into_the_water_they_feed) {
         MapGenerator generator(config, maps_logger());
         generator.generate();
         const MapGraph& graph = generator.graph();
-        const Noise terrain(config.noise_terrain);
-        const TerrainDetail detail = make_terrain_detail(config, terrain);
+        const TerrainSurface surface(graph, config);
+        const TerrainDetail& detail = surface.detail();
         const RiverChannels channels = make_river_channels(graph, config, detail);
         const WaterField field(graph, config, detail, channels);
         for (const ChannelSegment& mouth : channels.segments) {

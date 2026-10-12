@@ -271,6 +271,11 @@ public:
      * @return The style to draw with.
      */
     static ElevationSurface effective_surface(const MapConfig& config) {
+        // Natural terrain IS a smooth surface: drawing it flat-and-blurred would draw the cells,
+        // not the ground a 3D consumer stands on.
+        if (config.terrain_model == TerrainModel::Natural) {
+            return ElevationSurface::Interpolated;
+        }
         if (config.elevation_surface == ElevationSurface::Blended
             && blend_radius_(config) <= 0) {
             return ElevationSurface::Flat;
@@ -596,8 +601,8 @@ private:
         // The terrain, dimmed. Drawn from the same sampler the elevation layer uses
         // so the two register: a passage sitting on a ridge here is on that ridge
         // there.
-        const Noise terrain(config.noise_terrain);
-        const TerrainDetail detail = make_terrain_detail(config, terrain);
+        const TerrainSurface ground(graph, config);
+        const TerrainDetail& detail = ground.detail();
         const RiverChannels channels = make_river_channels(graph, config, detail);
         const ElevationSurface surface = effective_surface(config);
         Outlines outlines(graph, config, slice);
@@ -716,8 +721,8 @@ private:
         const double inverse_scale = 1.0 / scale;
         // One sampler for the whole layer, not one per pixel: `Noise` wraps a
         // FastNoiseLite and is not free to build.
-        const Noise terrain(config.noise_terrain);
-        const TerrainDetail detail = make_terrain_detail(config, terrain);
+        const TerrainSurface ground(graph, config);
+        const TerrainDetail& detail = ground.detail();
         // Likewise one channel index for the whole layer. Walking the rivers per
         // pixel would be absurd; per layer it is a few milliseconds.
         const RiverChannels channels = make_river_channels(graph, config, detail);
@@ -750,8 +755,8 @@ private:
         // The same detail field the elevation layer uses. A river's surface is
         // measured *from the ground the other layer draws*, so this layer has to
         // sample the identical surface or the two disagree about where the bed is.
-        const Noise terrain(config.noise_terrain);
-        const TerrainDetail detail = make_terrain_detail(config, terrain);
+        const TerrainSurface ground(graph, config);
+        const TerrainDetail& detail = ground.detail();
         // The channels too, because the sheet settles into its bed as it nears the
         // mouth rather than staying up on the rim -- which is what lets it meet the
         // sea flush instead of ending a few metres above it.
@@ -903,8 +908,8 @@ private:
         (void)palette;
         const double scale = pixels_per_grid_unit_(config);
         const double inverse_scale = 1.0 / scale;
-        const Noise terrain(config.noise_terrain);
-        const TerrainDetail detail = make_terrain_detail(config, terrain);
+        const TerrainSurface ground(graph, config);
+        const TerrainDetail& detail = ground.detail();
         const RiverChannels channels = make_river_channels(graph, config, detail);
         Outlines outlines(graph, config, slice);
 
@@ -1466,8 +1471,8 @@ private:
         // fraction of a percent of a map, so this is a rounding error against the
         // blur that precedes it -- and it is why the channel index is consulted
         // before the outline is ever asked for.
-        const Noise terrain(config.noise_terrain);
-        const TerrainDetail detail = make_terrain_detail(config, terrain);
+        const TerrainSurface ground(graph, config);
+        const TerrainDetail& detail = ground.detail();
         const RiverChannels channels = make_river_channels(graph, config, detail);
         if (channels.empty()) {
             return;

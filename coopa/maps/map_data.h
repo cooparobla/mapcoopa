@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -745,9 +746,36 @@ struct MapCave {
  * value so one sampler serves a whole render: `Noise` wraps a FastNoiseLite,
  * which is not free to construct.
  */
+struct NaturalTerrain;
+
 struct TerrainDetail {
     const Noise* noise = nullptr; /**< @brief The detail field; null disables displacement. */
     double roughness = 0.0;       /**< @brief Displacement amplitude; 0 disables it. */
+    /** @brief `TerrainModel::Natural`'s landforms; null samples the classic surface. See `TerrainSurface`. */
+    const NaturalTerrain* natural = nullptr;
+};
+
+/**
+ * @struct NaturalTerrain
+ * @brief What `TerrainModel::Natural` shapes the sampled ground with: its landform fields, and
+ *        how far each cell is from water (which decides where the shaping may lower the ground).
+ *
+ * Built by `TerrainSurface` from a generated graph; read-only afterwards, so any number of
+ * threads may sample through it.
+ */
+struct NaturalTerrain {
+    NaturalTerrainConfig config;
+    double sea_level = 0.25;
+    Noise hills;
+    Noise ridge;
+    Noise plateau;
+    Noise warp;
+    /** @brief Per cell: rings of cells out from the nearest sea or lake cell, 0 on the water, capped at 4. */
+    std::vector<std::uint8_t> rings;
+
+    NaturalTerrain(const MapConfig& map, std::vector<std::uint8_t> water_rings)
+        : config(map.natural), sea_level(map.sea_level), hills(map.noise_hills), ridge(map.noise_ridge),
+          plateau(map.noise_plateau), warp(map.noise_warp), rings(std::move(water_rings)) {}
 };
 
 /**
@@ -1004,6 +1032,9 @@ public:
      */
     double elevation_at(const MapCenter& center, double x, double y,
                         const TerrainDetail& detail) const {
+        if (detail.natural != nullptr) {
+            return natural_elevation_(center, x, y, *detail.natural);
+        }
         const double base = elevation_at(center, x, y);
         if (detail.noise == nullptr || detail.roughness <= 0.0) {
             return base;
@@ -1103,6 +1134,69 @@ public:
             deepest = std::max(deepest, segment.depth * (1.0 - u * u));
         }
         return deepest;
+    }
+
+    /**
+     * @brief `TerrainModel::Natural`'s ground at a point.
+     *
+     * **The base** joins the three cell heights of the Delaunay triangle smoothly: each
+     * barycentric weight is eased (`smoothstep`, by `smoothing`) before the blend, so the
+     * surface still passes through every cell's own height and never leaves the range of its
+     * triangle's three, but rounds over instead of running in planes.
+     *
+     * **The landforms** are added over it, sampled through a warped field so ridges and
+     * valleys bend: rolling hills on the lowland, ridged mountain ranges where the land is high
+     * (`mountain_start`, the boundary itself broken up), and flat-topped plateaus with steep
+     * edges on a share of the lowland away from the mountains.
+     *
+     * **Near water the shaping may only raise the ground**: how far a point is from the sea or
+     * a lake (in cells, blended over the triangle) fades out first the lowering, then the
+     * raising. Every shore therefore stands at least as high as the classic surface puts it,
+     * and that surface keeps every shore above its water -- the guarantee `WaterField` relies on.
+     */
+    double natural_elevation_(const MapCenter& center, double x, double y, const NaturalTerrain& n) const {
+        std::array<CenterId, 3> ids{};
+        std::array<double, 3> weights{};
+        if (!triangle_at(center, x, y, ids, weights)) {
+            return elevation_at(center, x, y);
+        }
+        const auto smoothstep = [](double e0, double e1, double v) {
+            const double t = std::clamp((v - e0) / (e1 - e0), 0.0, 1.0);
+            return t * t * (3.0 - 2.0 * t);
+        };
+        const double smoothing = std::clamp(n.config.smoothing, 0.0, 1.0);
+        double base = 0.0;
+        double total = 0.0;
+        double ring = 0.0;
+        for (std::size_t i = 0; i < 3; ++i) {
+            const double w = std::clamp(weights[i], 0.0, 1.0);
+            const double eased = w + (w * w * (3.0 - 2.0 * w) - w) * smoothing;
+            const std::size_t id = static_cast<std::size_t>(ids[i]);
+            base += eased * centers[id].elevation;
+            total += eased;
+            ring += w * static_cast<double>(id < n.rings.size() ? n.rings[id] : 4);
+        }
+        base = total > 0.0 ? base / total : elevation_at(center, x, y);
+
+        const double sea = n.sea_level;
+        const double land = sea < 1.0 ? std::clamp((base - sea) / (1.0 - sea), 0.0, 1.0) : 0.0;
+        const double wx = x + n.config.warp * static_cast<double>(n.warp.sample(x, y));
+        const double wy = y + n.config.warp * static_cast<double>(n.warp.sample(x + 37.1, y - 21.7));
+
+        const double hills = n.config.hills * static_cast<double>(n.hills.sample(wx, wy)) * smoothstep(0.0, 0.12, land);
+        const double edge = land + 0.12 * static_cast<double>(n.plateau.sample(x * 0.5 + 411.0, y * 0.5 - 97.0));
+        const double range = smoothstep(n.config.mountain_start, n.config.mountain_start + 0.3, edge);
+        // Squared, so the crests come to an edge and the slopes below them fall away concave.
+        const double crest = 0.5 * (static_cast<double>(n.ridge.sample(wx, wy)) + 1.0);
+        const double mountains = n.config.mountains * range * (crest * crest - 0.25);
+        const double threshold = 0.4 - 0.8 * std::clamp(n.config.plateau_coverage, 0.0, 1.0);
+        const double mesa = smoothstep(threshold, threshold + 0.05, static_cast<double>(n.plateau.sample(wx, wy)))
+                          * smoothstep(0.03, 0.12, land) * (1.0 - range);
+        const double shaping = hills + mountains + n.config.plateaus * mesa;
+
+        const double raise = smoothstep(0.0, 1.5, ring);
+        const double lower = smoothstep(1.5, 3.0, ring);
+        return std::clamp(base + (shaping > 0.0 ? raise : lower) * shaping, 0.0, 1.0);
     }
 
     /**
@@ -1379,6 +1473,61 @@ public:
         }
         return k_invalid_id;
     }
+};
+
+/**
+ * @class TerrainSurface
+ * @brief Everything a consumer samples the ground through, built once per map: the detail
+ *        field and, under `TerrainModel::Natural`, its landforms.
+ *
+ * `detail()` is what `MapGraph::elevation_at()` takes. Build one per render or bake -- the
+ * renderer, the cave pass and a 3D host all do -- and pass the detail by reference; it borrows
+ * from this object, which is therefore neither copyable nor movable.
+ */
+class TerrainSurface {
+public:
+    TerrainSurface(const MapGraph& graph, const MapConfig& config) : noise_(config.noise_terrain) {
+        detail_ = make_terrain_detail(config, noise_);
+        if (config.terrain_model == TerrainModel::Natural) {
+            natural_ = std::make_unique<NaturalTerrain>(config, water_rings(graph));
+            detail_.natural = natural_.get();
+        }
+    }
+    TerrainSurface(const TerrainSurface&) = delete;
+    TerrainSurface& operator=(const TerrainSurface&) = delete;
+
+    const TerrainDetail& detail() const { return detail_; }
+
+    /** @brief Per cell, rings of cells out from the nearest sea or lake cell (0 on water), capped at 4. */
+    static std::vector<std::uint8_t> water_rings(const MapGraph& graph) {
+        std::vector<std::uint8_t> rings(graph.centers.size(), 4);
+        std::vector<CenterId> frontier;
+        for (const MapCenter& c : graph.centers) {
+            if (c.water) {
+                rings[static_cast<std::size_t>(c.index)] = 0;
+                frontier.push_back(c.index);
+            }
+        }
+        for (std::uint8_t d = 1; d < 4 && !frontier.empty(); ++d) {
+            std::vector<CenterId> next;
+            for (const CenterId id : frontier) {
+                for (const CenterId n : graph.centers[static_cast<std::size_t>(id)].neighbors) {
+                    std::uint8_t& r = rings[static_cast<std::size_t>(n)];
+                    if (r > d) {
+                        r = d;
+                        next.push_back(n);
+                    }
+                }
+            }
+            frontier = std::move(next);
+        }
+        return rings;
+    }
+
+private:
+    Noise noise_;
+    std::unique_ptr<NaturalTerrain> natural_;
+    TerrainDetail detail_;
 };
 
 /**

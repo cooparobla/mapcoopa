@@ -291,6 +291,70 @@ inline ElevationSurface elevation_surface_from_name(std::string_view name) {
 }
 
 /**
+ * @enum TerrainModel
+ * @brief How the sampled ground surface is shaped between the cells' heights.
+ *
+ * Both models pass through every cell's own height, so the passes (rivers, biomes, water levels)
+ * and everything derived from them are the same; they differ in the ground a consumer samples
+ * (`MapGraph::elevation_at()`) -- what an elevation render draws and a 3D terrain stands on.
+ */
+enum class TerrainModel {
+    /**
+     * @brief Flat triangles between the cell sites, plus the `terrain_roughness` detail field.
+     *
+     * Faithful to the stored heights, and plain: sampled finely (a world thousands of samples
+     * across), every slope is a plane and every contour a straight line.
+     */
+    Classic,
+    /**
+     * @brief A landscape: the cells' heights joined smoothly, then shaped by landform --
+     *        ridged mountain ranges where the land is high, rolling hills on the lowland,
+     *        flat-topped plateaus with cliff edges, all through a warped field so nothing
+     *        lines up. See `NaturalTerrainConfig`.
+     *
+     * Kept consistent with the water: near every sea and lake the shaping may only raise
+     * the ground, so no shore is ever pushed under the water beside it; rivers are fitted to
+     * whatever ground this makes (their banks and channels are measured from it).
+     */
+    Natural
+};
+
+/** @brief Maps a terrain model to its serialisation name. */
+inline std::string_view terrain_model_name(TerrainModel model) {
+    return model == TerrainModel::Natural ? "natural" : "classic";
+}
+
+/** @brief Resolves a serialisation name back to a terrain model; unknown names are `Classic`. */
+inline TerrainModel terrain_model_from_name(std::string_view name) {
+    return name == "natural" ? TerrainModel::Natural : TerrainModel::Classic;
+}
+
+/**
+ * @struct NaturalTerrainConfig
+ * @brief The landforms `TerrainModel::Natural` shapes the ground into.
+ *
+ * Amplitudes are in normalised height (multiply by `elevation_range_m` for metres). Each landform
+ * has its own noise field on `MapConfig` (`noise_hills`, `noise_ridge`, `noise_plateau`,
+ * `noise_warp`), seeded from the master seed and scaled with the grid like the island field.
+ */
+struct NaturalTerrainConfig {
+    /** @brief How smoothly the cells' heights are joined: 0 flat triangles, 1 fully rounded. */
+    double smoothing = 1.0;
+    /** @brief Rolling hills over the lowland. */
+    double hills = 0.05;
+    /** @brief Ridged mountain ranges: sharp crests and spurs where the land is high. */
+    double mountains = 0.45;
+    /** @brief Land height (0 the shore, 1 the summit) where mountain ranges begin. */
+    double mountain_start = 0.22;
+    /** @brief How high a plateau stands over the land around it. */
+    double plateaus = 0.07;
+    /** @brief Share of the lowland raised into plateaus, 0 to 1. */
+    double plateau_coverage = 0.25;
+    /** @brief How far the landform fields are pushed around, in grid units: bends ridges and valleys. */
+    double warp = 1.5;
+};
+
+/**
  * @enum MapShape
  * @brief The outline the landmass is confined to; everything outside it is sea.
  */
@@ -1242,6 +1306,21 @@ struct MapConfig {
      * would do.
      */
     NoiseConfig noise_cave{2011, 0.45};
+    /**
+     * @brief Which ground surface `MapGraph::elevation_at()` samples; see `TerrainModel`.
+     */
+    TerrainModel terrain_model = TerrainModel::Classic;
+    /** @brief The landforms of `TerrainModel::Natural`. */
+    NaturalTerrainConfig natural;
+    /** @brief Natural terrain's rolling hills (frequency at 40 cells, scaled with the grid). */
+    NoiseConfig noise_hills{6151, 0.3};
+    /** @brief Natural terrain's mountain ranges: ridged, so crests come out sharp. */
+    NoiseConfig noise_ridge{6871, 0.16, FastNoiseLite::NoiseType_OpenSimplex2, FastNoiseLite::FractalType_Ridged, 5,
+                            2.0, 0.5, 0.6};
+    /** @brief Natural terrain's plateau mask: broad, low-frequency patches. */
+    NoiseConfig noise_plateau{7297, 0.09, FastNoiseLite::NoiseType_OpenSimplex2, FastNoiseLite::FractalType_FBm, 3};
+    /** @brief Natural terrain's domain warp: what bends the other fields. */
+    NoiseConfig noise_warp{8461, 0.2, FastNoiseLite::NoiseType_OpenSimplex2, FastNoiseLite::FractalType_FBm, 3};
     /**
      * @brief How strongly the detail field displaces the sampled surface, 0 to 1.
      *
