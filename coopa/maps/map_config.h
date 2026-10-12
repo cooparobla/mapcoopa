@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <limits>
 #include <random>
+#include <string_view>
 #include <vector>
 
 #include <glm/glm.hpp>
@@ -288,6 +289,29 @@ inline ElevationSurface elevation_surface_from_name(std::string_view name) {
     if (name == "flat") return ElevationSurface::Flat;
     if (name == "blended") return ElevationSurface::Blended;
     return ElevationSurface::Interpolated;
+}
+
+/**
+ * @enum MapTopology
+ * @brief What surface the map's cells cover.
+ *
+ * - **Plane** -- the square `[0, grid_size]^2`, ringed by sea (`border_length`). Every map made
+ *   before spheres existed, and still the default: nothing about it changes with this setting.
+ * - **Sphere** -- the whole surface of a globe: no edges, no border, latitude climate from the
+ *   poles. Points lie at `sphere_radius()` grid units from the centre, so a cell is still about
+ *   one grid unit across and every distance, width and noise frequency keeps its meaning.
+ *   `MapPoint::z` is used; on a plane it is always 0.
+ */
+enum class MapTopology { Plane, Sphere };
+
+/** @brief Maps a topology to its serialisation name. */
+inline std::string_view map_topology_name(MapTopology topology) {
+    return topology == MapTopology::Sphere ? "sphere" : "plane";
+}
+
+/** @brief Resolves a serialisation name back to a topology; unknown names are `Plane`. */
+inline MapTopology map_topology_from_name(std::string_view name) {
+    return name == "sphere" ? MapTopology::Sphere : MapTopology::Plane;
 }
 
 /**
@@ -996,6 +1020,10 @@ struct MapConfig {
 
     /** @brief Cells per axis; the point set is `(grid_size + 1)^2` plus a boundary ring. */
     int grid_size = 50;
+    /** @brief Plane (the square map) or sphere (a globe); see `MapTopology`. */
+    MapTopology topology = MapTopology::Plane;
+    /** @brief Sphere only: how many cells cover the globe; 0 means `(grid_size + 1)^2`. */
+    int sphere_cells = 0;
     /** @brief How far a grid point may wander from its lattice position, in grid units. */
     double jitter = 0.5;
     /** @brief Master seed; every pass derives its generator from this. */
@@ -2072,6 +2100,126 @@ inline double shape_inset(const MapConfig& config, double x, double y) {
     return ShapeField(config).inset(x, y);
 }
 
+/** @brief How many cells a sphere map has: `sphere_cells`, or `(grid_size + 1)^2`. */
+inline int sphere_point_count(const MapConfig& config) {
+    if (config.sphere_cells > 0) return std::max(12, config.sphere_cells);
+    return std::max(12, (config.grid_size + 1) * (config.grid_size + 1));
+}
+
+/**
+ * @brief A sphere map's radius in grid units: the one at which its cells average a grid unit
+ *        across (`4 pi R^2 = N`), so every distance on it means what it means on a plane.
+ */
+inline double sphere_radius(const MapConfig& config) {
+    return std::sqrt(static_cast<double>(sphere_point_count(config)) / (4.0 * 3.14159265358979323846));
+}
+
+/**
+ * @class SphereShapeField
+ * @brief `ShapeField` on a globe: where land may rise, as a signed distance in grid units.
+ *
+ * - **Rectangle** has no edge on a sphere: the whole globe is open to land, and the island noise
+ *   alone decides where it is (`inset()` is always far positive).
+ * - **Circle** and **Triangle** are one round landmass -- a cap -- of `diameter_m`
+ *   (`edge_length_m`) across, centred on a seeded point; 0 is half the globe.
+ * - **Continent** is one irregular landmass of `continent_size_m` (0: half the globe), and
+ *   **Archipelago** `continent_count` of them, spread apart over the globe with their sizes
+ *   varied by `size_variance`.
+ *
+ * A landmass's edge wanders by `irregularity` (a low-frequency field over the globe) and its coast
+ * by `coast_detail` (the shape noise, sampled in 3D). Distances are along the surface.
+ */
+class SphereShapeField {
+public:
+    explicit SphereShapeField(const MapConfig& config)
+        : shape_(config.shape.shape), radius_(sphere_radius(config)) {
+        configure_noise(warp_, config.noise_shape);
+        warp_.SetFrequency(static_cast<float>(config.noise_shape.frequency * 3.0));
+        irregularity_ = std::clamp(config.shape.irregularity, 0.0, 0.6);
+        coast_ = std::max(0.0, config.shape.coast_detail);
+        const double half_globe = 0.5 * 3.14159265358979323846 * radius_;   // arc to the equator from a pole
+        const auto arc_of = [&](double meters) {
+            return meters > 0.0 ? 0.5 * meters / config.meters_per_grid_unit : half_globe;
+        };
+        std::mt19937 rng(static_cast<std::mt19937::result_type>(config.seed * 2654435761u + 97u));
+        UniformRealDistribution<double> unit(0.0, 1.0);
+        const auto random_dir = [&]() {
+            const double z = 2.0 * unit(rng) - 1.0;
+            const double a = 2.0 * 3.14159265358979323846 * unit(rng);
+            const double r = std::sqrt(std::max(0.0, 1.0 - z * z));
+            return glm::dvec3(r * std::cos(a), r * std::sin(a), z);
+        };
+        switch (shape_) {
+            case MapShape::Rectangle:
+                return;
+            case MapShape::Circle:
+                blobs_.push_back({random_dir(), arc_of(config.shape.diameter_m)});
+                return;
+            case MapShape::Triangle:
+                blobs_.push_back({random_dir(), arc_of(config.shape.edge_length_m)});
+                return;
+            case MapShape::Continent:
+                blobs_.push_back({random_dir(), arc_of(config.shape.continent_size_m)});
+                return;
+            case MapShape::Archipelago: {
+                const int count = std::max(1, config.shape.continent_count);
+                // Mean size: the landmasses share about half the globe between them.
+                const double mean = config.shape.continent_size_m > 0.0
+                                        ? 0.5 * config.shape.continent_size_m / config.meters_per_grid_unit
+                                        : half_globe / std::sqrt(static_cast<double>(count));
+                const double variance = std::clamp(config.shape.size_variance, 0.0, 0.9);
+                for (int i = 0; i < count; ++i) {
+                    // Best of a few candidates: the one furthest from those already placed.
+                    glm::dvec3 best = random_dir();
+                    double best_gap = -1.0;
+                    for (int c = 0; c < 12; ++c) {
+                        const glm::dvec3 d = random_dir();
+                        double gap = 4.0;
+                        for (const Blob& b : blobs_) gap = std::min(gap, glm::length(d - b.centre));
+                        if (gap > best_gap) { best_gap = gap; best = d; }
+                    }
+                    const double scale = 1.0 + variance * (2.0 * unit(rng) - 1.0);
+                    blobs_.push_back({best, mean * scale});
+                }
+                return;
+            }
+        }
+    }
+
+    /** @brief How far inside the land's outline a point of the globe lies, in grid units. */
+    double inset(double x, double y, double z) const {
+        if (blobs_.empty()) return std::numeric_limits<double>::max();
+        const glm::dvec3 p(x, y, z);
+        const double len = glm::length(p);
+        if (len <= 0.0) return 0.0;
+        const glm::dvec3 dir = p / len;
+        const double wobble = static_cast<double>(warp_.GetNoise(static_cast<float>(dir.x * 4.0),
+                                                                  static_cast<float>(dir.y * 4.0),
+                                                                  static_cast<float>(dir.z * 4.0)));
+        const double coast = static_cast<double>(warp_.GetNoise(static_cast<float>(x), static_cast<float>(y),
+                                                                 static_cast<float>(z)));
+        double best = -std::numeric_limits<double>::max();
+        for (const Blob& b : blobs_) {
+            const double arc = std::acos(std::clamp(glm::dot(dir, b.centre), -1.0, 1.0)) * radius_;
+            const double reach = b.radius * (1.0 + irregularity_ * wobble) + coast_ * b.radius * coast;
+            best = std::max(best, reach - arc);
+        }
+        return best;
+    }
+
+private:
+    struct Blob {
+        glm::dvec3 centre; /**< Unit direction. */
+        double radius;     /**< Arc length from the centre to the edge, in grid units. */
+    };
+    MapShape shape_;
+    double radius_;
+    double irregularity_ = 0.0;
+    double coast_ = 0.0;
+    std::vector<Blob> blobs_;
+    FastNoiseLite warp_;
+};
+
 /**
  * @brief Converts a height in metres into the normalised elevation field.
  *
@@ -2156,8 +2304,14 @@ inline double grid_to_meters(const MapConfig& config, double grid) {
  * @param config Supplies the grid size and both scale factors.
  * @return The side length in pixels, at least 1.
  */
+inline double sphere_radius(const MapConfig& config);
+
 inline int derive_image_size(const MapConfig& config) {
-    const double meters = static_cast<double>(config.grid_size) * config.meters_per_grid_unit;
+    // A sphere renders equirectangular: `image_size` is the width, the equator's length.
+    const double grid_extent = config.topology == MapTopology::Sphere
+                                   ? 2.0 * 3.14159265358979323846 * sphere_radius(config)
+                                   : static_cast<double>(config.grid_size);
+    const double meters = grid_extent * config.meters_per_grid_unit;
     const double pixels = meters / (config.meters_per_pixel > 0.0 ? config.meters_per_pixel : 1.0);
     return std::max(1, static_cast<int>(pixels + 0.5));
 }

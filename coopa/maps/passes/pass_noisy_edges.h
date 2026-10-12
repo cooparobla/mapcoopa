@@ -77,6 +77,11 @@ public:
             edge.noisy_points1.clear();
             build_path_(edge.noisy_points0, v0, t, edge.midpoint, q, min_length, rng);
             build_path_(edge.noisy_points1, v1, s, edge.midpoint, r, min_length, rng);
+            if (graph.is_sphere()) {
+                // Subdivided in straight lines, the path cuts inside a globe: put it back on.
+                for (MapPoint& p : edge.noisy_points0) p = graph.on_surface(p);
+                for (MapPoint& p : edge.noisy_points1) p = graph.on_surface(p);
+            }
             edge.noisy = true;
         }
     }
@@ -116,12 +121,13 @@ private:
 
     /** @brief Linear interpolation between two points. */
     static MapPoint interpolate_(const MapPoint& from, const MapPoint& to, double f) {
-        return {from.x + f * (to.x - from.x), from.y + f * (to.y - from.y)};
+        return {from.x + f * (to.x - from.x), from.y + f * (to.y - from.y), from.z + f * (to.z - from.z)};
     }
 
     /** @brief Euclidean distance between two points. */
     static double distance_(const MapPoint& a, const MapPoint& b) {
-        return std::hypot(b.x - a.x, b.y - a.y);
+        if (a.z == 0.0 && b.z == 0.0) return std::hypot(b.x - a.x, b.y - a.y);   // a plane map
+        return a.distance_to(b);
     }
 
     /** @brief Emits the path from `a` to `c` through the quadrilateral `a b c d`. */

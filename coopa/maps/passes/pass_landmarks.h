@@ -373,7 +373,8 @@ private:
         for (const MapTown& town : graph.towns) {
             const double dx = town.point.x - point.x;
             const double dy = town.point.y - point.y;
-            if (dx * dx + dy * dy < clearance_squared) {
+            const double dz = town.point.z - point.z;   // 0 on a plane map
+            if (dx * dx + dy * dy + dz * dz < clearance_squared) {
                 return false;
             }
         }

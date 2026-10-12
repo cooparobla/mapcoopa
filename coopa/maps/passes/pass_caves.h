@@ -256,7 +256,8 @@ private:
                 const MapPoint& other = graph.edges[static_cast<std::size_t>(taken)].midpoint;
                 const double dx = here.x - other.x;
                 const double dy = here.y - other.y;
-                if (dx * dx + dy * dy < spacing_squared) {
+                const double dz = here.z - other.z;   // 0 on a plane map
+                if (dx * dx + dy * dy + dz * dz < spacing_squared) {
                     clear = false;
                     break;
                 }
@@ -313,7 +314,7 @@ private:
         cave.mouth_edge = edge.index;
         cave.mouth = edge.midpoint;
         cave.mouth_grade = edge_grade(graph, edge, config);
-        cave.surface_at_mouth = graph.elevation_at(low, cave.mouth.x, cave.mouth.y, detail, channels);
+        cave.surface_at_mouth = graph.elevation_at(low, cave.mouth, detail, channels);
         cave.region = low.region;
 
         const double mouth_floor = cave.surface_at_mouth - clearance - passage_height;
@@ -350,7 +351,7 @@ private:
 
         std::vector<Head> heads;
         heads.push_back(Head{cave.mouth, mouth_floor,
-                             std::atan2(high.point.y - low.point.y, high.point.x - low.point.x),
+                             graph.bearing_between(low.point, high.point),
                              trunk_budget, phase(rng), 0, 0});
 
         const double limit = static_cast<double>(config.grid_size);
@@ -377,8 +378,12 @@ private:
                 const bool phreatic = head.floor <= table + k_zone_epsilon;
 
                 head.bearing += caves.meander * k_max_turn
-                                * static_cast<double>(wander.sample(head.point.x + head.phase,
-                                                                   head.point.y - head.phase));
+                                * static_cast<double>(graph.is_sphere()
+                                                          ? wander.sample(head.point.x + head.phase,
+                                                                          head.point.y - head.phase,
+                                                                          head.point.z + head.phase)
+                                                          : wander.sample(head.point.x + head.phase,
+                                                                          head.point.y - head.phase));
                 head.bearing += massif_lean_(
                     graph, config, head,
                     cave.nodes[static_cast<std::size_t>(head.parent)].center, step,
@@ -392,9 +397,9 @@ private:
                                     : phreatic ? phreatic_drop * unit(rng)
                                                : descent_drop;
 
-                const MapPoint next{head.point.x + std::cos(head.bearing) * advance,
-                                    head.point.y + std::sin(head.bearing) * advance};
-                if (next.x < 0.0 || next.y < 0.0 || next.x > limit || next.y > limit) {
+                const MapPoint next = graph.step_from(head.point, head.bearing, advance);
+                // A globe has no edge to run off.
+                if (!graph.is_sphere() && (next.x < 0.0 || next.y < 0.0 || next.x > limit || next.y > limit)) {
                     cut_short = true;
                     break;
                 }
@@ -688,11 +693,9 @@ private:
             return 0.0;
         }
         const auto probe = [&](double bearing) {
-            const MapPoint at{head.point.x + std::cos(bearing) * step,
-                              head.point.y + std::sin(bearing) * step};
+            const MapPoint at = graph.step_from(head.point, bearing, step);
             const CenterId cell = locate_(graph, at, from);
-            return graph.elevation_at(graph.centers[static_cast<std::size_t>(cell)], at.x, at.y,
-                                      detail, channels);
+            return graph.elevation_at(graph.centers[static_cast<std::size_t>(cell)], at, detail, channels);
         };
 
         // Only steer when the rock ahead is actually thinning. Under a massif every
@@ -757,11 +760,11 @@ private:
             // where a wobbled outline differs from a straight one.
             const CenterId cell = locate_(graph, at, from);
             const MapCenter& center = graph.centers[static_cast<std::size_t>(cell)];
-            double height = graph.elevation_at(center, at.x, at.y, detail, channels);
+            double height = graph.elevation_at(center, at, detail, channels);
             for (const CenterId neighbor : center.neighbors) {
                 height = std::min(height,
                                   graph.elevation_at(graph.centers[static_cast<std::size_t>(neighbor)],
-                                                     at.x, at.y, detail, channels));
+                                                     at, detail, channels));
             }
             return height;
         };
@@ -771,8 +774,7 @@ private:
         }
         for (int i = 0; i < k_rim_probes; ++i) {
             const double angle = k_turn * static_cast<double>(i) / static_cast<double>(k_rim_probes);
-            lowest = std::min(lowest, sample(MapPoint{point.x + std::cos(angle) * radius,
-                                                      point.y + std::sin(angle) * radius}));
+            lowest = std::min(lowest, sample(graph.step_from(point, angle, radius)));
         }
         return lowest;
     }

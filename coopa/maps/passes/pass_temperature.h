@@ -58,13 +58,15 @@ public:
         }
 
         for (MapCorner& corner : graph.corners) {
-            corner.temperature = sample_(noise, config, grid_size, corner.point, corner.elevation);
+            corner.temperature = graph.is_sphere() ? sample_sphere_(noise, config, graph, corner.point, corner.elevation)
+                                                   : sample_(noise, config, grid_size, corner.point, corner.elevation);
         }
 
         for (MapCenter& center : graph.centers) {
             if (center.corners.empty()) {
                 center.temperature =
-                    sample_(noise, config, grid_size, center.point, center.elevation);
+                    graph.is_sphere() ? sample_sphere_(noise, config, graph, center.point, center.elevation)
+                                      : sample_(noise, config, grid_size, center.point, center.elevation);
                 continue;
             }
             double sum = 0.0;
@@ -76,6 +78,23 @@ public:
     }
 
 private:
+    /**
+     * @brief Temperature at a point of a globe: latitude from height above the equator.
+     *
+     * `|z| / R` rather than the latitude angle, so a polar cap reaching `polar_extent` of the way
+     * to the equator covers that fraction of its hemisphere's area -- what the setting means on a
+     * plane. North is +z.
+     */
+    static double sample_sphere_(const Noise& noise, const MapConfig& config, const MapGraph& graph,
+                                 const MapPoint& point, double elevation) {
+        const double distance = std::clamp(std::abs(point.z) / graph.sphere_radius, 0.0, 1.0);
+        const double extent = point.z >= 0.0 ? config.polar_extent_north : config.polar_extent_south;
+        const double band = latitude_band_(distance, extent, config.temperature_falloff);
+        const double lapse = elevation * config.temperature_lapse_rate;
+        const double variation = noise.sample(point.x, point.y, point.z) * k_variation_scale;
+        return std::clamp(band - lapse + variation + config.temperature_offset, 0.0, 1.0);
+    }
+
     /** @brief Strength of the noise term, as a fraction of the full range. */
     static constexpr double k_variation_scale = 0.12;
 

@@ -50,14 +50,22 @@ inline constexpr std::int32_t k_invalid_id = -1;
 struct MapPoint {
     double x = 0.0; /**< @brief Horizontal position in grid units. */
     double y = 0.0; /**< @brief Vertical position in grid units. */
+    /**
+     * @brief Third coordinate, used only by sphere maps (`MapTopology::Sphere`), whose points lie
+     *        on a globe centred at the origin. Always 0 on a plane, where every formula below
+     *        reduces exactly to its 2D form.
+     */
+    double z = 0.0;
 
     /**
-     * @brief Euclidean distance to another point.
+     * @brief Euclidean distance to another point -- on a sphere the chord, which at the scales
+     *        any pass measures is the arc to well under a percent.
      * @param other The point to measure to.
      * @return The distance in grid units.
      */
     double distance_to(const MapPoint& other) const {
-        return std::sqrt((x - other.x) * (x - other.x) + (y - other.y) * (y - other.y));
+        return std::sqrt((x - other.x) * (x - other.x) + (y - other.y) * (y - other.y)
+                         + (z - other.z) * (z - other.z));
     }
 };
 
@@ -149,8 +157,8 @@ inline void chaikin_smooth(std::vector<MapPoint>& points, int iterations) {
         for (std::size_t i = 0; i + 1 < points.size(); ++i) {
             const MapPoint& a = points[i];
             const MapPoint& b = points[i + 1];
-            cut.push_back({a.x * 0.75 + b.x * 0.25, a.y * 0.75 + b.y * 0.25});
-            cut.push_back({a.x * 0.25 + b.x * 0.75, a.y * 0.25 + b.y * 0.75});
+            cut.push_back({a.x * 0.75 + b.x * 0.25, a.y * 0.75 + b.y * 0.25, a.z * 0.75 + b.z * 0.25});
+            cut.push_back({a.x * 0.25 + b.x * 0.75, a.y * 0.25 + b.y * 0.75, a.z * 0.25 + b.z * 0.75});
         }
         cut.push_back(points.back());
         points = std::move(cut);
@@ -914,6 +922,21 @@ inline double distance_to_segment(double x, double y, const MapPoint& a, const M
 }
 
 /**
+ * @brief Distance from a point to a segment in 3D -- what a sphere map's channels and rivers are
+ *        measured with (the chord, at river widths the arc to well under a percent).
+ */
+inline double distance_to_segment(const MapPoint& p, const MapPoint& a, const MapPoint& b) {
+    const double dx = b.x - a.x, dy = b.y - a.y, dz = b.z - a.z;
+    const double length_squared = dx * dx + dy * dy + dz * dz;
+    double t = 0.0;
+    if (length_squared > 0.0) {
+        t = std::clamp(((p.x - a.x) * dx + (p.y - a.y) * dy + (p.z - a.z) * dz) / length_squared, 0.0, 1.0);
+    }
+    const double px = p.x - (a.x + t * dx), py = p.y - (a.y + t * dy), pz = p.z - (a.z + t * dz);
+    return std::sqrt(px * px + py * py + pz * pz);
+}
+
+/**
  * @class MapGraph
  * @brief Owns every cell, corner, edge, road run and settlement of one generated map.
  *
@@ -934,9 +957,73 @@ public:
     std::vector<MapCountry> countries; /**< @brief Nations carved by the region pass. */
     std::vector<MapLandmark> landmarks; /**< @brief Notable places found by the landmark pass. */
     std::vector<MapCave> caves;     /**< @brief Cave systems opened by the cave pass. */
+    /**
+     * @brief A sphere map's radius in grid units (`MapTopology::Sphere`): its points lie on a
+     *        globe of this radius about the origin. 0 for a plane map.
+     */
+    double sphere_radius = 0.0;
+
+    /** @brief True for a sphere map. */
+    bool is_sphere() const { return sphere_radius > 0.0; }
+
+    /** @brief A noise field at a point: in 3D on a sphere (seamless round the globe), 2D on a plane. */
+    float noise_at(const Noise& noise, const MapPoint& p) const {
+        return is_sphere() ? noise.sample(p.x, p.y, p.z) : noise.sample(p.x, p.y);
+    }
+
+    /** @brief A point pushed back onto a sphere map's globe; unchanged on a plane. */
+    MapPoint on_surface(const MapPoint& p) const {
+        if (!is_sphere()) return p;
+        const double len = std::sqrt(p.x * p.x + p.y * p.y + p.z * p.z);
+        if (len <= 0.0) return p;
+        const double k = sphere_radius / len;
+        return MapPoint{p.x * k, p.y * k, p.z * k};
+    }
+
+    /**
+     * @brief The point `distance` grid units from `p` along `bearing` (radians, counter-clockwise
+     *        from +x). On a plane that is exactly `p + (cos, sin) * distance`; on a globe the
+     *        bearing is measured in the ground's local frame (from east toward north, with east
+     *        along the equator), and the step lands back on the globe.
+     */
+    MapPoint step_from(const MapPoint& p, double bearing, double distance) const {
+        if (!is_sphere()) {
+            return MapPoint{p.x + std::cos(bearing) * distance, p.y + std::sin(bearing) * distance};
+        }
+        double ex = 0.0, ey = 0.0, ez = 0.0, nx = 0.0, ny = 0.0, nz = 0.0;
+        local_frame_(p, ex, ey, ez, nx, ny, nz);
+        const double c = std::cos(bearing) * distance;
+        const double s = std::sin(bearing) * distance;
+        return on_surface(MapPoint{p.x + ex * c + nx * s, p.y + ey * c + ny * s, p.z + ez * c + nz * s});
+    }
+
+    /** @brief The bearing from `a` toward `b`, as `step_from()` measures one. */
+    double bearing_between(const MapPoint& a, const MapPoint& b) const {
+        if (!is_sphere()) {
+            return std::atan2(b.y - a.y, b.x - a.x);
+        }
+        double ex = 0.0, ey = 0.0, ez = 0.0, nx = 0.0, ny = 0.0, nz = 0.0;
+        local_frame_(a, ex, ey, ez, nx, ny, nz);
+        const double dx = b.x - a.x, dy = b.y - a.y, dz = b.z - a.z;
+        return std::atan2(dx * nx + dy * ny + dz * nz, dx * ex + dy * ey + dz * ez);
+    }
+
+    /** @brief A globe's local ground frame at `p`: east (along the equator) and north. */
+    void local_frame_(const MapPoint& p, double& ex, double& ey, double& ez, double& nx, double& ny,
+                      double& nz) const {
+        const double len = std::sqrt(p.x * p.x + p.y * p.y + p.z * p.z);
+        const double ux = len > 0.0 ? p.x / len : 0.0, uy = len > 0.0 ? p.y / len : 0.0,
+                     uz = len > 0.0 ? p.z / len : 1.0;
+        ex = -uy; ey = ux; ez = 0.0;   // cross(z-axis, up)
+        double el = std::sqrt(ex * ex + ey * ey);
+        if (el < 1e-9) { ex = 1.0; ey = 0.0; el = 1.0; }   // at a pole any east will do
+        ex /= el; ey /= el;
+        nx = uy * ez - uz * ey; ny = uz * ex - ux * ez; nz = ux * ey - uy * ex;   // cross(up, east)
+    }
 
     /** @brief Drops every array, returning the graph to its freshly constructed state. */
     void clear() {
+        sphere_radius = 0.0;
         centers.clear();
         corners.clear();
         edges.clear();
@@ -989,10 +1076,14 @@ public:
      * @return The interpolated height, or 0 if the cell has no corners.
      */
     double elevation_at(const MapCenter& center, double x, double y) const {
+        return elevation_at(center, MapPoint{x, y});
+    }
+
+    /** @brief `elevation_at()` at a point given whole -- the form a sphere map is queried in. */
+    double elevation_at(const MapCenter& center, const MapPoint& query) const {
         if (center.corners.empty()) {
             return 0.0;
         }
-        const MapPoint query{x, y};
 
         double height = 0.0;
         if (triangle_elevation_(center, query, height)) {
@@ -1032,17 +1123,22 @@ public:
      */
     double elevation_at(const MapCenter& center, double x, double y,
                         const TerrainDetail& detail) const {
+        return elevation_at(center, MapPoint{x, y}, detail);
+    }
+
+    /** @brief The detailed surface at a point given whole (a sphere map's form). */
+    double elevation_at(const MapCenter& center, const MapPoint& p, const TerrainDetail& detail) const {
         if (detail.natural != nullptr) {
-            return natural_elevation_(center, x, y, *detail.natural);
+            return natural_elevation_(center, p, *detail.natural);
         }
-        const double base = elevation_at(center, x, y);
+        const double base = elevation_at(center, p);
         if (detail.noise == nullptr || detail.roughness <= 0.0) {
             return base;
         }
         // Taper by the base height itself. Anything that does not vanish at zero
         // would either lift the shoreline off sea level or push it under.
         const double amplitude = detail.roughness * base;
-        const double displaced = base + amplitude * static_cast<double>(detail.noise->sample(x, y));
+        const double displaced = base + amplitude * static_cast<double>(noise_at(*detail.noise, p));
         return std::clamp(displaced, 0.0, 1.0);
     }
 
@@ -1068,8 +1164,14 @@ public:
      */
     double elevation_at(const MapCenter& center, double x, double y, const TerrainDetail& detail,
                         const RiverChannels& channels) const {
-        const double surface = elevation_at(center, x, y, detail);
-        const double cut = channel_cut(center, x, y, channels);
+        return elevation_at(center, MapPoint{x, y}, detail, channels);
+    }
+
+    /** @brief The full surface at a point given whole (a sphere map's form). */
+    double elevation_at(const MapCenter& center, const MapPoint& p, const TerrainDetail& detail,
+                        const RiverChannels& channels) const {
+        const double surface = elevation_at(center, p, detail);
+        const double cut = channel_cut(center, p, channels);
         return cut > 0.0 ? std::clamp(surface - cut, 0.0, 1.0) : surface;
     }
 
@@ -1105,6 +1207,13 @@ public:
      */
     double channel_cut(const MapCenter& center, double x, double y,
                         const RiverChannels& channels) const {
+        return channel_cut(center, MapPoint{x, y}, channels);
+    }
+
+    /** @brief `channel_cut()` at a point given whole (a sphere map's form). */
+    double channel_cut(const MapCenter& center, const MapPoint& p, const RiverChannels& channels) const {
+        const double x = p.x;
+        const double y = p.y;
         const std::size_t index = static_cast<std::size_t>(center.index);
         if (index >= channels.cells.size()) {
             return 0.0;
@@ -1114,11 +1223,16 @@ public:
             || y > cell.max.y) {
             return 0.0;
         }
+        const bool sphere = is_sphere();
+        if (sphere && (p.z < cell.min.z || p.z > cell.max.z)) {
+            return 0.0;
+        }
 
         double deepest = 0.0;
         for (std::size_t i = cell.first; i < cell.first + cell.count; ++i) {
             const ChannelSegment& segment = channels.segments[i];
-            const double distance = distance_to_segment(x, y, segment.a, segment.b);
+            const double distance = sphere ? distance_to_segment(p, segment.a, segment.b)
+                                           : distance_to_segment(x, y, segment.a, segment.b);
             if (distance >= segment.half_width) {
                 continue;
             }
@@ -1154,11 +1268,13 @@ public:
      * raising. Every shore therefore stands at least as high as the classic surface puts it,
      * and that surface keeps every shore above its water -- the guarantee `WaterField` relies on.
      */
-    double natural_elevation_(const MapCenter& center, double x, double y, const NaturalTerrain& n) const {
+    double natural_elevation_(const MapCenter& center, const MapPoint& p, const NaturalTerrain& n) const {
+        const double x = p.x;
+        const double y = p.y;
         std::array<CenterId, 3> ids{};
         std::array<double, 3> weights{};
-        if (!triangle_at(center, x, y, ids, weights)) {
-            return elevation_at(center, x, y);
+        if (!triangle_at(center, p, ids, weights)) {
+            return elevation_at(center, p);
         }
         const auto smoothstep = [](double e0, double e1, double v) {
             const double t = std::clamp((v - e0) / (e1 - e0), 0.0, 1.0);
@@ -1176,21 +1292,28 @@ public:
             total += eased;
             ring += w * static_cast<double>(id < n.rings.size() ? n.rings[id] : 4);
         }
-        base = total > 0.0 ? base / total : elevation_at(center, x, y);
+        base = total > 0.0 ? base / total : elevation_at(center, p);
 
         const double sea = n.sea_level;
         const double land = sea < 1.0 ? std::clamp((base - sea) / (1.0 - sea), 0.0, 1.0) : 0.0;
-        const double wx = x + n.config.warp * static_cast<double>(n.warp.sample(x, y));
-        const double wy = y + n.config.warp * static_cast<double>(n.warp.sample(x + 37.1, y - 21.7));
+        // The fields are read through a warp: 2D on a plane, 3D (so it wraps the globe) on a sphere.
+        const bool sphere = is_sphere();
+        const auto at = [sphere](const Noise& field, double a, double b, double c) {
+            return static_cast<double>(sphere ? field.sample(a, b, c) : field.sample(a, b));
+        };
+        const double z = p.z;
+        const double wx = x + n.config.warp * at(n.warp, x, y, z);
+        const double wy = y + n.config.warp * at(n.warp, x + 37.1, y - 21.7, z + 13.3);
+        const double wz = sphere ? z + n.config.warp * at(n.warp, x - 19.4, y + 8.8, z - 41.0) : 0.0;
 
-        const double hills = n.config.hills * static_cast<double>(n.hills.sample(wx, wy)) * smoothstep(0.0, 0.12, land);
-        const double edge = land + 0.12 * static_cast<double>(n.plateau.sample(x * 0.5 + 411.0, y * 0.5 - 97.0));
+        const double hills = n.config.hills * at(n.hills, wx, wy, wz) * smoothstep(0.0, 0.12, land);
+        const double edge = land + 0.12 * at(n.plateau, x * 0.5 + 411.0, y * 0.5 - 97.0, z * 0.5 + 53.0);
         const double range = smoothstep(n.config.mountain_start, n.config.mountain_start + 0.3, edge);
         // Squared, so the crests come to an edge and the slopes below them fall away concave.
-        const double crest = 0.5 * (static_cast<double>(n.ridge.sample(wx, wy)) + 1.0);
+        const double crest = 0.5 * (at(n.ridge, wx, wy, wz) + 1.0);
         const double mountains = n.config.mountains * range * (crest * crest - 0.25);
         const double threshold = 0.4 - 0.8 * std::clamp(n.config.plateau_coverage, 0.0, 1.0);
-        const double mesa = smoothstep(threshold, threshold + 0.05, static_cast<double>(n.plateau.sample(wx, wy)))
+        const double mesa = smoothstep(threshold, threshold + 0.05, at(n.plateau, wx, wy, wz))
                           * smoothstep(0.03, 0.12, land) * (1.0 - range);
         const double shaping = hills + mountains + n.config.plateaus * mesa;
 
@@ -1215,7 +1338,12 @@ public:
      */
     bool triangle_at(const MapCenter& center, double x, double y, std::array<CenterId, 3>& out_cells,
                      std::array<double, 3>& out_weights) const {
-        const MapPoint query{x, y};
+        return triangle_at(center, MapPoint{x, y}, out_cells, out_weights);
+    }
+
+    /** @brief `triangle_at()` at a point given whole (a sphere map's form). */
+    bool triangle_at(const MapCenter& center, const MapPoint& query, std::array<CenterId, 3>& out_cells,
+                     std::array<double, 3>& out_weights) const {
         if (triangle_cells_(center, query, out_cells, out_weights)) {
             return true;
         }
@@ -1239,7 +1367,7 @@ public:
             const MapCenter& a = centers[static_cast<std::size_t>(corner.touches[0])];
             const MapCenter& b = centers[static_cast<std::size_t>(corner.touches[1])];
             const MapCenter& c = centers[static_cast<std::size_t>(corner.touches[2])];
-            if (barycentric_(a.point, b.point, c.point, query, out_weights[0], out_weights[1],
+            if (barycentric_on_(a.point, b.point, c.point, query, out_weights[0], out_weights[1],
                              out_weights[2])) {
                 out_cells = {a.index, b.index, c.index};
                 return true;
@@ -1273,7 +1401,7 @@ public:
             double wa = 0.0;
             double wb = 0.0;
             double wc = 0.0;
-            if (barycentric_(a.point, b.point, c.point, query, wa, wb, wc)) {
+            if (barycentric_on_(a.point, b.point, c.point, query, wa, wb, wc)) {
                 out_height = wa * a.elevation + wb * b.elevation + wc * c.elevation;
                 return true;
             }
@@ -1297,6 +1425,39 @@ public:
      * @param out_c Weight of `c`.
      * @return True if the point lies in the triangle.
      */
+    /** @brief `barycentric_()` on a plane; on a sphere, `barycentric3_()`. */
+    bool barycentric_on_(const MapPoint& a, const MapPoint& b, const MapPoint& c, const MapPoint& point,
+                         double& out_a, double& out_b, double& out_c) const {
+        return is_sphere() ? barycentric3_(a, b, c, point, out_a, out_b, out_c)
+                           : barycentric_(a, b, c, point, out_a, out_b, out_c);
+    }
+
+    /**
+     * @brief Barycentric coordinates on a sphere map: the point's ray from the globe's centre
+     *        meets the triangle's plane (a gnomonic projection, which keeps a spherical
+     *        triangle's edges straight), and the weights are taken there.
+     */
+    static bool barycentric3_(const MapPoint& a, const MapPoint& b, const MapPoint& c, const MapPoint& point,
+                              double& out_a, double& out_b, double& out_c) {
+        const double e1x = b.x - a.x, e1y = b.y - a.y, e1z = b.z - a.z;
+        const double e2x = c.x - a.x, e2y = c.y - a.y, e2z = c.z - a.z;
+        const double nx = e1y * e2z - e1z * e2y, ny = e1z * e2x - e1x * e2z, nz = e1x * e2y - e1y * e2x;
+        const double nn = nx * nx + ny * ny + nz * nz;
+        const double along = nx * point.x + ny * point.y + nz * point.z;
+        if (nn == 0.0 || along == 0.0) return false;
+        const double scale = (nx * a.x + ny * a.y + nz * a.z) / along;
+        if (scale <= 0.0) return false;   // the triangle is on the far side of the globe
+        const double qx = point.x * scale - a.x, qy = point.y * scale - a.y, qz = point.z * scale - a.z;
+        // Weight of b: area(a, q, c) / area(a, b, c), signed against the normal; likewise c.
+        const double cbx = qy * e2z - qz * e2y, cby = qz * e2x - qx * e2z, cbz = qx * e2y - qy * e2x;
+        const double ccx = e1y * qz - e1z * qy, ccy = e1z * qx - e1x * qz, ccz = e1x * qy - e1y * qx;
+        out_b = (cbx * nx + cby * ny + cbz * nz) / nn;
+        out_c = (ccx * nx + ccy * ny + ccz * nz) / nn;
+        out_a = 1.0 - out_b - out_c;
+        constexpr double tolerance = -1e-9;
+        return out_a >= tolerance && out_b >= tolerance && out_c >= tolerance;
+    }
+
     static bool barycentric_(const MapPoint& a, const MapPoint& b, const MapPoint& c,
                              const MapPoint& point, double& out_a, double& out_b,
                              double& out_c) {
@@ -1445,6 +1606,19 @@ public:
         }
         double twice_area = 0.0;
         const std::size_t count = center.corners.size();
+        if (is_sphere()) {
+            // A fan of triangles from the site: the cell is all but flat at a grid unit across.
+            const MapPoint& o = center.point;
+            for (std::size_t i = 0, j = count - 1; i < count; j = i++) {
+                const MapPoint& a = corners[static_cast<std::size_t>(center.corners[i])].point;
+                const MapPoint& b = corners[static_cast<std::size_t>(center.corners[j])].point;
+                const double ax = a.x - o.x, ay = a.y - o.y, az = a.z - o.z;
+                const double bx = b.x - o.x, by = b.y - o.y, bz = b.z - o.z;
+                const double cx = ay * bz - az * by, cy = az * bx - ax * bz, cz = ax * by - ay * bx;
+                twice_area += std::sqrt(cx * cx + cy * cy + cz * cz);
+            }
+            return twice_area * 0.5;
+        }
         for (std::size_t i = 0, j = count - 1; i < count; j = i++) {
             const MapPoint& a = corners[static_cast<std::size_t>(center.corners[i])].point;
             const MapPoint& b = corners[static_cast<std::size_t>(center.corners[j])].point;
@@ -1472,6 +1646,63 @@ public:
             }
         }
         return k_invalid_id;
+    }
+};
+
+/**
+ * @struct SphereFrame
+ * @brief A globe seen from straight above one point: the gnomonic projection onto the plane that
+ *        touches the globe there, with x east and y north (`MapGraph::local_frame_`).
+ *
+ * What a pass that lays things out in 2D -- a town's plots and streets -- runs in on a sphere map:
+ * flatten the graph around the place, lay out as on a plane, lift the result back. Within a few
+ * cells of the touching point the projection stretches distances by well under a percent.
+ */
+struct SphereFrame {
+    double radius = 0.0;
+    double ux = 0.0, uy = 0.0, uz = 1.0;   ///< Up: the touching point's direction.
+    double ex = 1.0, ey = 0.0, ez = 0.0;   ///< East.
+    double nx = 0.0, ny = 1.0, nz = 0.0;   ///< North.
+
+    SphereFrame(const MapGraph& graph, const MapPoint& at) : radius(graph.sphere_radius) {
+        const double len = std::sqrt(at.x * at.x + at.y * at.y + at.z * at.z);
+        if (len > 0.0) { ux = at.x / len; uy = at.y / len; uz = at.z / len; }
+        graph.local_frame_(at, ex, ey, ez, nx, ny, nz);
+    }
+
+    /** @brief A point of the globe on the touching plane, in grid units from the touching point. */
+    MapPoint to_plane(const MapPoint& p) const {
+        const double along = p.x * ux + p.y * uy + p.z * uz;
+        if (along <= radius * 0.05) return MapPoint{1.0e6, 1.0e6};   // the far side: out of reach
+        const double k = radius / along;
+        const double qx = p.x * k, qy = p.y * k, qz = p.z * k;
+        return MapPoint{qx * ex + qy * ey + qz * ez, qx * nx + qy * ny + qz * nz};
+    }
+
+    /** @brief A point of the touching plane back on the globe. */
+    MapPoint to_sphere(const MapPoint& q) const {
+        const double px = ux * radius + ex * q.x + nx * q.y;
+        const double py = uy * radius + ey * q.x + ny * q.y;
+        const double pz = uz * radius + ez * q.x + nz * q.y;
+        const double len = std::sqrt(px * px + py * py + pz * pz);
+        const double k = len > 0.0 ? radius / len : 0.0;
+        return MapPoint{px * k, py * k, pz * k};
+    }
+
+    /** @brief A copy of `graph` with every point on the touching plane -- a plane map to lay out on. */
+    MapGraph flatten(const MapGraph& graph) const {
+        MapGraph flat = graph;
+        flat.sphere_radius = 0.0;
+        for (MapCenter& c : flat.centers) c.point = to_plane(c.point);
+        for (MapCorner& c : flat.corners) c.point = to_plane(c.point);
+        for (MapEdge& e : flat.edges) {
+            e.midpoint = to_plane(e.midpoint);
+            for (MapPoint& p : e.noisy_points0) p = to_plane(p);
+            for (MapPoint& p : e.noisy_points1) p = to_plane(p);
+        }
+        for (MapRiver& r : flat.rivers) for (MapPoint& p : r.points) p = to_plane(p);
+        for (MapRoad& r : flat.roads) for (MapPoint& p : r.points) p = to_plane(p);
+        return flat;
     }
 };
 
@@ -1576,10 +1807,10 @@ inline double edge_grade(const MapGraph& graph, const MapEdge& edge, const MapCo
  * wins. Whether the point is actually *under* that water is the caller's comparison against the
  * ground. See water_field.h for why this is the rule.
  */
-inline double water_body_level_at(const MapGraph& graph, const MapCenter& center, double x, double y) {
+inline double water_body_level_at(const MapGraph& graph, const MapCenter& center, const MapPoint& p) {
     std::array<CenterId, 3> cells{};
     std::array<double, 3> weights{};
-    if (!graph.triangle_at(center, x, y, cells, weights)) {
+    if (!graph.triangle_at(center, p, cells, weights)) {
         return center.water_level;
     }
     double level = 0.0;
@@ -1588,6 +1819,46 @@ inline double water_body_level_at(const MapGraph& graph, const MapCenter& center
     }
     return level;
 }
+
+/** @brief `water_body_level_at()` on a plane map, by coordinates. */
+inline double water_body_level_at(const MapGraph& graph, const MapCenter& center, double x, double y) {
+    return water_body_level_at(graph, center, MapPoint{x, y});
+}
+
+namespace detail {
+
+/**
+ * @brief Sideways from a sphere map's segment, along the ground: perpendicular to both the
+ *        segment and the globe's radius at its middle, `reach` long. (On a plane it is the 2D
+ *        perpendicular, which the plane code below writes out itself.)
+ */
+inline MapPoint sphere_across(const MapPoint& a, const MapPoint& b, double reach) {
+    const double mx = (a.x + b.x) * 0.5, my = (a.y + b.y) * 0.5, mz = (a.z + b.z) * 0.5;
+    const double dx = b.x - a.x, dy = b.y - a.y, dz = b.z - a.z;
+    double cx = my * dz - mz * dy, cy = mz * dx - mx * dz, cz = mx * dy - my * dx;
+    double len = std::sqrt(cx * cx + cy * cy + cz * cz);
+    if (len <= 0.0) {
+        // A zero-length segment: any direction along the ground will do.
+        cx = -my; cy = mx; cz = 0.0;
+        len = std::sqrt(cx * cx + cy * cy);
+        if (len <= 0.0) { cx = 1.0; cy = 0.0; len = 1.0; }
+    }
+    return MapPoint{cx / len * reach, cy / len * reach, cz / len * reach};
+}
+
+/** @brief Along a segment, `reach` long (3D; the zero-length fallback is any sideways step). */
+inline MapPoint sphere_along(const MapPoint& a, const MapPoint& b, double reach) {
+    const double dx = b.x - a.x, dy = b.y - a.y, dz = b.z - a.z;
+    const double len = std::sqrt(dx * dx + dy * dy + dz * dz);
+    if (len <= 0.0) return sphere_across(a, b, reach);
+    return MapPoint{dx / len * reach, dy / len * reach, dz / len * reach};
+}
+
+inline MapPoint offset(const MapPoint& p, const MapPoint& d, double k) {
+    return MapPoint{p.x + d.x * k, p.y + d.y * k, p.z + d.z * k};
+}
+
+} // namespace detail
 
 namespace detail {
 
@@ -1650,6 +1921,28 @@ inline void bank_river_surfaces(const MapGraph& graph, const MapConfig& config, 
             continue;
         }
         const MapCenter& center = graph.centers[static_cast<std::size_t>(corner.touches.front())];
+        if (graph.is_sphere()) {
+            const double reach = segment.half_width + overlap;
+            const MapPoint across = sphere_across(segment.a, segment.b, reach);
+            const MapPoint stations[] = {segment.a,
+                                         graph.on_surface(MapPoint{(segment.a.x + segment.b.x) * 0.5,
+                                                                   (segment.a.y + segment.b.y) * 0.5,
+                                                                   (segment.a.z + segment.b.z) * 0.5}),
+                                         segment.b};
+            double bank = std::numeric_limits<double>::max();
+            double crown = 0.0;
+            for (const MapPoint& station : stations) {
+                crown = std::max(crown, graph.elevation_at(center, station, terrain));
+                for (double side : {-1.0, 1.0}) {
+                    const MapPoint q = graph.on_surface(offset(station, across, side));
+                    bank = std::min(bank, std::max(graph.elevation_at(center, q, terrain),
+                                                   water_body_level_at(graph, center, q) + margin));
+                }
+            }
+            caps[p] = bank - margin;
+            crowns[p] = crown;
+            continue;
+        }
         const double dx = segment.b.x - segment.a.x;
         const double dy = segment.b.y - segment.a.y;
         const double length = std::sqrt(dx * dx + dy * dy);
@@ -1841,7 +2134,8 @@ inline RiverChannels make_river_channels(const MapGraph& graph, const MapConfig&
                 const MapCenter& here =
                     graph.centers[static_cast<std::size_t>(corner.touches.front())];
                 const MapPoint middle{(segment.a.x + segment.b.x) * 0.5,
-                                      (segment.a.y + segment.b.y) * 0.5};
+                                      (segment.a.y + segment.b.y) * 0.5,
+                                      (segment.a.z + segment.b.z) * 0.5};
                 // Deep enough to put the bed at the waterline, and wide enough to
                 // carry the whole drawn ribbon -- the probe that decides the water's
                 // floor reaches past the stroke diagonally, so anything narrower
@@ -1857,7 +2151,7 @@ inline RiverChannels make_river_channels(const MapGraph& graph, const MapConfig&
                                                  + config.river_depth_per_volume_m
                                                        * static_cast<double>(volume));
                 const double to_water =
-                    graph.elevation_at(here, middle.x, middle.y, detail) - (target - freeboard);
+                    graph.elevation_at(here, graph.on_surface(middle), detail) - (target - freeboard);
                 const double reach =
                     (river_width(config, volume)
                      + meters_to_grid(config, config.water_edge_overlap_m) * 2.0) * 0.5;
@@ -2001,16 +2295,24 @@ inline RiverChannels make_river_channels(const MapGraph& graph, const MapConfig&
         double min_y = grouped[i].front().a.y;
         double max_x = min_x;
         double max_y = min_y;
+        double min_z = grouped[i].front().a.z;
+        double max_z = min_z;
         for (const ChannelSegment& segment : grouped[i]) {
             const double reach = segment.half_width;
             min_x = std::min({min_x, segment.a.x - reach, segment.b.x - reach});
             min_y = std::min({min_y, segment.a.y - reach, segment.b.y - reach});
             max_x = std::max({max_x, segment.a.x + reach, segment.b.x + reach});
             max_y = std::max({max_y, segment.a.y + reach, segment.b.y + reach});
+            min_z = std::min({min_z, segment.a.z - reach, segment.b.z - reach});
+            max_z = std::max({max_z, segment.a.z + reach, segment.b.z + reach});
             channels.segments.push_back(segment);
         }
         cell.min = MapPoint{min_x, min_y};
         cell.max = MapPoint{max_x, max_y};
+        if (graph.is_sphere()) {
+            cell.min.z = min_z;
+            cell.max.z = max_z;
+        }
     }
     return channels;
 }
@@ -2090,6 +2392,22 @@ inline double river_ground_under(const MapGraph& graph, const MapRiver& river,
         (river_width(config, corner.river)
          + meters_to_grid(config, config.water_edge_overlap_m) * 2.0)
         * 0.5;
+    if (graph.is_sphere()) {
+        const MapPoint along = sphere_along(from, to, reach);
+        const MapPoint across = sphere_across(from, to, reach);
+        const MapPoint stations[] = {offset(from, along, -1.0), from,
+                                     MapPoint{(from.x + to.x) * 0.5, (from.y + to.y) * 0.5, (from.z + to.z) * 0.5},
+                                     to, offset(to, along, 1.0)};
+        double ground = 0.0;
+        for (const MapPoint& station : stations) {
+            for (double k = -1.0; k <= 1.0; k += 0.5) {
+                const MapPoint q = graph.on_surface(offset(station, across, k));
+                ground = std::max(ground, channels == nullptr ? graph.elevation_at(center, q, detail)
+                                                              : graph.elevation_at(center, q, detail, *channels));
+            }
+        }
+        return ground;
+    }
     const double dx = to.x - from.x;
     const double dy = to.y - from.y;
     const double length = std::sqrt(dx * dx + dy * dy);

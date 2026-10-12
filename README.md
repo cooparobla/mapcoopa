@@ -47,6 +47,13 @@ All images are cropped from the `map_out_*.png` renders at the repository root, 
   archipelago of landmasses that fuse when they land close together.
 - **Elevation.** Distance from the coast blended with fractal relief, with a real sea
   level, a sea bed, and a vertical scale in metres (`elevation_range_m`).
+- **Natural terrain** (`terrain_model: natural`). Heights blended smoothly between cells, then
+  shaped by warped ridged mountain ranges, rolling hills and flat-topped plateaus
+  (`NaturalTerrainConfig`). Near water the shaping only ever raises the ground, so every shore
+  stays above its water. `classic` (the default) keeps flat facets between cells.
+- **Sphere maps** (`topology: sphere`, CLI `--sphere`). The whole world on a globe: cells over
+  the sphere with no edges, latitude climate from the poles, continents and seas as anywhere
+  else. See [Sphere maps](#sphere-maps). `plane` (the default) is the flat map.
 - **Climate and biomes.** Temperature from latitude, altitude, noise and a global offset,
   with independent polar caps. Moisture from water and coast distance. 33 biomes from a
   three-axis Whittaker table.
@@ -197,6 +204,25 @@ towns, landmarks, caves, noisy edges.
 
 Each pass is one header in [`coopa/maps/passes/`](coopa/maps/passes/). Their inputs,
 outputs and details are in [`coopa/maps/passes/README.md`](coopa/maps/passes/README.md).
+
+## Sphere maps
+
+`topology: sphere` generates on a globe instead of a rectangle, for a planet (toyengine's planet
+TileTerrain uses it). Nothing about a flat map changes; the sphere has its own branches.
+
+- **Size.** `sphere_cells` cells (0: `(grid_size + 1)^2`) at radius `sqrt(cells / 4π)` grid units,
+  so a cell is still about one grid unit across and every metre setting keeps its meaning
+  (`sphere_point_count()`, `sphere_radius()`).
+- **Geometry.** Jittered Fibonacci points, triangulated by projecting stereographically from one
+  point and fanning that pole across the hull, so every half-edge pairs and the mesh is closed
+  (V - E + F = 2). Points carry `z`; `MapGraph::is_sphere()` and `sphere_radius` say so.
+- **Passes.** Noise is read in 3D (`MapGraph::noise_at`), the ocean is seeded from the sea rather
+  than a border, latitude comes from `z`, smoothing and routes are kept on the globe, towns are laid
+  out in a tangent plane (`SphereFrame`), caves step along it.
+- **Queries.** `elevation_at`, `triangle_at`, `channel_cut`, `WaterField::at` and `TerrainSurface`
+  take a `MapPoint` (3D); a flow is a 3D tangent vector. The 2D overloads remain for flat maps.
+- **Output.** Rendered equirectangular (twice as wide as tall); the map YAML stores `z` per point
+  and the topology keys, written only for spheres, so flat files are unchanged.
 
 ## Testing
 

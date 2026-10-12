@@ -298,7 +298,8 @@ private:
                 const MapPoint& other = graph.centers[static_cast<std::size_t>(chosen)].point;
                 const double dx = point.x - other.x;
                 const double dy = point.y - other.y;
-                if (dx * dx + dy * dy < spacing_squared) {
+                const double dz = point.z - other.z;   // 0 on a plane map
+                if (dx * dx + dy * dy + dz * dz < spacing_squared) {
                     clear = false;
                     break;
                 }
@@ -598,6 +599,7 @@ private:
                 }
 
                 chaikin_smooth(run.points, config.roads.smoothing_iterations);
+                for (MapPoint& point : run.points) point = graph.on_surface(point);
                 graph.roads.push_back(std::move(run));
             }
         }

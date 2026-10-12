@@ -40,6 +40,14 @@ public:
         return generator_.GetNoise(static_cast<float>(x), static_cast<float>(y));
     }
 
+    /**
+     * @brief Samples the field in 3D -- what a sphere map reads at a point of its globe, so the
+     *        field wraps the globe with no seam.
+     */
+    float sample(double x, double y, double z) const {
+        return generator_.GetNoise(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z));
+    }
+
 private:
     FastNoiseLite generator_; /**< @brief The configured field; never reconfigured after construction. */
 };

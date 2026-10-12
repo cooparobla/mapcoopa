@@ -128,7 +128,8 @@ private:
                         const MapPoint& other = graph.centers[static_cast<std::size_t>(placed)].point;
                         const double dx = other.x - point.x;
                         const double dy = other.y - point.y;
-                        return dx * dx + dy * dy < spacing_squared;
+                        const double dz = other.z - point.z;   // 0 on a plane map
+                        return dx * dx + dy * dy + dz * dz < spacing_squared;
                     });
                 if (clear) {
                     seeds.push_back(candidate);
@@ -241,7 +242,8 @@ private:
                 }
                 const double dx = center.point.x - point.x;
                 const double dy = center.point.y - point.y;
-                const double distance = dx * dx + dy * dy;
+                const double dz = center.point.z - point.z;   // 0 on a plane map
+                const double distance = dx * dx + dy * dy + dz * dz;
                 if (distance < best) {
                     best = distance;
                     nearest = center.country;

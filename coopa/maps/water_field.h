@@ -91,14 +91,22 @@ public:
      *        samples the channels as they are.
      */
     WaterSample at(const MapCenter& center, double x, double y, double min_half_width = 0.0) const {
+        return at(center, MapPoint{x, y}, min_half_width);
+    }
+
+    /** @brief `at()` at a point given whole -- a sphere map's form (`p` on its globe). */
+    WaterSample at(const MapCenter& center, const MapPoint& p, double min_half_width = 0.0) const {
+        const double x = p.x;
+        const double y = p.y;
+        const bool sphere = graph_.is_sphere();
         WaterSample sample;
-        sample.ground = graph_.elevation_at(center, x, y, detail_, channels_);
+        sample.ground = graph_.elevation_at(center, p, detail_, channels_);
         sample.surface = sample.ground;
 
         // Seas and lakes: any body cell among the triangle's vertices reaches the point.
         std::array<CenterId, 3> cells{};
         std::array<double, 3> weights{};
-        const bool found = graph_.triangle_at(center, x, y, cells, weights);
+        const bool found = graph_.triangle_at(center, p, cells, weights);
         const std::size_t count = found ? 3 : 1;
         if (!found) {
             cells[0] = center.index;
@@ -116,15 +124,18 @@ public:
         const std::size_t index = static_cast<std::size_t>(center.index);
         if (index < channels_.cells.size()) {
             const RiverChannels::Cell& group = channels_.cells[index];
-            if (group.count > 0 && x >= group.min.x - min_half_width && x <= group.max.x + min_half_width &&
-                y >= group.min.y - min_half_width && y <= group.max.y + min_half_width) {
+            const bool in_box = x >= group.min.x - min_half_width && x <= group.max.x + min_half_width &&
+                                y >= group.min.y - min_half_width && y <= group.max.y + min_half_width &&
+                                (!sphere || (p.z >= group.min.z - min_half_width && p.z <= group.max.z + min_half_width));
+            if (group.count > 0 && in_box) {
                 for (std::size_t i = group.first; i < group.first + group.count; ++i) {
                     const ChannelSegment& segment = channels_.segments[i];
-                    const double distance = distance_to_segment(x, y, segment.a, segment.b);
+                    const double distance = sphere ? distance_to_segment(p, segment.a, segment.b)
+                                                   : distance_to_segment(x, y, segment.a, segment.b);
                     if (segment.river < 0 || distance >= std::max(segment.half_width, min_half_width)) {
                         continue;
                     }
-                    const double height = river_height_(segment, x, y);
+                    const double height = river_height_(segment, p);
                     if (sample.wet() && height <= sample.surface) {
                         continue;   // a higher water already covers it
                     }
@@ -138,8 +149,14 @@ public:
                     sample.surface = height;
                     const double dx = segment.b.x - segment.a.x;
                     const double dy = segment.b.y - segment.a.y;
-                    const double length = std::sqrt(dx * dx + dy * dy);
-                    sample.flow = length > 0.0 ? MapPoint{dx / length, dy / length} : MapPoint{0.0, 0.0};
+                    if (sphere) {
+                        const double dz = segment.b.z - segment.a.z;
+                        const double length = std::sqrt(dx * dx + dy * dy + dz * dz);
+                        sample.flow = length > 0.0 ? MapPoint{dx / length, dy / length, dz / length} : MapPoint{};
+                    } else {
+                        const double length = std::sqrt(dx * dx + dy * dy);
+                        sample.flow = length > 0.0 ? MapPoint{dx / length, dy / length} : MapPoint{0.0, 0.0};
+                    }
                 }
             }
         }
@@ -157,15 +174,27 @@ private:
      * Treated as the height at each segment's midpoint and interpolated between them, it falls
      * smoothly -- and stays falling, since a blend of a falling sequence falls.
      */
-    double river_height_(const ChannelSegment& segment, double x, double y) const {
+    double river_height_(const ChannelSegment& segment, const MapPoint& p) const {
+        const double x = p.x;
+        const double y = p.y;
         const std::size_t river = static_cast<std::size_t>(segment.river);
         const std::size_t i = static_cast<std::size_t>(segment.segment);
         const double dx = segment.b.x - segment.a.x;
         const double dy = segment.b.y - segment.a.y;
-        const double length_squared = dx * dx + dy * dy;
-        const double t = length_squared > 0.0
-                             ? std::clamp(((x - segment.a.x) * dx + (y - segment.a.y) * dy) / length_squared, 0.0, 1.0)
-                             : 0.5;
+        double t = 0.5;
+        if (graph_.is_sphere()) {
+            const double dz = segment.b.z - segment.a.z;
+            const double ls = dx * dx + dy * dy + dz * dz;
+            if (ls > 0.0) {
+                t = std::clamp(((x - segment.a.x) * dx + (y - segment.a.y) * dy + (p.z - segment.a.z) * dz) / ls,
+                               0.0, 1.0);
+            }
+        } else {
+            const double length_squared = dx * dx + dy * dy;
+            t = length_squared > 0.0
+                    ? std::clamp(((x - segment.a.x) * dx + (y - segment.a.y) * dy) / length_squared, 0.0, 1.0)
+                    : 0.5;
+        }
         const double here = rivers_.at(river, i);
         if (segment.mouth) return here;   // the body's own level, all the way
         const std::size_t spans = river < rivers_.heights.size() ? rivers_.heights[river].size() : 0;

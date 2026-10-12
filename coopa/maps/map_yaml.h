@@ -108,7 +108,11 @@ inline fkyaml::node point_sequence(const std::vector<MapPoint>& points) {
     std::vector<fkyaml::node> nodes;
     nodes.reserve(points.size());
     for (const MapPoint& point : points) {
-        nodes.push_back(fkyaml::node::sequence({fkyaml::node(point.x), fkyaml::node(point.y)}));
+        if (point.z != 0.0) {   // sphere maps only
+            nodes.push_back(fkyaml::node::sequence({fkyaml::node(point.x), fkyaml::node(point.y), fkyaml::node(point.z)}));
+        } else {
+            nodes.push_back(fkyaml::node::sequence({fkyaml::node(point.x), fkyaml::node(point.y)}));
+        }
     }
     return fkyaml::node::sequence(std::move(nodes));
 }
@@ -126,7 +130,8 @@ inline std::vector<MapPoint> read_point_sequence(const fkyaml::node& parent, con
     points.reserve(sequence.size());
     for (const fkyaml::node& pair : sequence) {
         if (pair.is_sequence() && pair.size() >= 2) {
-            points.push_back({pair[0].get_value<double>(), pair[1].get_value<double>()});
+            points.push_back({pair[0].get_value<double>(), pair[1].get_value<double>(),
+                              pair.size() >= 3 ? pair[2].get_value<double>() : 0.0});
         }
     }
     return points;
@@ -301,6 +306,10 @@ inline fkyaml::node config_to_node(const MapConfig& config) {
     fkyaml::node node = fkyaml::node::mapping();
     node["seed"] = config.seed;
     node["grid_size"] = config.grid_size;
+    if (config.topology == MapTopology::Sphere) {   // written only for a globe: plane files are unchanged
+        node["topology"] = std::string(map_topology_name(config.topology));
+        node["sphere_cells"] = config.sphere_cells;
+    }
     node["jitter"] = config.jitter;
     node["meters_per_grid_unit"] = config.meters_per_grid_unit;
     node["elevation_range_m"] = config.elevation_range_m;
@@ -446,6 +455,9 @@ inline void apply_config_node(const fkyaml::node& node, MapConfig& config) {
 
     config.seed = detail::read_or(node, "seed", config.seed);
     config.grid_size = detail::read_or(node, "grid_size", config.grid_size);
+    config.topology = map_topology_from_name(
+        detail::read_or(node, "topology", std::string(map_topology_name(config.topology))));
+    config.sphere_cells = detail::read_or(node, "sphere_cells", config.sphere_cells);
     config.jitter = detail::read_or(node, "jitter", config.jitter);
     config.meters_per_grid_unit =
         detail::read_or(node, "meters_per_grid_unit", config.meters_per_grid_unit);
@@ -934,6 +946,7 @@ inline fkyaml::node map_to_node(const MapGraph& graph, const MapConfig& config) 
         node["i"] = static_cast<int>(center.index);
         node["x"] = center.point.x;
         node["y"] = center.point.y;
+        if (center.point.z != 0.0) node["z"] = center.point.z;   // sphere maps only
         node["elevation"] = center.elevation;
         node["water_level"] = center.water_level;
         node["moisture"] = center.moisture;
@@ -958,6 +971,7 @@ inline fkyaml::node map_to_node(const MapGraph& graph, const MapConfig& config) 
         node["i"] = static_cast<int>(corner.index);
         node["x"] = corner.point.x;
         node["y"] = corner.point.y;
+        if (corner.point.z != 0.0) node["z"] = corner.point.z;   // sphere maps only
         node["elevation"] = corner.elevation;
         node["moisture"] = corner.moisture;
         node["temperature"] = corner.temperature;
@@ -984,6 +998,7 @@ inline fkyaml::node map_to_node(const MapGraph& graph, const MapConfig& config) 
         node["v1"] = static_cast<int>(edge.v1);
         node["mx"] = edge.midpoint.x;
         node["my"] = edge.midpoint.y;
+        if (edge.midpoint.z != 0.0) node["mz"] = edge.midpoint.z;   // sphere maps only
         node["river"] = edge.river;
         node["road"] = edge.road;
         // Written only when there is something to say, as with noisy0/noisy1
@@ -1035,6 +1050,7 @@ inline fkyaml::node map_to_node(const MapGraph& graph, const MapConfig& config) 
             fkyaml::node node = fkyaml::node::mapping();
             node["x"] = building.point.x;
             node["y"] = building.point.y;
+            if (building.point.z != 0.0) node["z"] = building.point.z;   // sphere maps only
             node["w"] = building.width;
             node["h"] = building.height;
             node["r"] = building.rotation;
@@ -1053,6 +1069,10 @@ inline fkyaml::node map_to_node(const MapGraph& graph, const MapConfig& config) 
             node["y0"] = street.from.y;
             node["x1"] = street.to.x;
             node["y1"] = street.to.y;
+            if (street.from.z != 0.0 || street.to.z != 0.0) {   // sphere maps only
+                node["z0"] = street.from.z;
+                node["z1"] = street.to.z;
+            }
             node["clearance"] = street.clearance;
             streets.push_back(std::move(node));
         }
@@ -1062,6 +1082,7 @@ inline fkyaml::node map_to_node(const MapGraph& graph, const MapConfig& config) 
         node["cells"] = detail::id_sequence(town.cells);
         node["x"] = town.point.x;
         node["y"] = town.point.y;
+        if (town.point.z != 0.0) node["z"] = town.point.z;   // sphere maps only
         node["tier"] = std::string(town_tier_name(town.tier));
         node["score"] = town.score;
         if (!town.name.empty()) {
@@ -1077,6 +1098,7 @@ inline fkyaml::node map_to_node(const MapGraph& graph, const MapConfig& config) 
             fkyaml::node plaza = fkyaml::node::mapping();
             plaza["x"] = town.plaza.centre.x;
             plaza["y"] = town.plaza.centre.y;
+            if (town.plaza.centre.z != 0.0) plaza["z"] = town.plaza.centre.z;   // sphere maps only
             plaza["radius"] = town.plaza.radius;
             node["plaza"] = std::move(plaza);
         }
@@ -1127,6 +1149,7 @@ inline fkyaml::node map_to_node(const MapGraph& graph, const MapConfig& config) 
         node["center"] = static_cast<int>(landmark.center);
         node["x"] = landmark.point.x;
         node["y"] = landmark.point.y;
+        if (landmark.point.z != 0.0) node["z"] = landmark.point.z;   // sphere maps only
         node["kind"] = std::string(landmark_kind_name(landmark.kind));
         node["name"] = landmark.name;
         node["region"] = static_cast<int>(landmark.region);
@@ -1147,6 +1170,7 @@ inline fkyaml::node map_to_node(const MapGraph& graph, const MapConfig& config) 
             fkyaml::node node = fkyaml::node::mapping();
             node["x"] = station.point.x;
             node["y"] = station.point.y;
+            if (station.point.z != 0.0) node["z"] = station.point.z;   // sphere maps only
             node["f"] = station.floor;
             node["r"] = station.roof;
             node["w"] = station.radius;
@@ -1175,6 +1199,7 @@ inline fkyaml::node map_to_node(const MapGraph& graph, const MapConfig& config) 
         node["mouth_edge"] = static_cast<int>(cave.mouth_edge);
         node["x"] = cave.mouth.x;
         node["y"] = cave.mouth.y;
+        if (cave.mouth.z != 0.0) node["z"] = cave.mouth.z;   // sphere maps only
         node["grade"] = cave.mouth_grade;
         node["surface"] = cave.surface_at_mouth;
         node["phreatic"] = cave.phreatic_level;
@@ -1191,6 +1216,7 @@ inline fkyaml::node map_to_node(const MapGraph& graph, const MapConfig& config) 
     fkyaml::node root = fkyaml::node::mapping();
     root["version"] = k_map_yaml_version;
     root["config"] = config_to_node(config);
+    if (graph.is_sphere()) root["sphere_radius"] = graph.sphere_radius;
     root["centers"] = fkyaml::node::sequence(std::move(centers));
     root["corners"] = fkyaml::node::sequence(std::move(corners));
     root["edges"] = fkyaml::node::sequence(std::move(edges));
@@ -1223,12 +1249,13 @@ inline bool map_from_node(const fkyaml::node& root, MapGraph& out_graph, MapConf
 
     out_graph.clear();
     out_config = root.contains("config") ? config_from_node(root.at("config")) : MapConfig{};
+    out_graph.sphere_radius = detail::read_or(root, "sphere_radius", 0.0);
 
     if (root.at("centers").is_sequence()) {
         for (const fkyaml::node& node : root.at("centers")) {
             MapCenter center;
             center.index = static_cast<CenterId>(detail::read_or(node, "i", 0));
-            center.point = {detail::read_or(node, "x", 0.0), detail::read_or(node, "y", 0.0)};
+            center.point = {detail::read_or(node, "x", 0.0), detail::read_or(node, "y", 0.0), detail::read_or(node, "z", 0.0)};
             center.elevation = detail::read_or(node, "elevation", 0.0);
             center.water_level = detail::read_or(node, "water_level", 0.0);
             center.moisture = detail::read_or(node, "moisture", 0.0);
@@ -1253,7 +1280,7 @@ inline bool map_from_node(const fkyaml::node& root, MapGraph& out_graph, MapConf
         for (const fkyaml::node& node : root.at("corners")) {
             MapCorner corner;
             corner.index = static_cast<CornerId>(detail::read_or(node, "i", 0));
-            corner.point = {detail::read_or(node, "x", 0.0), detail::read_or(node, "y", 0.0)};
+            corner.point = {detail::read_or(node, "x", 0.0), detail::read_or(node, "y", 0.0), detail::read_or(node, "z", 0.0)};
             corner.elevation = detail::read_or(node, "elevation", 0.0);
             corner.moisture = detail::read_or(node, "moisture", 0.0);
             corner.temperature = detail::read_or(node, "temperature", 0.0);
@@ -1279,7 +1306,7 @@ inline bool map_from_node(const fkyaml::node& root, MapGraph& out_graph, MapConf
             edge.d1 = static_cast<CenterId>(detail::read_or(node, "d1", static_cast<int>(k_invalid_id)));
             edge.v0 = static_cast<CornerId>(detail::read_or(node, "v0", static_cast<int>(k_invalid_id)));
             edge.v1 = static_cast<CornerId>(detail::read_or(node, "v1", static_cast<int>(k_invalid_id)));
-            edge.midpoint = {detail::read_or(node, "mx", 0.0), detail::read_or(node, "my", 0.0)};
+            edge.midpoint = {detail::read_or(node, "mx", 0.0), detail::read_or(node, "my", 0.0), detail::read_or(node, "mz", 0.0)};
             edge.river = detail::read_or(node, "river", 0);
             edge.road = detail::read_or(node, "road", false);
             // A document written before roads had classes says only `road: true`.
@@ -1325,7 +1352,7 @@ inline bool map_from_node(const fkyaml::node& root, MapGraph& out_graph, MapConf
             town.cells = detail::read_id_sequence<CenterId>(node, "cells");
             town.center = static_cast<CenterId>(
                 detail::read_or(node, "center", static_cast<int>(k_invalid_id)));
-            town.point = {detail::read_or(node, "x", 0.0), detail::read_or(node, "y", 0.0)};
+            town.point = {detail::read_or(node, "x", 0.0), detail::read_or(node, "y", 0.0), detail::read_or(node, "z", 0.0)};
             town.tier = town_tier_from_name(detail::read_or(node, "tier", std::string("village")));
             town.score = detail::read_or(node, "score", 0.0);
             town.name = detail::read_or(node, "name", std::string());
@@ -1339,7 +1366,7 @@ inline bool map_from_node(const fkyaml::node& root, MapGraph& out_graph, MapConf
                 for (const fkyaml::node& building_node : node.at("buildings")) {
                     MapBuilding building;
                     building.point = {detail::read_or(building_node, "x", 0.0),
-                                      detail::read_or(building_node, "y", 0.0)};
+                                      detail::read_or(building_node, "y", 0.0), detail::read_or(building_node, "z", 0.0)};
                     building.width = detail::read_or(building_node, "w", 0.0);
                     building.height = detail::read_or(building_node, "h", 0.0);
                     building.rotation = detail::read_or(building_node, "r", 0.0);
@@ -1355,16 +1382,18 @@ inline bool map_from_node(const fkyaml::node& root, MapGraph& out_graph, MapConf
                     // disagree with them.
                     town.streets.push_back(
                         make_street(MapPoint{detail::read_or(street_node, "x0", 0.0),
-                                             detail::read_or(street_node, "y0", 0.0)},
+                                             detail::read_or(street_node, "y0", 0.0),
+                                             detail::read_or(street_node, "z0", 0.0)},
                                     MapPoint{detail::read_or(street_node, "x1", 0.0),
-                                             detail::read_or(street_node, "y1", 0.0)},
+                                             detail::read_or(street_node, "y1", 0.0),
+                                             detail::read_or(street_node, "z1", 0.0)},
                                     detail::read_or(street_node, "clearance", 0.0)));
                 }
             }
             if (node.contains("plaza")) {
                 const fkyaml::node& plaza = node.at("plaza");
                 town.plaza.centre = {detail::read_or(plaza, "x", 0.0),
-                                     detail::read_or(plaza, "y", 0.0)};
+                                     detail::read_or(plaza, "y", 0.0), detail::read_or(plaza, "z", 0.0)};
                 town.plaza.radius = detail::read_or(plaza, "radius", 0.0);
             }
             out_graph.towns.push_back(std::move(town));
@@ -1416,7 +1445,7 @@ inline bool map_from_node(const fkyaml::node& root, MapGraph& out_graph, MapConf
             MapLandmark landmark;
             landmark.center = static_cast<CenterId>(
                 detail::read_or(node, "center", static_cast<int>(k_invalid_id)));
-            landmark.point = {detail::read_or(node, "x", 0.0), detail::read_or(node, "y", 0.0)};
+            landmark.point = {detail::read_or(node, "x", 0.0), detail::read_or(node, "y", 0.0), detail::read_or(node, "z", 0.0)};
             landmark.kind =
                 landmark_kind_from_name(detail::read_or(node, "kind", std::string("ruins")));
             landmark.name = detail::read_or(node, "name", std::string());
@@ -1431,7 +1460,7 @@ inline bool map_from_node(const fkyaml::node& root, MapGraph& out_graph, MapConf
             MapCave cave;
             cave.mouth_edge = static_cast<EdgeId>(
                 detail::read_or(node, "mouth_edge", static_cast<int>(k_invalid_id)));
-            cave.mouth = {detail::read_or(node, "x", 0.0), detail::read_or(node, "y", 0.0)};
+            cave.mouth = {detail::read_or(node, "x", 0.0), detail::read_or(node, "y", 0.0), detail::read_or(node, "z", 0.0)};
             cave.mouth_grade = detail::read_or(node, "grade", 0.0);
             cave.surface_at_mouth = detail::read_or(node, "surface", 0.0);
             cave.phreatic_level = detail::read_or(node, "phreatic", 0.0);
@@ -1451,7 +1480,7 @@ inline bool map_from_node(const fkyaml::node& root, MapGraph& out_graph, MapConf
                 for (const fkyaml::node& entry : node.at("nodes")) {
                     CaveNode station;
                     station.point = {detail::read_or(entry, "x", 0.0),
-                                     detail::read_or(entry, "y", 0.0)};
+                                     detail::read_or(entry, "y", 0.0), detail::read_or(entry, "z", 0.0)};
                     station.floor = detail::read_or(entry, "f", 0.0);
                     station.roof = detail::read_or(entry, "r", 0.0);
                     station.radius = detail::read_or(entry, "w", 0.0);

@@ -71,6 +71,7 @@ void print_usage() {
         << "  --cave-grade=F   steepness a slope needs to bear a cave; rise over run\n"
         << "  --no-caves       skip caves entirely\n"
         << "  --no-roads       skip the road network\n"
+        << "  --sphere         generate a globe (no edges, latitude climate); images equirectangular\n"
         << "  --no-subdivide   draw straight cell boundaries instead of wobbled ones\n"
         << "  --out=PATH       output prefix (default \"map_out\")\n"
         << "  --config=PATH    settings file (default assets/config.yaml)\n"
@@ -201,6 +202,8 @@ int main(int argc, char** argv) {
         if (argument == "--help" || argument == "-h") {
             print_usage();
             return 0;
+        } else if (argument == "--sphere") {
+            config.topology = coopa::maps::MapTopology::Sphere;
         } else if (argument == "--no-subdivide") {
             config.subdivide_noisy_edges = false;
         } else if (argument == "--no-regions") {

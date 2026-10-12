@@ -104,6 +104,24 @@ private:
                 corner.elevation = std::numeric_limits<double>::infinity();
             }
         }
+        // A globe without a border measures height from its sea instead (water steps are all but
+        // free here anyway, so on a plane the two seeds agree); failing that, from any water,
+        // and failing that from one corner.
+        if (pending.empty() && graph.is_sphere()) {
+            for (const bool any_water : {false, true}) {
+                for (MapCorner& corner : graph.corners) {
+                    if (any_water ? corner.water : corner.ocean) {
+                        corner.elevation = 0.0;
+                        pending.push(corner.index);
+                    }
+                }
+                if (!pending.empty()) break;
+            }
+            if (pending.empty() && !graph.corners.empty()) {
+                graph.corners.front().elevation = 0.0;
+                pending.push(graph.corners.front().index);
+            }
+        }
 
         while (!pending.empty()) {
             const CornerId current_id = pending.front();
@@ -181,7 +199,7 @@ private:
             const double distance = std::clamp(corner.elevation / land_ceiling, 0.0, 1.0);
             // Noise arrives in [-1, 1].
             const double unit = std::clamp(
-                0.5 * (static_cast<double>(noise.sample(corner.point.x, corner.point.y)) + 1.0),
+                0.5 * (static_cast<double>(graph.noise_at(noise, corner.point)) + 1.0),
                 0.0, 1.0);
             const double coast_mask = std::min(1.0, distance / k_coast_band);
 

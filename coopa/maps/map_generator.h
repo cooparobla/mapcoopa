@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <random>
 #include <string>
 #include <unordered_map>
@@ -200,7 +201,155 @@ private:
         }
 
         const delaunator::Delaunator delaunay(coords);
-        collect_delaunay_data_(delaunay);
+        collect_delaunay_data_(delaunay.triangles, delaunay.halfedges);
+    }
+
+    // ------------------------------------------------------------------------
+    // Sphere maps (MapTopology::Sphere)
+    // ------------------------------------------------------------------------
+
+    /**
+     * @brief Lays the generating sites over a globe: a Fibonacci spiral, jittered.
+     *
+     * The spiral spaces N points almost exactly evenly over the sphere (each claims the same
+     * area to within a few percent), which is what the plane's jittered lattice does for the
+     * square. The jitter moves each point along the ground by up to `jitter` grid units -- the
+     * plane's meaning, since cells here are a grid unit across too.
+     */
+    void generate_sphere_points_() {
+        std::mt19937 rng(static_cast<std::mt19937::result_type>(config_.seed));
+        coopa::maps::UniformRealDistribution<double> jitter(-1.0, 1.0);
+        const int count = sphere_point_count(config_);
+        const double radius = sphere_radius(config_);
+        const double golden = 3.14159265358979323846 * (3.0 - std::sqrt(5.0));
+        points_.clear();
+        points_.reserve(static_cast<std::size_t>(count));
+        for (int i = 0; i < count; ++i) {
+            const double z = 1.0 - (2.0 * i + 1.0) / static_cast<double>(count);
+            const double r = std::sqrt(std::max(0.0, 1.0 - z * z));
+            const double phi = golden * static_cast<double>(i);
+            glm::dvec3 dir(r * std::cos(phi), r * std::sin(phi), z);
+            // A tangent frame at the point, to jitter along the ground.
+            const glm::dvec3 east = glm::length(glm::dvec3(-dir.y, dir.x, 0.0)) > 1e-9
+                                        ? glm::normalize(glm::dvec3(-dir.y, dir.x, 0.0))
+                                        : glm::dvec3(1.0, 0.0, 0.0);
+            const glm::dvec3 north = glm::cross(dir, east);
+            const double ju = config_.jitter * (jitter(rng) - 0.5) / radius;
+            const double jv = config_.jitter * (jitter(rng) - 0.5) / radius;
+            dir = glm::normalize(dir + east * ju + north * jv) * radius;
+            points_.push_back({dir.x, dir.y, dir.z});
+        }
+    }
+
+    /**
+     * @brief Triangulates a globe's sites: a spherical Delaunay triangulation (its convex hull).
+     *
+     * Through the plane triangulator, by stereographic projection: projecting the sphere from
+     * one site onto a plane maps circles to circles, so the plane's Delaunay triangulation of the
+     * other sites is exactly the sphere's -- less the triangles round the projection point, which
+     * went to infinity. Those are put back as a fan from that site to every edge of the plane
+     * triangulation's hull. The result is closed: every edge has two sides, every corner three
+     * cells, and `collect_delaunay_data_()` reads it exactly as it reads a plane's.
+     */
+    void triangulate_sphere_points_() {
+        const std::size_t count = points_.size();
+        const std::size_t pole = 0;
+        const glm::dvec3 n = glm::normalize(glm::dvec3(points_[pole].x, points_[pole].y, points_[pole].z));
+        const glm::dvec3 helper = std::abs(n.z) < 0.9 ? glm::dvec3(0.0, 0.0, 1.0) : glm::dvec3(1.0, 0.0, 0.0);
+        const glm::dvec3 u = glm::normalize(glm::cross(helper, n));
+        const glm::dvec3 v = glm::cross(n, u);
+
+        std::vector<double> coords;
+        std::vector<std::size_t> original;   // projected index -> site index
+        coords.reserve(count * 2);
+        original.reserve(count);
+        for (std::size_t i = 0; i < count; ++i) {
+            if (i == pole) continue;
+            const glm::dvec3 q = glm::normalize(glm::dvec3(points_[i].x, points_[i].y, points_[i].z));
+            const double denom = 1.0 - glm::dot(q, n);
+            if (denom <= 1e-12) continue;   // coincides with the pole: dropped like a duplicate
+            coords.push_back(glm::dot(q, u) / denom);
+            coords.push_back(glm::dot(q, v) / denom);
+            original.push_back(i);
+        }
+        const delaunator::Delaunator delaunay(coords);
+
+        std::vector<std::size_t> triangles;
+        triangles.reserve(delaunay.triangles.size() + 3 * 256);
+        for (const std::size_t t : delaunay.triangles) triangles.push_back(original[t]);
+        // The fan: one triangle per hull half-edge a->b, wound b->a->pole so it pairs.
+        for (std::size_t e = 0; e < delaunay.halfedges.size(); ++e) {
+            if (delaunay.halfedges[e] != delaunator::INVALID_INDEX) continue;
+            const std::size_t next = (e % 3 == 2) ? e - 2 : e + 1;
+            const std::size_t a = original[delaunay.triangles[e]];
+            const std::size_t b = original[delaunay.triangles[next]];
+            triangles.push_back(b);
+            triangles.push_back(a);
+            triangles.push_back(pole);
+        }
+        // Pair every half-edge with its opposite.
+        std::vector<std::size_t> halfedges(triangles.size(), delaunator::INVALID_INDEX);
+        std::unordered_map<std::uint64_t, std::size_t> open;
+        open.reserve(triangles.size());
+        for (std::size_t e = 0; e < triangles.size(); ++e) {
+            const std::size_t next = (e % 3 == 2) ? e - 2 : e + 1;
+            const std::uint64_t a = triangles[e];
+            const std::uint64_t b = triangles[next];
+            const auto found = open.find((b << 32) | a);
+            if (found != open.end()) {
+                halfedges[e] = found->second;
+                halfedges[found->second] = e;
+                open.erase(found);
+            } else {
+                open.emplace((a << 32) | b, e);
+            }
+        }
+        collect_delaunay_data_(triangles, halfedges);
+    }
+
+    /** @brief A sphere map's Voronoi vertex: the outward normal of its Delaunay triangle, on the globe. */
+    MapPoint sphere_corner_(const MapPoint& a, const MapPoint& b, const MapPoint& c) const {
+        const glm::dvec3 pa(a.x, a.y, a.z), pb(b.x, b.y, b.z), pc(c.x, c.y, c.z);
+        glm::dvec3 nrm = glm::cross(pb - pa, pc - pa);
+        const double len = glm::length(nrm);
+        if (len <= 0.0) nrm = pa + pb + pc;
+        if (glm::dot(nrm, pa + pb + pc) < 0.0) nrm = -nrm;
+        nrm = glm::normalize(nrm) * graph_.sphere_radius;
+        return {nrm.x, nrm.y, nrm.z};
+    }
+
+    /** @brief Sorts each cell's corners counter-clockwise about its site, seen from outside the globe. */
+    void sort_sphere_cell_corners_() {
+        for (MapCenter& center : graph_.centers) {
+            if (center.corners.size() < 3) continue;
+            const glm::dvec3 nrm = glm::normalize(glm::dvec3(center.point.x, center.point.y, center.point.z));
+            const glm::dvec3 helper = std::abs(nrm.z) < 0.9 ? glm::dvec3(0.0, 0.0, 1.0) : glm::dvec3(1.0, 0.0, 0.0);
+            const glm::dvec3 e1 = glm::normalize(glm::cross(helper, nrm));
+            const glm::dvec3 e2 = glm::cross(nrm, e1);
+            const auto angle = [&](CornerId id) {
+                const MapPoint& p = graph_.corners[static_cast<std::size_t>(id)].point;
+                const glm::dvec3 d = glm::dvec3(p.x, p.y, p.z) - glm::dvec3(center.point.x, center.point.y, center.point.z);
+                return std::atan2(glm::dot(d, e2), glm::dot(d, e1));
+            };
+            coopa::maps::sort(center.corners.begin(), center.corners.end(),
+                              [&](CornerId a, CornerId b) { return angle(a) < angle(b); });
+        }
+    }
+
+    /** @brief A globe's border: wherever its landmass shape (`SphereShapeField`) keeps the land away. */
+    void sphere_border_check_() {
+        const double border = config_.border_length;
+        const SphereShapeField shape(config_);
+        for (MapCenter& center : graph_.centers) {
+            if (shape.inset(center.point.x, center.point.y, center.point.z) <= border) center.border = true;
+            for (const CornerId corner_id : center.corners) {
+                MapCorner& corner = graph_.corners[static_cast<std::size_t>(corner_id)];
+                if (shape.inset(corner.point.x, corner.point.y, corner.point.z) <= border) {
+                    corner.border = true;
+                    center.border = true;
+                }
+            }
+        }
     }
 
     /**
@@ -212,23 +361,25 @@ private:
      * arrays hold one record per geometric edge rather than the two the
      * original produced.
      */
-    void collect_delaunay_data_(const delaunator::Delaunator& delaunay) {
+    void collect_delaunay_data_(const std::vector<std::size_t>& triangles,
+                                const std::vector<std::size_t>& halfedges) {
         graph_.centers.resize(points_.size());
         for (std::size_t i = 0; i < points_.size(); ++i) {
             graph_.centers[i].index = static_cast<CenterId>(i);
             graph_.centers[i].point = points_[i];
         }
 
-        const std::size_t triangle_count = delaunay.triangles.size() / 3;
+        const std::size_t triangle_count = triangles.size() / 3;
         graph_.corners.resize(triangle_count);
         for (std::size_t t = 0; t < triangle_count; ++t) {
-            const std::size_t i0 = delaunay.triangles[t * 3];
-            const std::size_t i1 = delaunay.triangles[t * 3 + 1];
-            const std::size_t i2 = delaunay.triangles[t * 3 + 2];
+            const std::size_t i0 = triangles[t * 3];
+            const std::size_t i1 = triangles[t * 3 + 1];
+            const std::size_t i2 = triangles[t * 3 + 2];
 
             MapCorner& corner = graph_.corners[t];
             corner.index = static_cast<CornerId>(t);
-            corner.point = circumcenter_(points_[i0], points_[i1], points_[i2]);
+            corner.point = graph_.is_sphere() ? sphere_corner_(points_[i0], points_[i1], points_[i2])
+                                              : circumcenter_(points_[i0], points_[i1], points_[i2]);
 
             const CornerId corner_id = corner.index;
             for (const std::size_t center_index : {i0, i1, i2}) {
@@ -237,14 +388,14 @@ private:
             }
         }
 
-        for (std::size_t e = 0; e < delaunay.halfedges.size(); ++e) {
-            const std::size_t paired = delaunay.halfedges[e];
+        for (std::size_t e = 0; e < halfedges.size(); ++e) {
+            const std::size_t paired = halfedges[e];
             if (paired == delaunator::INVALID_INDEX || paired < e) {
                 continue; // Hull edge, or the far side of an edge already built.
             }
 
-            const CenterId d0 = static_cast<CenterId>(delaunay.triangles[e]);
-            const CenterId d1 = static_cast<CenterId>(delaunay.triangles[paired]);
+            const CenterId d0 = static_cast<CenterId>(triangles[e]);
+            const CenterId d1 = static_cast<CenterId>(triangles[paired]);
             const CornerId v0 = static_cast<CornerId>(e / 3);
             const CornerId v1 = static_cast<CornerId>(paired / 3);
 
@@ -258,6 +409,11 @@ private:
                               + graph_.corners[static_cast<std::size_t>(v1)].point.x) * 0.5,
                              (graph_.corners[static_cast<std::size_t>(v0)].point.y
                               + graph_.corners[static_cast<std::size_t>(v1)].point.y) * 0.5};
+            if (graph_.is_sphere()) {
+                edge.midpoint.z = (graph_.corners[static_cast<std::size_t>(v0)].point.z
+                                   + graph_.corners[static_cast<std::size_t>(v1)].point.z) * 0.5;
+                edge.midpoint = graph_.on_surface(edge.midpoint);
+            }
 
             const EdgeId edge_id = edge.index;
             graph_.edges.push_back(edge);
@@ -375,10 +531,18 @@ private:
                      + ", grid " + std::to_string(config_.grid_size) + ")");
 
         graph_.clear();
+        if (config_.topology == MapTopology::Sphere) {
+            graph_.sphere_radius = sphere_radius(config_);
+            generate_sphere_points_();
+            triangulate_sphere_points_();
+            sort_sphere_cell_corners_();
+            sphere_border_check_();
+        } else {
         generate_points_();
         triangulate_points_();
         sort_cell_corners_();
         border_check_();
+        }
         if (state) {
             state->step();   // The geometry build is one stage of the fifteen.
         }

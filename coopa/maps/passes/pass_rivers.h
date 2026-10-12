@@ -162,6 +162,7 @@ private:
         // because it never moves a point more than a quarter of a segment. The
         // meander is the downslope chain itself and survives intact.
         chaikin_smooth(river.points, config.river_smoothing_iterations);
+        for (MapPoint& point : river.points) point = graph.on_surface(point);   // a globe's cuts fall inside it
         graph.rivers.push_back(std::move(river));
         return true;
     }

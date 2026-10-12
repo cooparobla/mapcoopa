@@ -112,9 +112,13 @@ public:
             town.cells = claim_cells_(graph, center, towns, town.tier, claimed);
             // Streets and square before the packer: both are things the buildings
             // have to be laid out *around*, so they cannot be decided afterwards.
-            town.streets = gather_streets_(graph, town, config);
-            town.plaza = site_plaza_(graph, town, config);
-            town.buildings = pack_settlement_(graph, town, config, rng);
+            if (graph.is_sphere()) {
+                lay_out_on_sphere_(graph, town, config, rng);
+            } else {
+                town.streets = gather_streets_(graph, town, config);
+                town.plaza = site_plaza_(graph, town, config);
+                town.buildings = pack_settlement_(graph, town, config, rng);
+            }
             assign_roles_(town, config.towns);
             assign_statistics_(town, center, towns, rng);
             town.name = name_for_(graph, town, rng);
@@ -196,7 +200,8 @@ private:
         for (const MapTown& town : graph.towns) {
             const double dx = town.point.x - point.x;
             const double dy = town.point.y - point.y;
-            if (dx * dx + dy * dy < min_spacing_squared) {
+            const double dz = town.point.z - point.z;   // 0 on a plane map
+            if (dx * dx + dy * dy + dz * dz < min_spacing_squared) {
                 return false;
             }
         }
@@ -296,6 +301,31 @@ private:
      * @param rng The pass's seeded generator.
      * @return Every building placed, across all of the settlement's cells.
      */
+    /**
+     * @brief A town on a globe: laid out exactly as on a plane, in the plane touching the globe at
+     *        the town (`SphereFrame`), then lifted back. Bearings and building yaws stay in that
+     *        plane's frame -- east along the equator, north toward +z.
+     */
+    void lay_out_on_sphere_(const MapGraph& graph, MapTown& town, const MapConfig& config,
+                            std::mt19937& rng) const {
+        const SphereFrame frame(graph, town.point);
+        const MapGraph flat = frame.flatten(graph);
+        MapTown local = town;
+        local.point = frame.to_plane(town.point);
+        local.streets = gather_streets_(flat, local, config);
+        local.plaza = site_plaza_(flat, local, config);
+        local.buildings = pack_settlement_(flat, local, config, rng);
+        town.streets = std::move(local.streets);
+        for (MapStreet& street : town.streets) {
+            street.from = frame.to_sphere(street.from);
+            street.to = frame.to_sphere(street.to);
+        }
+        town.plaza = local.plaza;
+        town.plaza.centre = frame.to_sphere(local.plaza.centre);
+        town.buildings = std::move(local.buildings);
+        for (MapBuilding& building : town.buildings) building.point = frame.to_sphere(building.point);
+    }
+
     std::vector<MapBuilding> pack_settlement_(const MapGraph& graph, const MapTown& town,
                                               const MapConfig& config, std::mt19937& rng) const {
         std::vector<MapBuilding> buildings;

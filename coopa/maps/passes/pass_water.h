@@ -30,6 +30,40 @@ namespace maps {
  * reaches the edge of the map.
  */
 class PassWater {
+private:
+    static void seed_sphere_oceans_(MapGraph& graph, std::queue<CenterId>& pending) {
+        std::vector<int> body(graph.centers.size(), -1);
+        std::vector<std::size_t> sizes;
+        for (const MapCenter& seed : graph.centers) {
+            if (!seed.water || body[static_cast<std::size_t>(seed.index)] >= 0) continue;
+            const int id = static_cast<int>(sizes.size());
+            std::size_t size = 0;
+            std::vector<CenterId> stack{seed.index};
+            body[static_cast<std::size_t>(seed.index)] = id;
+            while (!stack.empty()) {
+                const CenterId c = stack.back();
+                stack.pop_back();
+                ++size;
+                for (const CenterId nb : graph.centers[static_cast<std::size_t>(c)].neighbors) {
+                    if (graph.centers[static_cast<std::size_t>(nb)].water && body[static_cast<std::size_t>(nb)] < 0) {
+                        body[static_cast<std::size_t>(nb)] = id;
+                        stack.push_back(nb);
+                    }
+                }
+            }
+            sizes.push_back(size);
+        }
+        std::size_t largest = 0;
+        for (const std::size_t n : sizes) largest = std::max(largest, n);
+        for (MapCenter& center : graph.centers) {
+            const int id = body[static_cast<std::size_t>(center.index)];
+            if (id >= 0 && sizes[static_cast<std::size_t>(id)] * 10 >= largest) {
+                center.ocean = true;
+                pending.push(center.index);
+            }
+        }
+    }
+
 public:
     /**
      * @brief Runs the pass.
@@ -45,7 +79,7 @@ public:
         const Noise noise(config.noise_island);
 
         for (MapCorner& corner : graph.corners) {
-            const float value = noise.sample(corner.point.x, corner.point.y);
+            const float value = graph.noise_at(noise, corner.point);
             corner.water = (value > config.threshold_water) || corner.border;
         }
 
@@ -73,6 +107,11 @@ public:
                 center.ocean = true;
                 pending.push(center.index);
             }
+        }
+        // A globe with no landmass shape has no border to flood from: its sea is the largest body
+        // of water, and any other body at least a tenth of its size; smaller ones are lakes.
+        if (pending.empty() && graph.is_sphere()) {
+            seed_sphere_oceans_(graph, pending);
         }
 
         while (!pending.empty()) {

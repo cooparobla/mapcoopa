@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -21,6 +22,7 @@
 #include <coopa/maps/image.h>
 #include <coopa/maps/map_config.h>
 #include <coopa/maps/map_data.h>
+#include <coopa/maps/water_field.h>
 
 namespace coopa {
 namespace maps {
@@ -193,8 +195,11 @@ public:
      * @return Outlines and row ranges for every cell.
      */
     static CellGeometry build_cell_geometry(const MapGraph& graph, const MapConfig& config) {
-        const double scale = pixels_per_grid_unit_(config);
         CellGeometry geometry;
+        if (graph.is_sphere()) {
+            return geometry;   // a globe renders per pixel (`draw_sphere_()`): no outlines
+        }
+        const double scale = pixels_per_grid_unit_(config);
         geometry.outlines.resize(graph.centers.size());
         geometry.min_row.assign(graph.centers.size(), 0);
         geometry.max_row.assign(graph.centers.size(), -1);
@@ -247,6 +252,9 @@ public:
                                           const BiomePalette& palette = BiomePalette{},
                                           const CellGeometry* geometry = nullptr,
                                           double extra_blur_cells = k_shade_blur_cells) {
+        if (graph.is_sphere()) {
+            return HeightField{};   // a globe shades per pixel (`draw_sphere_()`)
+        }
         const double scale = pixels_per_grid_unit_(config);
         // `elevation()` finishes the raster itself, so under `Blended` this is
         // already the smoothed field -- which is the whole point of reading it here
@@ -305,6 +313,9 @@ public:
     static void finish(Image& image, MapLayer layer, const MapGraph& graph,
                        const MapConfig& config, const BiomePalette& palette = BiomePalette{},
                        const RenderSlice& slice = RenderSlice{}) {
+        if (graph.is_sphere()) {
+            return;
+        }
         if (layer == MapLayer::Elevation) {
             smooth_elevation_raster_(image, graph, config, palette, slice.geometry);
         }
@@ -326,13 +337,16 @@ public:
     static Image allocate(MapLayer layer, const MapConfig& config,
                           const BiomePalette& palette = BiomePalette{}) {
         Image image;
+        // A globe is drawn equirectangular: the full circle of longitude across, half of it down.
+        const int rows = config.topology == MapTopology::Sphere ? std::max(1, config.image_size / 2)
+                                                                : config.image_size;
         if (map_layer_has_alpha(layer)) {
-            image.reset(config.image_size, config.image_size, 4, glm::vec4(0.0f));
+            image.reset(config.image_size, rows, 4, glm::vec4(0.0f));
             return image;
         }
         const bool on_background = layer == MapLayer::Biomes || layer == MapLayer::Regions
                                 || layer == MapLayer::Composite;
-        image.reset(config.image_size, config.image_size, 3,
+        image.reset(config.image_size, rows, 3,
                     on_background ? palette.background_color : glm::vec3(0.0f));
         return image;
     }
@@ -355,6 +369,10 @@ public:
                             const MapConfig& config,
                             const BiomePalette& palette = BiomePalette{},
                             const RenderSlice& slice = RenderSlice{}) {
+        if (graph.is_sphere()) {
+            draw_sphere_(image, layer, graph, config, palette, slice.band);
+            return;
+        }
         switch (layer) {
             case MapLayer::Elevation:  draw_elevation_(image, graph, config, palette, slice); return;
             case MapLayer::Water:      draw_water_(image, graph, config, palette, slice); return;
@@ -380,6 +398,9 @@ public:
     static Image render(MapLayer layer, const MapGraph& graph, const MapConfig& config,
                         const BiomePalette& palette = BiomePalette{},
                         const RenderSlice& slice = RenderSlice{}) {
+        if (graph.is_sphere()) {
+            return sphere_layer_(layer, graph, config, palette, slice);
+        }
         switch (layer) {
             case MapLayer::Elevation:  return elevation(graph, config, palette, slice);
             case MapLayer::Water:      return water(graph, config, palette, slice);
@@ -425,6 +446,9 @@ public:
     static Image elevation(const MapGraph& graph, const MapConfig& config,
                            const BiomePalette& palette = BiomePalette{},
                            const RenderSlice& slice = RenderSlice{}) {
+        if (graph.is_sphere()) {
+            return sphere_layer_(MapLayer::Elevation, graph, config, palette, slice);
+        }
         Image image = allocate(MapLayer::Elevation, config, palette);
         draw_elevation_(image, graph, config, palette, slice);
         finish(image, MapLayer::Elevation, graph, config, palette, slice);
@@ -457,6 +481,9 @@ public:
     static Image water(const MapGraph& graph, const MapConfig& config,
                        const BiomePalette& palette = BiomePalette{},
                        const RenderSlice& slice = RenderSlice{}) {
+        if (graph.is_sphere()) {
+            return sphere_layer_(MapLayer::Water, graph, config, palette, slice);
+        }
         Image image = allocate(MapLayer::Water, config, palette);
         draw_water_(image, graph, config, palette, slice);
         return image;
@@ -466,6 +493,9 @@ public:
     static Image biomes(const MapGraph& graph, const MapConfig& config,
                         const BiomePalette& palette = BiomePalette{},
                         const RenderSlice& slice = RenderSlice{}) {
+        if (graph.is_sphere()) {
+            return sphere_layer_(MapLayer::Biomes, graph, config, palette, slice);
+        }
         Image image = allocate(MapLayer::Biomes, config, palette);
         draw_biomes_(image, graph, config, palette, slice);
         return image;
@@ -497,6 +527,9 @@ public:
     static Image regions(const MapGraph& graph, const MapConfig& config,
                          const BiomePalette& palette = BiomePalette{},
                          const RenderSlice& slice = RenderSlice{}) {
+        if (graph.is_sphere()) {
+            return sphere_layer_(MapLayer::Regions, graph, config, palette, slice);
+        }
         Image image = allocate(MapLayer::Regions, config, palette);
         draw_regions_(image, graph, config, palette, slice);
         return image;
@@ -512,6 +545,9 @@ public:
     static Image roads(const MapGraph& graph, const MapConfig& config,
                        const BiomePalette& palette = BiomePalette{},
                        const RenderSlice& slice = RenderSlice{}) {
+        if (graph.is_sphere()) {
+            return sphere_layer_(MapLayer::Roads, graph, config, palette, slice);
+        }
         Image image = allocate(MapLayer::Roads, config, palette);
         draw_roads_layer_(image, graph, config, palette, slice);
         return image;
@@ -521,6 +557,9 @@ public:
     static Image structures(const MapGraph& graph, const MapConfig& config,
                             const BiomePalette& palette = BiomePalette{},
                             const RenderSlice& slice = RenderSlice{}) {
+        if (graph.is_sphere()) {
+            return sphere_layer_(MapLayer::Structures, graph, config, palette, slice);
+        }
         Image image = allocate(MapLayer::Structures, config, palette);
         draw_structures_layer_(image, graph, config, palette, slice);
         return image;
@@ -530,6 +569,9 @@ public:
     static Image landmarks(const MapGraph& graph, const MapConfig& config,
                            const BiomePalette& palette = BiomePalette{},
                            const RenderSlice& slice = RenderSlice{}) {
+        if (graph.is_sphere()) {
+            return sphere_layer_(MapLayer::Landmarks, graph, config, palette, slice);
+        }
         Image image = allocate(MapLayer::Landmarks, config, palette);
         draw_landmarks_layer_(image, graph, config, palette, slice);
         return image;
@@ -550,6 +592,9 @@ public:
     static Image composite(const MapGraph& graph, const MapConfig& config,
                            const BiomePalette& palette = BiomePalette{},
                            const RenderSlice& slice = RenderSlice{}) {
+        if (graph.is_sphere()) {
+            return sphere_layer_(MapLayer::Composite, graph, config, palette, slice);
+        }
         Image image = allocate(MapLayer::Composite, config, palette);
         draw_composite_(image, graph, config, palette, slice);
         return image;
@@ -577,6 +622,9 @@ public:
     static Image caves(const MapGraph& graph, const MapConfig& config,
                        const BiomePalette& palette = BiomePalette{},
                        const RenderSlice& slice = RenderSlice{}) {
+        if (graph.is_sphere()) {
+            return sphere_layer_(MapLayer::Caves, graph, config, palette, slice);
+        }
         Image image = allocate(MapLayer::Caves, config, palette);
         draw_caves_(image, graph, config, palette, slice);
         return image;
@@ -711,6 +759,106 @@ private:
         const float deep = static_cast<float>(
             std::clamp(1.0 - (height - range.low) / (range.high - range.low), 0.0, 1.0));
         return palette.cave_shallow_color * (1.0f - deep) + palette.cave_deep_color * deep;
+    }
+
+    /** @brief One whole layer of a globe. */
+    static Image sphere_layer_(MapLayer layer, const MapGraph& graph, const MapConfig& config,
+                               const BiomePalette& palette, const RenderSlice& slice) {
+        Image image = allocate(layer, config, palette);
+        draw_sphere_(image, layer, graph, config, palette, slice.band);
+        return image;
+    }
+
+    /**
+     * @brief Draws a globe's layer, equirectangular: x is longitude (-180 to 180 degrees east),
+     *        y latitude (north, +z, at the top).
+     *
+     * Per pixel rather than per cell: each pixel's point on the globe finds its cell by walking
+     * from the last pixel's (the Delaunay neighbours lead greedily to the nearest site), then
+     * reads the same queries a 3D consumer does -- the ground, the water, the cell's biome and
+     * region. No outline crosses the seam or wraps a pole, so neither needs handling. The
+     * overlay layers (roads, structures, landmarks) are left empty on a globe, and the cave
+     * overview is its dimmed terrain alone.
+     */
+    static void draw_sphere_(Image& image, MapLayer layer, const MapGraph& graph, const MapConfig& config,
+                             const BiomePalette& palette, const RowBand& band) {
+        if (graph.centers.empty() || map_layer_has_alpha(layer)) return;
+        const int width = image.width;
+        const int height = image.height;
+        const double radius = graph.sphere_radius;
+        const TerrainSurface ground(graph, config);
+        const RiverChannels channels = make_river_channels(graph, config, ground.detail());
+        const bool needs_water =
+            layer == MapLayer::Water || layer == MapLayer::Composite || layer == MapLayer::Caves;
+        std::unique_ptr<WaterField> field;
+        if (needs_water) field = std::make_unique<WaterField>(graph, config, ground.detail(), channels);
+        const double pi = 3.14159265358979323846;
+        const int y0 = std::max(0, band.begin);
+        const int y1 = std::min(height, band.end);
+        std::size_t hint = 0;
+        for (int y = y0; y < y1; ++y) {
+            const double lat = 0.5 * pi - (static_cast<double>(y) + 0.5) / static_cast<double>(height) * pi;
+            for (int x = 0; x < width; ++x) {
+                const double lon = -pi + (static_cast<double>(x) + 0.5) / static_cast<double>(width) * 2.0 * pi;
+                const MapPoint p{radius * std::cos(lat) * std::cos(lon), radius * std::cos(lat) * std::sin(lon),
+                                 radius * std::sin(lat)};
+                hint = nearest_cell_(graph, p, hint);
+                const MapCenter& center = graph.centers[hint];
+                glm::vec3 color(0.0f);
+                switch (layer) {
+                    case MapLayer::Elevation:
+                        color = height_grey_(graph.elevation_at(center, p, ground.detail(), channels));
+                        break;
+                    case MapLayer::Water: {
+                        const WaterSample w = field->at(center, p);
+                        color = w.wet() ? height_grey_(w.surface) : glm::vec3(0.0f);
+                        break;
+                    }
+                    case MapLayer::Biomes:
+                        color = palette.color_for(center.biome);
+                        break;
+                    case MapLayer::Regions:
+                        color = center.region != k_invalid_id && static_cast<std::size_t>(center.region) < graph.regions.size()
+                                    ? graph.regions[static_cast<std::size_t>(center.region)].color
+                                    : palette.background_color;
+                        break;
+                    default: {   // Composite
+                        const WaterSample w = field->at(center, p);
+                        if (w.kind == WaterKind::River) {
+                            color = palette.river_color;
+                        } else if (w.wet()) {
+                            color = palette.color_for(center.water ? center.biome : Biome::Ocean);
+                        } else {
+                            const double land = land_height(config, w.ground);
+                            color = biome_color_(graph, center, config, palette)
+                                    * static_cast<float>(0.8 + 0.4 * std::clamp(land, 0.0, 1.0));
+                        }
+                        break;
+                    }
+                }
+                if (layer == MapLayer::Caves) color *= static_cast<float>(k_cave_backdrop_dim);   // the terrain, dimmed
+                image.set_pixel(x, y, glm::clamp(color, glm::vec3(0.0f), glm::vec3(255.0f)));
+            }
+        }
+    }
+
+    /** @brief The cell whose site is nearest a point of a globe, walking from `hint`. */
+    static std::size_t nearest_cell_(const MapGraph& graph, const MapPoint& p, std::size_t hint) {
+        std::size_t best = hint < graph.centers.size() ? hint : 0;
+        double distance = graph.centers[best].point.distance_to(p);
+        for (int guard = 0; guard < 4096; ++guard) {
+            std::size_t next = best;
+            for (const CenterId n : graph.centers[best].neighbors) {
+                const double d = graph.centers[static_cast<std::size_t>(n)].point.distance_to(p);
+                if (d < distance) {
+                    distance = d;
+                    next = static_cast<std::size_t>(n);
+                }
+            }
+            if (next == best) break;
+            best = next;
+        }
+        return best;
     }
 
     /** @brief Draws the elevation layer into an already-allocated buffer. */
