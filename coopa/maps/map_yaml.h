@@ -344,6 +344,8 @@ inline fkyaml::node config_to_node(const MapConfig& config) {
     node["river_valley_falloff"] = config.river_valley_falloff;
     node["water_edge_overlap_m"] = config.water_edge_overlap_m;
     node["lake_depth_m"] = config.lake_depth_m;
+    node["lake_bed_grade"] = config.lake_bed_grade;
+    node["lake_depth_max_m"] = config.lake_depth_max_m;
     node["terrain_model"] = std::string(terrain_model_name(config.terrain_model));
     {
         fkyaml::node natural = fkyaml::node::mapping();
@@ -354,12 +356,16 @@ inline fkyaml::node config_to_node(const MapConfig& config) {
         natural["plateaus"] = config.natural.plateaus;
         natural["plateau_coverage"] = config.natural.plateau_coverage;
         natural["warp"] = config.natural.warp;
+        natural["seabed"] = config.natural.seabed;
+        natural["seabed_ridges"] = config.natural.seabed_ridges;
+        natural["seabed_shelf"] = config.natural.seabed_shelf;
         node["natural"] = std::move(natural);
     }
     node["noise_hills"] = detail::noise_to_node(config.noise_hills);
     node["noise_ridge"] = detail::noise_to_node(config.noise_ridge);
     node["noise_plateau"] = detail::noise_to_node(config.noise_plateau);
     node["noise_warp"] = detail::noise_to_node(config.noise_warp);
+    node["noise_seabed"] = detail::noise_to_node(config.noise_seabed);
     node["trail_width_m"] = config.trail_width_m;
     node["road_width_m"] = config.road_width_m;
     node["highway_width_m"] = config.highway_width_m;
@@ -512,6 +518,8 @@ inline void apply_config_node(const fkyaml::node& node, MapConfig& config) {
     config.water_edge_overlap_m =
         detail::read_or(node, "water_edge_overlap_m", config.water_edge_overlap_m);
     config.lake_depth_m = detail::read_or(node, "lake_depth_m", config.lake_depth_m);
+    config.lake_bed_grade = detail::read_or(node, "lake_bed_grade", config.lake_bed_grade);
+    config.lake_depth_max_m = detail::read_or(node, "lake_depth_max_m", config.lake_depth_max_m);
     config.terrain_model = terrain_model_from_name(
         detail::read_or(node, "terrain_model", std::string(terrain_model_name(config.terrain_model))));
     if (node.contains("natural")) {
@@ -524,11 +532,15 @@ inline void apply_config_node(const fkyaml::node& node, MapConfig& config) {
         c.plateaus = detail::read_or(n, "plateaus", c.plateaus);
         c.plateau_coverage = detail::read_or(n, "plateau_coverage", c.plateau_coverage);
         c.warp = detail::read_or(n, "warp", c.warp);
+        c.seabed = detail::read_or(n, "seabed", c.seabed);
+        c.seabed_ridges = detail::read_or(n, "seabed_ridges", c.seabed_ridges);
+        c.seabed_shelf = detail::read_or(n, "seabed_shelf", c.seabed_shelf);
     }
     detail::noise_from_node(node, "noise_hills", config.noise_hills);
     detail::noise_from_node(node, "noise_ridge", config.noise_ridge);
     detail::noise_from_node(node, "noise_plateau", config.noise_plateau);
     detail::noise_from_node(node, "noise_warp", config.noise_warp);
+    detail::noise_from_node(node, "noise_seabed", config.noise_seabed);
     config.trail_width_m = detail::read_or(node, "trail_width_m", config.trail_width_m);
     config.road_width_m = detail::read_or(node, "road_width_m", config.road_width_m);
     config.highway_width_m = detail::read_or(node, "highway_width_m", config.highway_width_m);

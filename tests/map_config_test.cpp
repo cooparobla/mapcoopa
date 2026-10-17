@@ -118,6 +118,26 @@ MapConfig perturbed_config() {
                     41.5, 1250.0, 0.24, 0.45, 0.35, 0.09, 0.31, 0.62, 4, 275, 7.5,
                     21.5, 0.17, 55.5, 3};
 
+    // The ground, above and below the waterline. Positional like the four above, and correct
+    // only while it covers every field of NaturalTerrainConfig in declaration order:
+    // smoothing, hills, mountains, mountain_start, plateaus, plateau_coverage, warp, then the
+    // bed's own seabed, seabed_ridges, seabed_shelf.
+    config.terrain_model = TerrainModel::Natural;
+    config.natural = {0.4, 0.07, 0.6, 0.31, 0.11, 0.42, 2.25, 0.055, 0.09, 0.07};
+    config.noise_hills = {55, 0.25, FastNoiseLite::NoiseType_Perlin,
+                          FastNoiseLite::FractalType_FBm, 4, 2.2, 0.45, 0.3};
+    config.noise_ridge = {56, 0.19, FastNoiseLite::NoiseType_Perlin,
+                          FastNoiseLite::FractalType_Ridged, 6, 1.8, 0.55, 0.65};
+    config.noise_plateau = {57, 0.07, FastNoiseLite::NoiseType_Value,
+                            FastNoiseLite::FractalType_FBm, 2, 2.4, 0.5, 0.1};
+    config.noise_warp = {58, 0.31, FastNoiseLite::NoiseType_Perlin,
+                         FastNoiseLite::FractalType_FBm, 5, 2.0, 0.6, 0.2};
+    config.noise_seabed = {59, 1.3, FastNoiseLite::NoiseType_Perlin,
+                           FastNoiseLite::FractalType_FBm, 4, 2.1, 0.4, 0.5};
+    config.lake_depth_m = 9.5;
+    config.lake_bed_grade = 0.21;
+    config.lake_depth_max_m = 140.0;
+
     config.enable_water = false;
     config.enable_coast = false;
     config.enable_elevation = false;
@@ -220,6 +240,21 @@ COOPA_TEST(config_round_trips_every_field) {
     ASSERT_TRUE(loaded.river_valley_width == original.river_valley_width);
     ASSERT_TRUE(std::abs(loaded.river_valley_falloff - original.river_valley_falloff) < 1e-9);
     ASSERT_TRUE(std::abs(loaded.water_edge_overlap_m - original.water_edge_overlap_m) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.lake_depth_m - original.lake_depth_m) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.lake_bed_grade - original.lake_bed_grade) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.lake_depth_max_m - original.lake_depth_max_m) < 1e-9);
+    ASSERT_TRUE(loaded.terrain_model == original.terrain_model);
+    // The natural model's landforms, land and bed alike.
+    ASSERT_TRUE(std::abs(loaded.natural.smoothing - original.natural.smoothing) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.natural.hills - original.natural.hills) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.natural.mountains - original.natural.mountains) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.natural.mountain_start - original.natural.mountain_start) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.natural.plateaus - original.natural.plateaus) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.natural.plateau_coverage - original.natural.plateau_coverage) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.natural.warp - original.natural.warp) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.natural.seabed - original.natural.seabed) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.natural.seabed_ridges - original.natural.seabed_ridges) < 1e-9);
+    ASSERT_TRUE(std::abs(loaded.natural.seabed_shelf - original.natural.seabed_shelf) < 1e-9);
     ASSERT_TRUE(std::abs(loaded.terrain_relief - original.terrain_relief) < 1e-9);
     ASSERT_TRUE(std::abs(loaded.terrain_roughness - original.terrain_roughness) < 1e-9);
     ASSERT_EQ(loaded.caves.cave_count, original.caves.cave_count);

@@ -376,6 +376,36 @@ struct NaturalTerrainConfig {
     double plateau_coverage = 0.25;
     /** @brief How far the landform fields are pushed around, in grid units: bends ridges and valleys. */
     double warp = 1.5;
+
+    // --- Under the water ---
+    // The ground does not stop at the shore. Without these the submerged ground is the bare
+    // interpolation of the cell heights -- the shaping above is all gated on height *above* the
+    // waterline, so it is exactly zero below it -- and a sea floor comes out a hundred times
+    // flatter than the land beside it.
+
+    /**
+     * @brief Rolling relief over the floor of every sea and lake: sandbanks, swells and hollows.
+     *
+     * Read from `MapConfig::noise_seabed`, which is a finer field than `noise_hills` -- a bed is
+     * seen from a few metres away by anything swimming over it, not from a mountainside.
+     */
+    double seabed = 0.04;
+    /**
+     * @brief Ridges and gullies in deep water: banks, seamounts and the troughs between them.
+     *
+     * Faded in *below* the shelf rather than at it, so a shore shelves gently and only the open
+     * floor is broken up. Read from the same ridged field as the mountains, at an offset.
+     */
+    double seabed_ridges = 0.07;
+    /**
+     * @brief Depth over which the bed shaping fades in from the shoreline, in normalised height.
+     *
+     * The shoreline is where the ground crosses the water's surface, and every pass downstream is
+     * derived from where that falls -- so the shaping has to vanish there, exactly as the land
+     * shaping vanishes at the shore from the other side. This is how wide that band is: at the
+     * default 600 m elevation range, the first 30 m of water.
+     */
+    double seabed_shelf = 0.05;
 };
 
 /**
@@ -1350,6 +1380,14 @@ struct MapConfig {
     /** @brief Natural terrain's domain warp: what bends the other fields. */
     NoiseConfig noise_warp{8461, 0.2, FastNoiseLite::NoiseType_OpenSimplex2, FastNoiseLite::FractalType_FBm, 3};
     /**
+     * @brief Natural terrain's bed relief, under every sea and lake.
+     *
+     * Three times the frequency of `noise_hills` and the same five octaves, so the floor carries
+     * detail down to a few metres. A bed is read from just above it -- a swimmer's distance --
+     * where a hillside is read from across a valley, so the two want different scales.
+     */
+    NoiseConfig noise_seabed{9173, 0.9};
+    /**
      * @brief How strongly the detail field displaces the sampled surface, 0 to 1.
      *
      * Zero -- the default -- leaves the surface exactly as the passes computed
@@ -1620,13 +1658,37 @@ struct MapConfig {
      */
     double water_edge_overlap_m = 1.0;
     /**
-     * @brief How deep a lake's bed lies under its surface, at the least, in metres.
+     * @brief How deep a lake's bed lies under its surface at the shore, in metres.
      *
      * Lake cells are ranked with the land, so a cell the water pass flooded can carry a "bed"
      * well up a hillside. `assign_water_levels()` lowers every lake cell to at least this far
      * under the lake's spill level, which is what turns a flooded patch into a basin.
+     *
+     * The depth at the *rim*, not everywhere: the bed falls away from there at `lake_bed_grade`.
      */
     double lake_depth_m = 6.0;
+    /**
+     * @brief How steeply a lake's bed falls away from its shore, as rise over run.
+     *
+     * What makes a lake a basin rather than a pan. `lake_depth_m` on its own is one depth for the
+     * whole body: every cell of a kilometre-wide lake is lowered to the same height and its bed
+     * comes out exactly flat -- measurably so, zero spread on every lake of every seed. With a
+     * grade, depth grows with the distance from the shoreline, so a tarn stays ankle-deep and a
+     * wide lake has a middle worth sounding.
+     *
+     * Dimensionless and measured in real metres both ways (through `meters_per_grid_unit`), like
+     * `edge_grade()`, so the default means a one-in-eight bed whatever the world's scale. Zero
+     * restores one flat depth everywhere.
+     */
+    double lake_bed_grade = 0.125;
+    /**
+     * @brief How deep a lake's bed may reach under its surface, in metres.
+     *
+     * A ceiling on `lake_bed_grade`, so an inland sea does not have its middle pushed down to
+     * the floor of the height field -- where it would be clamped flat again, which is the very
+     * thing the grade exists to avoid.
+     */
+    double lake_depth_max_m = 90.0;
     /**
      * @brief Carriageway width of a `RoadClass::Trail`, in metres.
      *

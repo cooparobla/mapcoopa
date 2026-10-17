@@ -211,9 +211,17 @@ and compute the same cut.
 `MapCenter::water_level` is the *surface* of whatever water covers a cell, flat per body,
 as against `elevation` which is the height of the ground underneath. That distinction is
 the whole reason the water layer can draw a sheet: drawing `elevation` would draw the sea bed.
-A lake stands at its **spill level** -- just under the lowest cell of its shore -- over a bed at
-least `lake_depth_m` deep (`passes/water_levels.h`; settled again after the valleys pass, which
-can cut a shore). Every shore cell therefore stands above its lake.
+A lake stands at its **spill level** -- just under the lowest cell of its shore -- over a
+**basin**: at least `lake_depth_m` under the surface anywhere, and deeper by `lake_bed_grade`
+(rise over run, in real metres) for every metre in from the shoreline, to a floor of
+`lake_depth_max_m` (`passes/water_levels.h`; settled again after the valleys pass, which can cut
+a shore). Every shore cell therefore stands above its lake. The distance in from the shoreline is
+a Dijkstra walk over site-to-site distances inside the body, seeded half a step out from each dry
+neighbour (`shoreline_distances()`) -- real distance, so an elongated lake gets an elongated
+trough, and seeded at the *boundary* rather than at the shore cells, or a small lake, whose every
+cell is a shore cell, would read zero everywhere and come out flat however wide it was. One
+depth for the whole body makes every lake a flat pan instead -- a bed spread of exactly zero
+metres, on every lake of every seed.
 
 `RiverChannels::banked` is each river's *physical* surface (`RiverFit::Banked`): decided from the
 uncut ground before the channel is cut -- under both banks, only ever falling, backed up to the
@@ -241,6 +249,26 @@ through a warped field -- ridged mountain ranges on high ground, rolling hills, 
 plateaus. Near seas and lakes (blended cell rings from the water) the shaping may only raise the
 ground, so every water guarantee holds on both (`water_field_test` runs both). An elevation render of
 a natural map samples the surface directly whatever `elevation_surface` says.
+
+Every landform above is gated on height *above* the waterline, so all of them are exactly zero
+below it. **Under the water the bed has its own two** (`seabed`, `seabed_ridges`, field
+`noise_seabed`): rolling relief faded in over the first `seabed_shelf` of depth, and ridges and
+gullies faded in past it, so a shore shelves smoothly and only the open floor is broken up. They
+are *added* to the land shaping rather than replacing it, which is what keeps the surface
+continuous across a lake's shoreline -- a lake stands above `sea_level` and so reads as land
+height, where a branch would leave a step there. A rise is capped at half the water's remaining
+depth, so a shoal can never break the surface and strand dry ground in open water; a fall is
+capped at half the height left under it, so the deep floor rises into seamounts rather than being
+gouged through the bottom of the field. Without them a sea floor moves 0.1 m per 3.75 m of ground
+where the land beside it moves 1.9 (`seabed_test`).
+
+Both shapings are tested before they are sampled, which is what makes the second set free: the
+land shaping is *exactly* zero wherever the blended cell ring is (both its gates are
+`smoothstep(., ., 0)`), and a ring of zero means every cell of the triangle is a water cell --
+the open sea, and most of a map. So a submerged sample reads the bed's two fields and skips the
+land's four. Measured over the standard map's whole grid, 1.44 M samples: **500 ms** for the land
+fields everywhere and no bed, **456 ms** for the bed shaped and the land fields skipped where they
+cannot matter.
 
 ### [`water_field.h`](./water_field.h)
 `WaterField::at(cell, x, y)` -- the counterpart of `elevation_at()` for water, for a consumer

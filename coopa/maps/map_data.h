@@ -778,12 +778,14 @@ struct NaturalTerrain {
     Noise ridge;
     Noise plateau;
     Noise warp;
+    Noise seabed;
     /** @brief Per cell: rings of cells out from the nearest sea or lake cell, 0 on the water, capped at 4. */
     std::vector<std::uint8_t> rings;
 
     NaturalTerrain(const MapConfig& map, std::vector<std::uint8_t> water_rings)
         : config(map.natural), sea_level(map.sea_level), hills(map.noise_hills), ridge(map.noise_ridge),
-          plateau(map.noise_plateau), warp(map.noise_warp), rings(std::move(water_rings)) {}
+          plateau(map.noise_plateau), warp(map.noise_warp), seabed(map.noise_seabed),
+          rings(std::move(water_rings)) {}
 };
 
 /**
@@ -1267,6 +1269,12 @@ public:
      * a lake (in cells, blended over the triangle) fades out first the lowering, then the
      * raising. Every shore therefore stands at least as high as the classic surface puts it,
      * and that surface keeps every shore above its water -- the guarantee `WaterField` relies on.
+     *
+     * **Under the water the bed gets its own landforms**: rolling relief (`seabed`) faded in over
+     * the first `seabed_shelf` of depth, and ridges (`seabed_ridges`) faded in past it. The
+     * landforms above are all gated on height *above* the waterline, so they are exactly zero
+     * below it; without a second set the floor of every sea and lake is the bare interpolation of
+     * the cell heights, an eighteenth of the local relief of the land beside it.
      */
     double natural_elevation_(const MapCenter& center, const MapPoint& p, const NaturalTerrain& n) const {
         const double x = p.x;
@@ -1284,6 +1292,9 @@ public:
         double base = 0.0;
         double total = 0.0;
         double ring = 0.0;
+        // The highest water any of the triangle's cells puts over this point -- the same reach
+        // `WaterField::at()` reads the triangle for, so the two agree on where the shoreline is.
+        double water = 0.0;
         for (std::size_t i = 0; i < 3; ++i) {
             const double w = std::clamp(weights[i], 0.0, 1.0);
             const double eased = w + (w * w * (3.0 - 2.0 * w) - w) * smoothing;
@@ -1291,11 +1302,25 @@ public:
             base += eased * centers[id].elevation;
             total += eased;
             ring += w * static_cast<double>(id < n.rings.size() ? n.rings[id] : 4);
+            water = std::max(water, centers[id].water_level);
         }
         base = total > 0.0 ? base / total : elevation_at(center, p);
 
-        const double sea = n.sea_level;
-        const double land = sea < 1.0 ? std::clamp((base - sea) / (1.0 - sea), 0.0, 1.0) : 0.0;
+        // Both shapings are gated to nothing in places, and the gate is cheaper than the fields
+        // it guards -- four noise lookups for the land, two for the bed, against a render that
+        // takes 23 million samples. So each is tested before it is sampled.
+        //
+        // The LAND shaping is exactly zero wherever the blended ring is: `raise` and `lower` are
+        // both smoothstep(., ., 0), whatever the amplitudes say. A ring of zero means every cell
+        // of the triangle is a water cell, which is the open sea and most of a map.
+        const bool shape_land = ring > 0.0;
+        // The BED shaping needs water over the point to have anywhere to apply; `water` is zero
+        // on any triangle that neither touches a body nor dips under the waterline.
+        const bool shape_bed = water > 0.0 && (n.config.seabed > 0.0 || n.config.seabed_ridges > 0.0);
+        if (!shape_land && !shape_bed) {
+            return std::clamp(base, 0.0, 1.0);
+        }
+
         // The fields are read through a warp: 2D on a plane, 3D (so it wraps the globe) on a sphere.
         const bool sphere = is_sphere();
         const auto at = [sphere](const Noise& field, double a, double b, double c) {
@@ -1306,20 +1331,50 @@ public:
         const double wy = y + n.config.warp * at(n.warp, x + 37.1, y - 21.7, z + 13.3);
         const double wz = sphere ? z + n.config.warp * at(n.warp, x - 19.4, y + 8.8, z - 41.0) : 0.0;
 
-        const double hills = n.config.hills * at(n.hills, wx, wy, wz) * smoothstep(0.0, 0.12, land);
-        const double edge = land + 0.12 * at(n.plateau, x * 0.5 + 411.0, y * 0.5 - 97.0, z * 0.5 + 53.0);
-        const double range = smoothstep(n.config.mountain_start, n.config.mountain_start + 0.3, edge);
-        // Squared, so the crests come to an edge and the slopes below them fall away concave.
-        const double crest = 0.5 * (at(n.ridge, wx, wy, wz) + 1.0);
-        const double mountains = n.config.mountains * range * (crest * crest - 0.25);
-        const double threshold = 0.4 - 0.8 * std::clamp(n.config.plateau_coverage, 0.0, 1.0);
-        const double mesa = smoothstep(threshold, threshold + 0.05, at(n.plateau, wx, wy, wz))
-                          * smoothstep(0.03, 0.12, land) * (1.0 - range);
-        const double shaping = hills + mountains + n.config.plateaus * mesa;
+        double ground = base;
+        if (shape_land) {
+            const double sea = n.sea_level;
+            const double land = sea < 1.0 ? std::clamp((base - sea) / (1.0 - sea), 0.0, 1.0) : 0.0;
+            const double hills = n.config.hills * at(n.hills, wx, wy, wz) * smoothstep(0.0, 0.12, land);
+            const double edge = land + 0.12 * at(n.plateau, x * 0.5 + 411.0, y * 0.5 - 97.0, z * 0.5 + 53.0);
+            const double range = smoothstep(n.config.mountain_start, n.config.mountain_start + 0.3, edge);
+            // Squared, so the crests come to an edge and the slopes below them fall away concave.
+            const double crest = 0.5 * (at(n.ridge, wx, wy, wz) + 1.0);
+            const double mountains = n.config.mountains * range * (crest * crest - 0.25);
+            const double threshold = 0.4 - 0.8 * std::clamp(n.config.plateau_coverage, 0.0, 1.0);
+            const double mesa = smoothstep(threshold, threshold + 0.05, at(n.plateau, wx, wy, wz))
+                              * smoothstep(0.03, 0.12, land) * (1.0 - range);
+            const double shaping = hills + mountains + n.config.plateaus * mesa;
 
-        const double raise = smoothstep(0.0, 1.5, ring);
-        const double lower = smoothstep(1.5, 3.0, ring);
-        return std::clamp(base + (shaping > 0.0 ? raise : lower) * shaping, 0.0, 1.0);
+            const double raise = smoothstep(0.0, 1.5, ring);
+            const double lower = smoothstep(1.5, 3.0, ring);
+            ground = base + (shaping > 0.0 ? raise : lower) * shaping;
+        }
+
+        // --- Under the water ---
+        // Added to the land shaping rather than replacing it, and gated so it vanishes at the
+        // waterline: the two are then one continuous surface, where a branch at the shoreline
+        // would leave a step wherever the land shaping is non-zero there -- which it is around
+        // every lake, since a lake stands above `sea_level` and so reads as land height.
+        const double headroom = water - ground;
+        if (!shape_bed || headroom <= 0.0) {
+            return std::clamp(ground, 0.0, 1.0);
+        }
+        const double shelf = std::max(1e-6, n.config.seabed_shelf);
+        const double rolling = n.config.seabed * at(n.seabed, wx, wy, wz) * smoothstep(0.0, shelf, headroom);
+        // The ridged field again, at an offset, so a bank reads like a range and the gullies
+        // between them like the valleys -- but only out past the shelf, so a shore stays smooth.
+        const double bank = 0.5 * (at(n.ridge, wx + 613.0, wy - 457.0, wz + 271.0) + 1.0);
+        const double ridges = n.config.seabed_ridges * (bank * bank - 0.25)
+                            * smoothstep(shelf, 3.0 * shelf, headroom);
+        double relief = rolling + ridges;
+        // Room either way, so the bed stays a bed. Up: never more than halfway to the surface,
+        // or a shoal would break it and strand dry ground in open water. Down: never more than
+        // halfway to the floor of the height field, where a clamp would flatten it again --
+        // which is why the deep floor rises into seamounts rather than being gouged, and an
+        // abyssal plain is the flattest ground there is.
+        relief = relief > 0.0 ? std::min(relief, 0.5 * headroom) : std::max(relief, -0.5 * ground);
+        return std::clamp(ground + relief, 0.0, 1.0);
     }
 
     /**
