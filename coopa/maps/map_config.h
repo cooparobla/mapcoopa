@@ -379,9 +379,11 @@ struct NaturalTerrainConfig {
 
     // --- Under the water ---
     // The ground does not stop at the shore. Without these the submerged ground is the bare
-    // interpolation of the cell heights -- the shaping above is all gated on height *above* the
-    // waterline, so it is exactly zero below it -- and a sea floor comes out a hundred times
-    // flatter than the land beside it.
+    // interpolation of the cell heights, a hundred times flatter than the land beside it --
+    // the shaping above fades out across the shoreline instead of stopping dead at it, so a
+    // depth floor (keyed on `lake_depth_m`, see `NaturalTerrain::min_protected_depth`) keeps
+    // that fade-out and the relief below from together raising a point out of water deeper
+    // than the generator meant it to have.
 
     /**
      * @brief Rolling relief over the floor of every sea and lake: sandbanks, swells and hollows.

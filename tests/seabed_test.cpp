@@ -198,6 +198,74 @@ COOPA_TEST(bed_relief_leaves_dry_ground_alone) {
 }
 
 /**
+ * @brief Once a point's carved depth reaches `lake_depth_m`, shaping may not erase most of it.
+ *
+ * `lake_beds_are_basins` proves the basin is cut correctly at the cell centres
+ * `assign_water_levels()` works on; nothing ever samples a cell centre directly, though -- every
+ * consumer queries a point through `natural_elevation_()`'s land and bed shaping instead. The
+ * land terms are gated on distance from water, not on water depth itself, so they apply at full
+ * amplitude across a lake's interior, and only `raise` (never `lower`) applies near one -- a
+ * one-directional leak with no size limit of its own, left unchecked by the older seabed-relief
+ * clamp (which only ever halves what's left, and only after the land leak has already run).
+ *
+ * Checked the same way `bed_relief_leaves_dry_ground_alone` checks dry invariance: one generated
+ * world sampled through two `TerrainSurface`s built from it, one with every land and bed
+ * amplitude zero. The zeroed one reduces `natural_elevation_()` to its bare carved interpolation
+ * (`base`), which gives `headroom0 = water - base` -- the point's true carved depth, independent
+ * of shaping -- without duplicating that formula here.
+ */
+COOPA_TEST(shaping_cannot_erase_a_carved_lake_floor) {
+    std::size_t protected_points = 0;
+    for (const int seed : {17, 31, 61, 67}) {
+        MapConfig shaped = bed_config(seed);
+        MapConfig bare = shaped;
+        bare.natural.hills = 0.0;
+        bare.natural.mountains = 0.0;
+        bare.natural.plateaus = 0.0;
+        bare.natural.seabed = 0.0;
+        bare.natural.seabed_ridges = 0.0;
+
+        MapGenerator generator(shaped, maps_logger());
+        generator.generate();
+        const MapGraph& graph = generator.graph();
+        const TerrainSurface with(graph, shaped);
+        const TerrainSurface without(graph, bare);
+        const double least_depth = meters_to_height(shaped, shaped.lake_depth_m);
+        ASSERT_TRUE(least_depth > 0.0);
+
+        const int n = shaped.grid_size * 4;
+        const double span = static_cast<double>(shaped.grid_size) / n;
+        for (int y = 0; y < n; ++y) {
+            for (int x = 0; x < n; ++x) {
+                const MapPoint p{x * span, y * span};
+                const MapCenter& cell = nearest(graph, p);
+                std::array<CenterId, 3> cells{};
+                std::array<double, 3> weights{};
+                if (!graph.triangle_at(cell, p, cells, weights)) continue;
+                double water = 0.0;
+                for (const CenterId id : cells) {
+                    water = std::max(water, graph.centers[static_cast<std::size_t>(id)].water_level);
+                }
+                if (water <= 0.0) continue;
+                const double base = graph.elevation_at(cell, p, without.detail());
+                const double headroom0 = water - base;
+                // Only points the carving already called fully deep -- half credit near a shore
+                // is lake_beds_are_basins's job, not this one's; the floor's own taper means a
+                // point just past the shelf is deliberately not held to the far-reach guarantee.
+                if (headroom0 < least_depth + 1e-9) continue;
+                const double actual = graph.elevation_at(cell, p, with.detail());
+                const double depth = water - actual;
+                ASSERT_TRUE(depth >= 0.75 * headroom0);
+                ++protected_points;
+            }
+        }
+    }
+    std::printf("seabed: %zu points at or past the carved minimum depth, none eroded past a quarter\n",
+                protected_points);
+    ASSERT_TRUE(protected_points > 100);
+}
+
+/**
  * @brief Every lake is a basin: its bed falls away from its shoreline by the configured grade.
  *
  * One flat depth for the whole body gives a bed spread of exactly zero on every lake of every
