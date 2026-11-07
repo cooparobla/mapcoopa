@@ -11,15 +11,130 @@
 
 #include <algorithm>
 #include <cmath>
+#include <queue>
+#include <string>
 #include <vector>
 
 #include <coopa/maps/map_renderer.h>
+#include <coopa/maps/passes/water_levels.h>
 
 #include "support/map_fixtures.h"
 
 using namespace mapcoopa_test;
 
 COOPA_TEST_SUITE("water");
+
+namespace {
+
+/**
+ * @brief A square lattice `MapGraph`, 4-connected, for testing the pure graph algorithms in
+ *        `water_levels.h` without running a real generator.
+ *
+ * `rows` is one row-major string per row, one character per cell: `'#'` land, anything else
+ * water. A water cell at the array's own edge (`x == 0`, `y == 0`, or the opposite edges) is
+ * flagged `border`, the same forced-water band a real generated map always carries. `ocean` is
+ * then a flood fill from the border cells over water, exactly as `PassWater` leaves it.
+ */
+coopa::maps::MapGraph build_lattice(const std::vector<std::string>& rows) {
+    using namespace coopa::maps;
+    MapGraph graph;
+    const int height = static_cast<int>(rows.size());
+    const int width = height > 0 ? static_cast<int>(rows[0].size()) : 0;
+    const auto index_of = [&](int x, int y) { return y * width + x; };
+
+    graph.centers.resize(static_cast<std::size_t>(width) * static_cast<std::size_t>(height));
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            MapCenter& c = graph.centers[static_cast<std::size_t>(index_of(x, y))];
+            c.index = static_cast<CenterId>(index_of(x, y));
+            c.point = MapPoint{static_cast<double>(x), static_cast<double>(y)};
+            c.water = rows[static_cast<std::size_t>(y)][static_cast<std::size_t>(x)] != '#';
+            c.border = c.water && (x == 0 || y == 0 || x == width - 1 || y == height - 1);
+            static constexpr int k_steps[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+            for (const auto& step : k_steps) {
+                const int nx = x + step[0];
+                const int ny = y + step[1];
+                if (nx < 0 || nx >= width || ny < 0 || ny >= height) continue;
+                c.neighbors.push_back(static_cast<CenterId>(index_of(nx, ny)));
+            }
+        }
+    }
+
+    // ocean = a flood fill from every border water cell, over water -- PassWater's own rule.
+    std::vector<bool> reached(graph.centers.size(), false);
+    std::queue<CenterId> pending;
+    for (MapCenter& c : graph.centers) {
+        if (!c.border || !c.water) continue;
+        c.ocean = true;
+        reached[static_cast<std::size_t>(c.index)] = true;
+        pending.push(c.index);
+    }
+    while (!pending.empty()) {
+        const CenterId current = pending.front();
+        pending.pop();
+        for (const CenterId nb : graph.centers[static_cast<std::size_t>(current)].neighbors) {
+            MapCenter& neighbor = graph.centers[static_cast<std::size_t>(nb)];
+            if (!neighbor.water || reached[static_cast<std::size_t>(nb)]) continue;
+            reached[static_cast<std::size_t>(nb)] = true;
+            neighbor.ocean = true;
+            pending.push(nb);
+        }
+    }
+    return graph;
+}
+
+/**
+ * @brief An island with a sealed lagoon behind a one-cell strait, `extra_corridor_rows` of open
+ *        water beyond a fixed baseline between the map's border and where the strait begins.
+ *
+ * Every dimension is sized relative to `coopa::maps::k_strait_half_width` itself (a margin of
+ * 3x), rather than a fixed literal, so this stays a valid regression however that constant is
+ * retuned: the corridor and the lagoon are both comfortably past `2 * k_strait_half_width` wide,
+ * so a wide INTERIOR behind a genuinely narrow (1-cell) neck does not on its own read as open --
+ * the regression this geometry pins, see `ocean_enclosure()`'s own doc.
+ *
+ * The baseline depth is `margin` rows, not 0: the open sea's own core needs room in BOTH
+ * directions to establish -- a border only one cell deep has nothing to read wide against,
+ * however wide the lattice is laterally, so `extra_corridor_rows == 0` already gives the open sea
+ * enough depth to read as open. A large value pushes the strait's mouth many more cells inland
+ * while the strait and lagoon themselves stay pixel-for-pixel identical -- which is the whole
+ * point: `ocean_enclosure()` must flag the lagoon either way.
+ *
+ * @return The lattice, plus the (x, y) of a cell at the lagoon's own centre.
+ */
+std::pair<coopa::maps::MapGraph, std::pair<int, int>> build_island_with_lagoon(int extra_corridor_rows) {
+    using coopa::maps::k_strait_half_width;
+    const int margin = static_cast<int>(std::ceil(k_strait_half_width)) * 3;
+    const int width = margin * 2 + 3;          // two land edges + the strait's own column
+    const int strait_col = width / 2;
+    const int corridor_rows = margin + extra_corridor_rows;
+    // The strait and the room behind it both need enough DEPTH that the lagoon's own centre
+    // doesn't outrun the carve's fade (`2 * k_strait_half_width` past the nearest core cell) --
+    // a too-shallow strait/room reaches the centre so quickly that even an unfixed bug could
+    // look "enclosed enough" by sheer proximity. 5 rows each verified by probe to clear the
+    // fade with margin to spare, independent of `extra_corridor_rows`.
+    const int strait_rows = 5;
+    const int room_rows = 5;
+
+    const std::string border_row(static_cast<std::size_t>(width), '.');
+    const std::string corridor_row = "#" + std::string(static_cast<std::size_t>(width - 2), '.') + "#";
+    std::string strait_row(static_cast<std::size_t>(width), '#');
+    strait_row[static_cast<std::size_t>(strait_col)] = '.';
+    std::string room_row(static_cast<std::size_t>(width), '#');
+    for (int dx = -margin; dx <= margin; ++dx) room_row[static_cast<std::size_t>(strait_col + dx)] = '.';
+    const std::string buffer_row(static_cast<std::size_t>(width), '#');
+
+    std::vector<std::string> rows;
+    rows.push_back(border_row);
+    for (int i = 0; i < corridor_rows; ++i) rows.push_back(corridor_row);
+    for (int i = 0; i < strait_rows; ++i) rows.push_back(strait_row);   // the strait, 1 cell wide
+    for (int i = 0; i < room_rows; ++i) rows.push_back(room_row);       // the lagoon itself
+    rows.push_back(buffer_row);   // land buffer, seals the lagoon off from the far edge
+    const int lagoon_row = 1 + corridor_rows + strait_rows + room_rows / 2;   // the room's middle row
+    return {build_lattice(rows), {strait_col, lagoon_row}};
+}
+
+} // namespace
 
 COOPA_TEST(water_separates_ocean_from_lakes) {
     std::size_t ocean = 0;
@@ -254,4 +369,94 @@ COOPA_TEST(water_bodies_win_inside_and_overhang_their_edge) {
         }
     }
     ASSERT_TRUE(wider > 0);
+}
+
+/**
+ * @brief A lagoon behind a strait gets a real basin wherever it sits on the map -- the direct pin
+ *        on the bug an earlier fix round left in place: `enclosed_ocean_cells()` used to compare
+ *        a cell's water-only path to the map's BORDER against the straight-line distance to it,
+ *        which only ever fires for a bay close to the edge. For a lagoon tens of cells inland,
+ *        the detour through its own strait is a small fraction of an already-long common
+ *        journey to the border, so the ratio test never climbed far enough to flag it -- exactly
+ *        `unified_terrain_demo`'s reported "lake" (seed 7, a continent filling most of a map many
+ *        times its own width). `ocean_enclosure()` instead measures distance in strait-widths
+ *        from the open-sea core, so the lagoon's own width is what decides it, not its distance
+ *        from the border.
+ *
+ * Two lattices, built from the SAME strait-and-lagoon geometry (`build_island_with_lagoon()`),
+ * one with the strait's mouth directly on the border and one with 20 rows of open sea between
+ * them. Both must flag the lagoon's centre.
+ */
+COOPA_TEST(a_lagoon_behind_a_strait_is_enclosed_wherever_it_sits) {
+    using namespace coopa::maps;
+    const int margin = static_cast<int>(std::ceil(k_strait_half_width)) * 3;
+    const int width = margin * 2 + 3;
+    for (const int corridor_rows : {0, 20}) {
+        auto [graph, lagoon] = build_island_with_lagoon(corridor_rows);
+        const std::size_t centre = static_cast<std::size_t>(lagoon.second * width + lagoon.first);
+        ASSERT_TRUE(graph.centers[centre].water && graph.centers[centre].ocean);
+
+        const std::vector<double> strength = ocean_enclosure(graph);
+        ASSERT_TRUE(strength[centre] > 0.5);
+
+        const std::vector<bool> enclosed = enclosed_ocean_cells(graph);
+        ASSERT_TRUE(enclosed[centre]);
+    }
+}
+
+/**
+ * @brief A straight coastline, with nothing but a wide, shallow cove in it, flags nothing.
+ *
+ * The negative case `an_open_coastline_is_never_enclosed` -- a wide, straight stretch of coast
+ * with no strait anywhere in it. Nothing in the middle of it should ever read as the far side of
+ * one.
+ *
+ * Sized relative to `k_strait_half_width` (a 4x margin), like `build_island_with_lagoon()`, so
+ * this stays valid if that constant is retuned. Only the inner half of the interior is checked,
+ * both in x and in y: where this rectangular lattice's straight coast meets its own side walls
+ * at a right angle, the corner is locally just as narrow as a real strait would be (close to
+ * land on two sides at once), and `ocean_enclosure()` correctly reads a little enclosure right
+ * in that corner. A real, organically-shaped coastline has no such right angle to manufacture
+ * one; the corner here is a lattice-construction artifact, not a case this test is for.
+ */
+COOPA_TEST(an_open_coastline_is_never_enclosed) {
+    using namespace coopa::maps;
+    const int margin = static_cast<int>(std::ceil(k_strait_half_width)) * 4;
+    const int width = margin * 2 + 3;
+    const int corridor_rows = margin;
+
+    std::vector<std::string> rows = {std::string(static_cast<std::size_t>(width), '.')};  // border
+    for (int i = 0; i < corridor_rows; ++i) {
+        rows.push_back("#" + std::string(static_cast<std::size_t>(width - 2), '.') + "#");
+    }
+    rows.push_back(std::string(static_cast<std::size_t>(width), '#'));   // the coast -- straight
+
+    const MapGraph graph = build_lattice(rows);
+    const std::vector<double> strength = ocean_enclosure(graph);
+    const int lo = margin / 2;
+    const int hi = width - 1 - margin / 2;
+    for (int y = 1; y <= corridor_rows - margin / 2; ++y) {
+        for (int x = lo; x <= hi; ++x) {
+            ASSERT_EQ(strength[static_cast<std::size_t>(y * width + x)], 0.0);
+        }
+    }
+}
+
+/**
+ * @brief A globe has no border band at all (`MapCenter::border` is false everywhere -- sphere
+ *        maps flag large bodies `ocean` by size instead, see `seed_sphere_oceans_()`), so there
+ *        is no open-sea core to measure enclosure against. `ocean_enclosure()` must read exactly
+ *        0 everywhere rather than, say, treating "unreached from a border that doesn't exist" as
+ *        "enclosed" -- which would flag every sea on every planet.
+ */
+COOPA_TEST(a_globe_with_no_border_water_flags_nothing) {
+    using namespace coopa::maps;
+    auto [graph, lagoon] = build_island_with_lagoon(0);
+    (void)lagoon;
+    for (MapCenter& c : graph.centers) c.border = false;   // a sphere map's own invariant
+
+    const std::vector<double> strength = ocean_enclosure(graph);
+    for (double s : strength) ASSERT_EQ(s, 0.0);
+    const std::vector<bool> enclosed = enclosed_ocean_cells(graph);
+    for (bool e : enclosed) ASSERT_TRUE(!e);
 }
